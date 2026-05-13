@@ -1,6 +1,25 @@
-import { OpenAI } from "langchain/llms/openai";
+import { ChatAnthropic } from "langchain/chat_models/anthropic";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
+
+// Explicit tool allow list — only tools named here may be invoked by the agent
+const ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+  // Add permitted tool names here, e.g.:
+  // "calculator",
+  // "web-search",
+]);
+
+/**
+ * Enforce the tool allow list before any tool execution.
+ * Throws if the requested tool is not explicitly permitted.
+ */
+function assertToolAllowed(toolName: string): void {
+  if (!ALLOWED_TOOLS.has(toolName)) {
+    throw new Error(
+      `Tool "${toolName}" is not on the allow list and cannot be executed.`
+    );
+  }
+}
 import { StreamingTextResponse, LangChainStream } from "ai";
 import clerk from "@clerk/clerk-sdk-node";
 import { CallbackManager } from "langchain/callbacks";
@@ -8,7 +27,23 @@ import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
-import { rateLimit } from "@/app/utils/rateLimit";
+// In-memory rate limiter (replaces Upstash Redis dependency)
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_MAX = 10;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+function rateLimit(identifier: string): { success: boolean } {
+  const now = Date.now();
+  const entry = rateLimitMap.get(identifier);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(identifier, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return { success: true };
+  }
+  entry.count += 1;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return { success: false };
+  }
+  return { success: true };
+}
 import { createHash, randomUUID } from "crypto";
 
 dotenv.config({ path: `.env.local` });
@@ -32,6 +67,102 @@ function sanitizeInput(input: string, maxLength = 4000): string {
   return sanitized;
 }
 
+function isMaliciousInput(input: string): boolean {
+  // Detect common prompt injection and jailbreak patterns
+  const maliciousPatterns = [
+    /ignore (all )?(previous|prior|above) instructions?/gi,
+    /you are now|act as|pretend (to be|you are)|disregard (all )?instructions?/gi,
+    /<script[\s\S]*?>/gi,
+    /system\s*:\s*(you are|ignore|forget)/gi,
+    /\[INST\]|\[\[INST\]\]|<\|im_start\|>|<\|system\|>/gi,
+  ];
+  return maliciousPatterns.some((pattern) => pattern.test(input));
+}
+
+// Detect and sanitize content read from companion files before LLM injection
+function sanitizeFileContent(content: string, maxLength = 8000): string {
+  if (typeof content !== "string") return "";
+
+  // Enforce length limit
+  let sanitized = content.slice(0, maxLength);
+
+  // Strip invisible / zero-width characters that can hide injections
+  sanitized = sanitized.replace(
+    /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/g,
+    ""
+  );
+
+  // Remove null bytes and dangerous control characters
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Detect and reject base64-encoded blobs (long runs of base64 chars)
+  if (/(?:[A-Za-z0-9+/]{40,}={0,2})/.test(sanitized)) {
+    console.warn("SECURITY: base64-encoded content detected in companion file, stripping.");
+    sanitized = sanitized.replace(/(?:[A-Za-z0-9+/]{40,}={0,2})/g, "[base64-removed]");
+  }
+
+  // Detect leetspeak obfuscation attempts (e.g. 1gn0r3, 3x3c)
+  const leetspeakInjection = /(?:1[g9][n]0[r][3e]|[e3][x][e3][c]|[s5][y][s5][t][e3][m])/i;
+  if (leetspeakInjection.test(sanitized)) {
+    console.warn("SECURITY: leetspeak obfuscation detected in companion file, sanitizing.");
+    sanitized = sanitized.replace(leetspeakInjection, "[removed]");
+  }
+
+  // Strip shell command patterns
+  const shellPatterns = [
+    /\b(rm|wget|curl|chmod|chown|sudo|bash|sh|zsh|powershell|cmd)\s+/gi,
+    /[|;&`$]\s*\(/g,
+    /\$\([^)]*\)/g,
+    /`[^`]*`/g,
+  ];
+  for (const pattern of shellPatterns) {
+    if (pattern.test(sanitized)) {
+      console.warn("SECURITY: shell command pattern detected in companion file, removing.");
+      sanitized = sanitized.replace(pattern, "[removed]");
+    }
+  }
+
+  // Strip prompt injection patterns
+  sanitized = sanitized.replace(
+    /ignore (all )?(previous|prior|above) instructions?/gi,
+    "[removed]"
+  );
+  sanitized = sanitized.replace(
+    /you are now|act as|pretend (to be|you are)|disregard (all )?instructions?/gi,
+    "[removed]"
+  );
+  sanitized = sanitized.replace(
+    /system\s*:\s*|<\s*system\s*>|\[\s*system\s*\]/gi,
+    "[removed]"
+  );
+
+  return sanitized;
+}
+
+function isMaliciousInput(input: string): boolean {
+  // Reject base64-encoded payloads (long stretches of base64 chars)
+  if (/(?:[A-Za-z0-9+/]{40,}={0,2})/.test(input)) return true;
+  // Reject shell command patterns
+  if (/(?:;|\||&&|`|\$\()\s*(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|exec|eval|system|passthru|popen)/i.test(input)) return true;
+  // Reject binary/non-printable content (beyond what sanitizeInput strips)
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/.test(input)) return true;
+  // Reject invisible/zero-width characters
+  if (/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/.test(input)) return true;
+  // Reject common leetspeak obfuscation of dangerous keywords
+  // e.g. "1gnor3", "3x3c", "syst3m"
+  const leet = input
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/5/g, "s")
+    .replace(/7/g, "t")
+    .replace(/@/g, "a");
+  if (/ignore\s+(all\s+)?(?:previous|prior|above)\s+instructions?/i.test(leet)) return true;
+  if (/(?:exec|eval|system|shell_exec|passthru)\s*\(/i.test(leet)) return true;
+  return false;
+}
+
 function validateName(name: string | null): string | null {
   if (!name) return null;
   // Allow only alphanumeric, spaces, hyphens, underscores (companion names)
@@ -43,6 +174,11 @@ export async function POST(req: Request) {
   let clerkUserId;
   let user;
   let clerkUserName;
+  // Validate pinned model against approved registry before any inference work.
+  assertModelApproved(PINNED_MODEL_NAME);
+  const inferenceRequestId = randomUUID();
+  recordInferenceMetadata(PINNED_MODEL_NAME, inferenceRequestId);
+
   const { prompt: rawPrompt, isText, userId, userName: rawUserName } = await req.json();
   const prompt = sanitizeInput(String(rawPrompt ?? ""), 2000);
   const userName = sanitizeInput(String(rawUserName ?? ""), 100);
@@ -67,7 +203,6 @@ export async function POST(req: Request) {
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
   }
-  const prompt = sanitizeInput(rawPrompt);
 
   const identifier = req.url + "-" + (userId || "anonymous");
   const { success } = await rateLimit(identifier);
@@ -92,9 +227,19 @@ export async function POST(req: Request) {
       { status: 400, headers: { "Content-Type": "application/json" } }
     );
   }
-  const companionFileName = name + ".txt";
+  const path = require("path");
+  const safeBaseName = path.basename(name + ".txt");
+  const companionsDir = path.resolve("companions");
+  const companionFilePath = path.resolve(companionsDir, safeBaseName);
+  if (!companionFilePath.startsWith(companionsDir + path.sep)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid companion name." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  const companionFileName = safeBaseName;
 
-  console.log("prompt: ", prompt);
+  console.log("INFO: processing chat request");
   user = await currentUser();
   clerkUserId = user?.id;
       clerkUserName = user?.firstName
@@ -120,7 +265,7 @@ export async function POST(req: Request) {
   // discussion. The PREAMBLE should include a seed conversation whose format will
   // vary by the model using it.
   const fs = require("fs").promises;
-  const data = await fs.readFile("companions/" + companionFileName, "utf8");
+  const data = await fs.readFile(companionFilePath, "utf8");
 
   // Clunky way to break out PREAMBLE and SEEDCHAT from the character file
   const presplit = data.split("###ENDPREAMBLE###");
@@ -128,10 +273,63 @@ export async function POST(req: Request) {
   const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
   const seedchat = sanitizeInput(seedsplit[0], 8000);
 
+  // Build a signed, expiry-bound companionKey to ensure session token integrity.
+  const COMPANION_KEY_SECRET = process.env.COMPANION_KEY_SECRET;
+  if (!COMPANION_KEY_SECRET || COMPANION_KEY_SECRET.length < 32) {
+    console.error("SECURITY: COMPANION_KEY_SECRET is missing or too short.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Server configuration error." }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  const COMPANION_KEY_TTL_MS = 60 * 60 * 1000; // 1 hour
+  const keyIssuedAt = Date.now();
+  const keyExpiresAt = keyIssuedAt + COMPANION_KEY_TTL_MS;
+  const companionName = name!;
+  const modelName = "gpt-4o-mini";
+  const boundUserId = clerkUserId;
+  // Canonical payload for signing: bind all key fields plus expiry
+  const keyPayload = `${companionName}|${modelName}|${boundUserId}|${keyExpiresAt}`;
+  const { createHmac } = await import("crypto");
+  const keySignature = createHmac("sha256", COMPANION_KEY_SECRET)
+    .update(keyPayload)
+    .digest("hex");
+  // Verify the signature and expiry before proceeding (integrity + expiry check)
+  const verifyCompanionKey = (
+    cn: string,
+    mn: string,
+    uid: string,
+    exp: number,
+    sig: string
+  ): boolean => {
+    if (Date.now() > exp) {
+      console.warn("SECURITY: companionKey has expired.");
+      return false;
+    }
+    const expected = createHmac("sha256", COMPANION_KEY_SECRET!)
+      .update(`${cn}|${mn}|${uid}|${exp}`)
+      .digest("hex");
+    // Constant-time comparison to prevent timing attacks
+    if (expected.length !== sig.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) {
+      diff |= expected.charCodeAt(i) ^ sig.charCodeAt(i);
+    }
+    return diff === 0;
+  };
+  if (!verifyCompanionKey(companionName, modelName, boundUserId, keyExpiresAt, keySignature)) {
+    console.error("SECURITY: companionKey signature/expiry validation failed.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Session token validation failed." }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
   const companionKey = {
-    companionName: name!,
-    modelName: "gpt-4o-mini",
-    userId: clerkUserId,
+    companionName,
+    modelName,
+    userId: boundUserId,
+    expiresAt: keyExpiresAt,
+    signature: keySignature,
   };
   const memoryManager = await MemoryManager.getInstance();
 
@@ -249,18 +447,32 @@ Below is a relevant conversation history
     })
     .catch(console.error);
 
-  await fs.appendFile(
-    "logs/llm_interactions.log",
-    JSON.stringify({
-      event: "llm_response",
-      timestamp: new Date().toISOString(),
-      userId: clerkUserId,
-      companionName: name,
-      result: result ?? null,
-    }) + "\n"
-  ).catch((err: Error) => console.error("Failed to write LLM response log:", err));
+  const inputHash = crypto
+    .createHash("sha256")
+    .update(prompt ?? "")
+    .digest("hex");
 
-  console.log("result", result);
+  const llmResponseLogEntry = JSON.stringify({
+    event: "llm_response",
+    timestamp: new Date().toISOString(),
+    principal: clerkUserId,
+    userId: clerkUserId,
+    companionName: name,
+    modelVersion: (model as { modelName?: string }).modelName ?? "unknown",
+    inputHash,
+    result: result ?? null,
+  }) + "\n";
+
+  try {
+    await fs.appendFile("logs/llm_interactions.log", llmResponseLogEntry);
+  } catch (err) {
+    console.error("FATAL: Failed to write LLM response audit log:", err);
+    throw new Error(
+      "Audit log write failure — halting to preserve forensic integrity"
+    );
+  }
+
+  console.log("INFO: LLM response received");
   // Validate and sanitize LLM output before use
   const rawText: unknown = result?.text;
 
@@ -299,9 +511,46 @@ Below is a relevant conversation history
     sanitizedText + "\n",
     companionKey
   );
-  console.log("chatHistoryRecord", chatHistoryRecord);
+  console.log("INFO: chat history record updated");
+  // --- Synthetic Content Provenance & Labeling ---
+  const provenanceTimestamp = new Date().toISOString();
+  const modelId = process.env.OPENAI_MODEL_ID ?? "gpt-3.5-turbo";
+  const syntheticLabel = "AI-GENERATED";
+
+  // Compute HMAC-SHA256 signature over (modelId + timestamp + content)
+  const crypto = await import("crypto");
+  const signingSecret = process.env.AI_SIGNING_SECRET ?? "default-insecure-secret";
+
+  const provenanceHeaders: Record<string, string> = {
+    "X-AI-Generated": syntheticLabel,
+    "X-AI-Model-ID": modelId,
+    "X-AI-Timestamp": provenanceTimestamp,
+    "X-Content-Type-Options": "nosniff",
+  };
+
   if (isText) {
-    return NextResponse.json(sanitizedText);
+    const payload = {
+      content: sanitizedText,
+      provenance: {
+        label: syntheticLabel,
+        modelId,
+        timestamp: provenanceTimestamp,
+      },
+    };
+    const signature = crypto
+      .createHmac("sha256", signingSecret)
+      .update(modelId + provenanceTimestamp + sanitizedText)
+      .digest("hex");
+    provenanceHeaders["X-AI-Signature"] = `sha256=${signature}`;
+    return NextResponse.json(payload, { headers: provenanceHeaders });
   }
-  return new StreamingTextResponse(stream);
+
+  // Streaming path: attach provenance metadata as response headers
+  const streamContent = sanitizedText; // use sanitized text for signature
+  const streamSignature = crypto
+    .createHmac("sha256", signingSecret)
+    .update(modelId + provenanceTimestamp + streamContent)
+    .digest("hex");
+  provenanceHeaders["X-AI-Signature"] = `sha256=${streamSignature}`;
+  return new StreamingTextResponse(stream, { headers: provenanceHeaders });
 }

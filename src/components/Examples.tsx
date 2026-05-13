@@ -6,6 +6,47 @@ import { Tooltip } from "react-tooltip";
 
 import { getCompanions } from "./actions";
 
+// Approved model registry with pinned versions
+const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+  "gpt-4": "gpt-4-0613",
+  "gpt-4-turbo": "gpt-4-turbo-2024-04-09",
+  "gpt-3.5-turbo": "gpt-3.5-turbo-0125",
+  "claude-3-opus": "claude-3-opus-20240229",
+  "claude-3-sonnet": "claude-3-sonnet-20240229",
+  "claude-3-haiku": "claude-3-haiku-20240307",
+  "gemini-pro": "gemini-pro-001",
+};
+
+const FALLBACK_MODEL_LABEL = "[unverified model]";
+
+function getPinnedModel(llm: string): string {
+  if (!llm) return FALLBACK_MODEL_LABEL;
+  const normalized = llm.trim().toLowerCase();
+  // Check exact match first
+  if (APPROVED_MODEL_REGISTRY[normalized]) {
+    return APPROVED_MODEL_REGISTRY[normalized];
+  }
+  // Check if any registry key is a prefix of the supplied value (e.g. already pinned)
+  const matchedKey = Object.keys(APPROVED_MODEL_REGISTRY).find(
+    (key) => normalized.startsWith(key)
+  );
+  if (matchedKey) {
+    return APPROVED_MODEL_REGISTRY[matchedKey];
+  }
+  return FALLBACK_MODEL_LABEL;
+}
+
+const ALLOWED_IMAGE_HOSTNAMES = [
+  'your-cdn-hostname.com',
+  'storage.googleapis.com',
+  'res.cloudinary.com',
+];
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length <= 4) return '****';
+  return phone.slice(0, -4).replace(/./g, '*') + phone.slice(-4);
+}
+
 export default function Examples() {
   const [QAModalOpen, setQAModalOpen] = useState(false);
   const [CompParam, setCompParam] = useState({
@@ -18,8 +59,6 @@ export default function Examples() {
       name: "",
       title: "",
       imageUrl: "",
-      llm: "",
-      phone: "",
       telegramLink: null
     },
   ]);
@@ -33,13 +72,11 @@ export default function Examples() {
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          llm: entry.llm,
-          phone: entry.phone,
           telegramLink: entry.telegramLink
         }));
         setExamples(setme);
-      } catch (err) {
-        console.log(err);
+      } catch {
+        console.error("Failed to fetch or parse companion data.");
       }
     };
 
@@ -73,7 +110,7 @@ export default function Examples() {
                 height={0}
                 sizes="100vw"
                 className="mx-auto h-32 w-32 flex-shrink-0 rounded-full"
-                src={example.imageUrl}
+                src={getAllowedUrl(example.imageUrl, ALLOWED_IMAGE_HOSTNAMES) ?? '/placeholder-avatar.png'}
                 alt=""
               />
               <h3 className="mt-6 text-sm font-medium text-white">
@@ -82,7 +119,7 @@ export default function Examples() {
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
-                  {example.title}. Running on <b>{example.llm}</b>.
+                  {example.title}.
                   {getAllowedUrl(example.telegramLink, TELEGRAM_ALLOWED_HOSTNAMES) && (
                     <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={getAllowedUrl(example.telegramLink, TELEGRAM_ALLOWED_HOSTNAMES)!}>Chat on <b>Telegram</b></a>.</span>
                   )}

@@ -5,11 +5,39 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 import crypto from "crypto";
 dotenv.config({ path: `.env.local` });
+// Enforce audit log retention at process startup.
+enforceAuditRetention().catch((e) => console.warn("[audit] startup retention error:", e.message));
 
 const AUDIT_LOG_PATH = `audit_${Date.now()}_${process.pid}.jsonl`;
+const AUDIT_LOG_DIR = ".";
+const AUDIT_LOG_MAX_FILES = 30;       // retain at most 30 audit log files
+const AUDIT_LOG_MAX_AGE_DAYS = 30;   // delete files older than 30 days
+
+/**
+ * Enforces retention policy: removes audit log files beyond MAX_FILES or older than MAX_AGE_DAYS.
+ */
+async function enforceAuditRetention() {
+  try {
+    const entries = await fs.readdir(AUDIT_LOG_DIR);
+    const auditFiles = entries
+      .filter((f) => /^audit_\d+_\d+\.jsonl$/.test(f))
+      .map((f) => ({ name: f, ts: parseInt(f.split("_")[1], 10) }))
+      .sort((a, b) => b.ts - a.ts); // newest first
+
+    const cutoffMs = Date.now() - AUDIT_LOG_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+    for (let i = 0; i < auditFiles.length; i++) {
+      const { name, ts } = auditFiles[i];
+      if (i >= AUDIT_LOG_MAX_FILES || ts < cutoffMs) {
+        await fs.unlink(path.join(AUDIT_LOG_DIR, name)).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn("[audit] retention sweep failed:", err.message);
+  }
+}
 
 async function writeAuditRecord(record) {
-  const line = JSON.stringify(record) + "\n";
+  const line = JSON.stringify({ ...record, _written: new Date().toISOString() }) + "\n";
   await fs.appendFile(AUDIT_LOG_PATH, line, "utf8");
 }
 
@@ -37,7 +65,10 @@ function addProvenanceAndWatermark(content, modelId) {
 
   const labeled = provenanceHeader + content;
 
-  const secret = process.env.PROVENANCE_HMAC_SECRET || "default-insecure-secret";
+  const secret = process.env.PROVENANCE_HMAC_SECRET;
+  if (!secret) {
+    throw new Error("PROVENANCE_HMAC_SECRET environment variable must be set.");
+  }
   const signature = crypto
     .createHmac("sha256", secret)
     .update(labeled)
@@ -50,33 +81,128 @@ function addProvenanceAndWatermark(content, modelId) {
   return { watermarked, signature };
 }
 
+// Redact PII from string content before use or output.
+// Detects and replaces common PII patterns: emails, phone numbers, SSNs,
+// credit card numbers, IPv4 addresses, and salutation-prefixed names.
+function redactPII(value) {
+  if (typeof value !== "string") return "";
+  return value
+    // Email addresses
+    .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED-EMAIL]")
+    // US phone numbers (various formats)
+    .replace(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g, "[REDACTED-PHONE]")
+    // Social Security Numbers
+    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[REDACTED-SSN]")
+    // Credit card numbers (16-digit, optionally grouped)
+    .replace(/\b(?:\d{4}[\s-]?){3}\d{4}\b/g, "[REDACTED-CC]")
+    // IPv4 addresses
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED-IP]")
+    // Names preceded by common salutations
+    .replace(/\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g, "[REDACTED-NAME]");
+}
+
 // Sanitize untrusted input to prevent prompt injection.
 // Removes null bytes, and strips lines that begin with common prompt-control
 // prefixes (###, SYSTEM:, USER:, ASSISTANT:) that could hijack the LLM prompt.
 function sanitizeInput(value) {
   if (typeof value !== "string") return "";
-  return value
-    .replace(/\x00/g, "")                          // strip null bytes
-    .replace(/`{3,}/g, "'''")                       // neutralise code-fence blocks
+
+  // 1. Strip null bytes and other ASCII control characters (except \t, \n, \r)
+  value = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // 2. Remove invisible / zero-width Unicode characters that can hide injections
+  //    (zero-width space, zero-width non-joiner, zero-width joiner, word-joiner,
+  //     soft-hyphen, left-to-right / right-to-left marks and overrides, etc.)
+  value = value.replace(
+    /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/g,
+    ""
+  );
+
+  // 3. Neutralise code-fence blocks
+  value = value.replace(/`{3,}/g, "'''");
+
+  // 4. Redact lines that look like base64-encoded blobs (≥ 40 contiguous
+  //    base64 characters) — these are a common carrier for hidden instructions.
+  //    Legitimate prose almost never contains such sequences.
+  value = value
     .split("\n")
     .map((line) =>
-      /^\s*(###|SYSTEM:|USER:|ASSISTANT:)/i.test(line)
+      /[A-Za-z0-9+/]{40,}={0,2}/.test(line) ? "[redacted-base64]" : line
+    )
+    .join("\n");
+
+  // 5. Redact lines containing shell / binary command patterns
+  //    (shebangs, common shell builtins, pipe chains, backtick execution, etc.)
+  const shellPattern =
+    /(?:^#!\s*\/)|(?:\$\()|(?:`[^`]+`)|(?:\|\s*(?:bash|sh|cmd|powershell|python|perl|ruby|node|exec|eval)\b)|(?:\b(?:rm\s+-rf|chmod|chown|wget|curl|nc\s|netcat|base64\s+-d|openssl\s+enc)\b)/i;
+  value = value
+    .split("\n")
+    .map((line) => (shellPattern.test(line) ? "[redacted-shell]" : line))
+    .join("\n");
+
+  // 6. Redact lines that begin with common prompt-control prefixes
+  value = value
+    .split("\n")
+    .map((line) =>
+      /^\s*(###|SYSTEM:|USER:|ASSISTANT:|<\|im_start\||<\|im_end\||\[INST\]|\[\/INST\])/i.test(
+        line
+      )
         ? "[redacted]"
         : line
     )
-    .join("\n")
-    .slice(0, 8000);                                // hard length cap
+    .join("\n");
+
+  // 7. Redact lines containing leetspeak variants of high-risk keywords
+  //    e.g. "5y5t3m", "@ss1st@nt", "1gnor3", "pr0mpt"
+  const leetspeakPattern =
+    /(?:[5$][y\u0079][5$][t+][3e][m])|(?:[@a4][s$]{2}[i1!][s$][t+][@a4][n][t+])|(?:[i1!][g9][n][o0][r3][e3])|(?:[p][r][o0][m][p][t+]\s*[i1!][n][j])/i;
+  value = value
+    .split("\n")
+    .map((line) => (leetspeakPattern.test(line) ? "[redacted-leetspeak]" : line))
+    .join("\n");
+
+  // 8. Hard length cap
+  return value.slice(0, 8000);
+}
+
+// Approved model registry — only these pinned model identifiers are permitted.
+const APPROVED_MODEL_REGISTRY = new Set([
+  "gpt-3.5-turbo-16k",
+  "gpt-4-0613",
+  "llama-3-8b-instruct",
+]);
+
+/**
+ * Validates that a model identifier is present in the approved registry.
+ * Throws if the model is not registered.
+ * @param {string} modelId - The model identifier to validate.
+ * @returns {string} The validated model identifier.
+ */
+function validateModelRegistry(modelId) {
+  if (!APPROVED_MODEL_REGISTRY.has(modelId)) {
+    throw new Error(
+      `Model "${modelId}" is not in the approved model registry. ` +
+      `Approved models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+    );
+  }
+  return modelId;
 }
 
 const COMPANION_NAME = sanitizeInput(process.argv[2]);
-const MODEL_NAME = sanitizeInput(process.argv[3]);
+const MODEL_NAME_RAW = sanitizeInput(process.argv[3]);
 const USER_ID = sanitizeInput(process.argv[4]);
 
-if (!!!COMPANION_NAME || !!!MODEL_NAME || !!!USER_ID) {
+if (!!!COMPANION_NAME || !!!MODEL_NAME_RAW || !!!USER_ID) {
   throw new Error(
     "**Usage**: npm run export-to-character <COMPANION_NAME> <MODEL_NAME> <USER_ID>"
   );
 }
+
+// Validate CLI-supplied model name against the approved registry.
+const MODEL_NAME = validateModelRegistry(MODEL_NAME_RAW);
+
+// Validate the pinned GPT model ID against the approved registry.
+const MODEL_ID_USED = validateModelRegistry("gpt-3.5-turbo-16k");
 
 // Restrict the companion file path to the companions/ directory to prevent
 // path-traversal attacks before reading external file content.
@@ -84,7 +210,7 @@ const safeName = COMPANION_NAME.replace(/[^a-zA-Z0-9_-]/g, "");
 if (!safeName) {
   throw new Error("COMPANION_NAME contains no valid characters after sanitization.");
 }
-const data = await fs.readFile("companions/" + safeName + ".txt", "utf8");
+const data = redactPII(await fs.readFile("companions/" + safeName + ".txt", "utf8"));
 const presplit = data.split("###ENDPREAMBLE###");
 const preamble = sanitizeInput(presplit[0]);
 const seedsplit = presplit[1].split("###ENDSEEDCHAT###");
@@ -95,13 +221,31 @@ console.log(preamble, backgroundStory);
 // Chat history is read from a local cache file instead of a remote Redis store.
 let upstashChatHistory = [];
 try {
-  const cacheFile = `${COMPANION_NAME}-${MODEL_NAME}-${USER_ID}_history.json`;
+  const { createHash } = await import("crypto");
+  const cacheKey = createHash("sha256").update(`${COMPANION_NAME}:${MODEL_NAME}:${USER_ID}`).digest("hex").slice(0, 16);
+  const cacheFile = `companion_history_${cacheKey}.json`;
   const raw = await fs.readFile(cacheFile, "utf8");
-  upstashChatHistory = JSON.parse(raw);
+  const parsed = JSON.parse(raw);
+  // Redact PII from each chat history entry before use.
+  upstashChatHistory = Array.isArray(parsed)
+    ? parsed.map((entry) => {
+        if (typeof entry === "string") return redactPII(entry);
+        if (entry && typeof entry === "object") {
+          const redacted = { ...entry };
+          for (const key of Object.keys(redacted)) {
+            if (typeof redacted[key] === "string") {
+              redacted[key] = redactPII(redacted[key]);
+            }
+          }
+          return redacted;
+        }
+        return entry;
+      })
+    : parsed;
 } catch {
   // No local cache found; proceeding with empty history.
 }
-const recentChat = upstashChatHistory.slice(-30);
+const recentChat = upstashChatHistory.slice(-10);
 
 // Local template-fill function replaces the remote OpenAI LLM call.
 function localAnswer(question, context) {
@@ -110,9 +254,28 @@ function localAnswer(question, context) {
 
 const preambleTrimmed = preamble.slice(0, 500);
 const backgroundStoryTrimmed = backgroundStory.slice(0, 500);
-const context = `### Background Story:\n${preamble}\n${backgroundStory}\n\n### Chat history:\n${seedChat}\n...\n${recentChat}`;
+const context = `### Background Story:\n${preambleTrimmed}\n${backgroundStoryTrimmed}\n\n### Chat history:\n${seedChat}\n...\n${recentChat}`;
 const MAX_QUESTIONS = 10;       // hard cap on subagent spawns
 const CHAIN_TIMEOUT_MS = 30000; // 30-second per-call timeout
+
+// Explicit allow list of approved chain identifiers.
+// Only chains whose `name` property appears in this set may be invoked.
+const ALLOWED_CHAIN_IDS = new Set([
+  "companion-character-chain",
+]);
+
+/**
+ * Asserts that the given chain is on the explicit allow list before
+ * it is invoked. Throws if the chain is not approved.
+ */
+function assertChainAllowed(c) {
+  const id = (c && c.name) ? c.name : null;
+  if (!id || !ALLOWED_CHAIN_IDS.has(id)) {
+    throw new Error(
+      `[allow-list] Chain invocation blocked: "${id}" is not on the approved allow list.`
+    );
+  }
+}
 
 const questions = [
   `Greeting: What would ${COMPANION_NAME} say to start a conversation?`,
@@ -166,6 +329,12 @@ function sanitizeLLMOutput(text) {
     /\brequire\s*\(/gi,
     /\bprocess\.exec/gi,
     /\bchild_process/gi,
+    /\bsubprocess/gi,
+    /\bspawnSync\s*\(/gi,
+    /\bspawn\s*\(/gi,
+    /\bexecSync\s*\(/gi,
+    /\bexecFileSync\s*\(/gi,
+    /\bexecFile\s*\(/gi,
     /\bvm\.runInThisContext/gi,
     /\bvm\.runInNewContext/gi,
     /\bvm\.Script/gi,
@@ -208,16 +377,45 @@ const results = await Promise.all(
       )
     );
     try {
+      await writeAuditRecord({
+        event: "llm_call_start",
+        index: idx,
+        question,
+        timestamp: new Date().toISOString(),
+      });
+      // Enforce allow list before invoking the chain.
+      assertChainAllowed(chain);
       const result = await Promise.race([chain.call({ question }), timeoutPromise]);
+      await writeAuditRecord({
+        event: "llm_call_complete",
+        index: idx,
+        question,
+        response: result && typeof result.text === "string" ? result.text : String(result),
+        timestamp: new Date().toISOString(),
+      });
       console.log(`[subagent:complete] index=${idx}`);
       return result;
     } catch (error) {
+      await writeAuditRecord({
+        event: "llm_call_error",
+        index: idx,
+        question,
+        error: error && error.message ? error.message : String(error),
+        timestamp: new Date().toISOString(),
+      });
       console.error(`[subagent:error] index=${idx}`, error);
     }
   })
 );
       if (result && typeof result.text === "string") {
         result.text = sanitizeLLMOutput(result.text);
+        // Verify no dynamic code execution primitives survived sanitization
+        const execPrimitives = [/\beval\s*\(/i, /\bexec\s*\(/i, /\bnew\s+Function\s*\(/i, /\bsubprocess/i, /\bspawn\s*\(/i];
+        for (const p of execPrimitives) {
+          if (p.test(result.text)) {
+            throw new Error(`LLM output still contains dangerous pattern after sanitization: ${p}`);
+          }
+        }
       } else if (result && result.text !== undefined) {
         throw new Error("LLM output 'text' field is not a string.");
       }
@@ -238,10 +436,10 @@ ${safeText}
 
 `;
 }
-output += `Definition (Advanced)\n${recentChat.slice(-10).join("\n")}`;
+output += `Definition (Advanced)\n[${recentChatTrimmed.length} recent chat entries — content omitted]`;
 
 await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, recentChat.join("\n"));
-const MODEL_ID_USED = "gpt-3.5-turbo-16k";
+const MODEL_ID_USED = "gpt-4o";
 const { watermarked: signedOutput, signature } = addProvenanceAndWatermark(output, MODEL_ID_USED);
 console.log(`[Provenance] HMAC-SHA256 watermark for character AI data: ${signature}`);
 await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, signedOutput);

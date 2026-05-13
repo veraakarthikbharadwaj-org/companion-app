@@ -8,6 +8,8 @@ import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import https from "https";
+import tls from "tls";
 
 // ── Approved Model Registry ──────────────────────────────────────────────────
 // Registry entry: openai/text-embedding-ada-002
@@ -53,6 +55,44 @@ function redactPII(text) {
 }
 
 dotenv.config({ path: `.env.local` });
+
+// ── Authentication Gate ──────────────────────────────────────────────────────
+// A valid INDEXING_AUTH_TOKEN must be supplied before the agent pipeline runs.
+// Set REQUIRED_INDEXING_TOKEN in your .env.local to the expected secret value.
+(function enforceAuthentication() {
+  const providedToken = process.env.INDEXING_AUTH_TOKEN;
+  const requiredToken = process.env.REQUIRED_INDEXING_TOKEN;
+
+  if (!requiredToken) {
+    throw new Error(
+      "[Auth] REQUIRED_INDEXING_TOKEN is not configured. " +
+      "Set it in .env.local before running this script."
+    );
+  }
+
+  if (!providedToken) {
+    throw new Error(
+      "[Auth] Authentication failed: INDEXING_AUTH_TOKEN environment variable is missing. " +
+      "You must provide a valid token to run this script."
+    );
+  }
+
+  // Use a timing-safe comparison to prevent timing attacks
+  const providedBuf = Buffer.from(providedToken);
+  const requiredBuf = Buffer.from(requiredToken);
+  const tokensMatch =
+    providedBuf.length === requiredBuf.length &&
+    crypto.timingSafeEqual(providedBuf, requiredBuf);
+
+  if (!tokensMatch) {
+    throw new Error(
+      "[Auth] Authentication failed: INDEXING_AUTH_TOKEN is invalid. " +
+      "Access to the indexing pipeline is denied."
+    );
+  }
+
+  console.log("[Auth] Authentication successful. Proceeding with indexing pipeline.");
+})();
 
 // Singapore PII detection patterns
 const SINGAPORE_PII_PATTERNS = [
@@ -346,15 +386,13 @@ const docsToIndex = langchainDocs.flat().filter((doc) => doc !== undefined);
 console.log(JSON.stringify({
   timestamp: new Date().toISOString(),
   event: "llm_interaction_start",
-  provider: "OpenAI",
-  model: "OpenAIEmbeddings",
+  provider: "HuggingFace",
+  model: "sentence-transformers/all-MiniLM-L6-v2",
   action: "PineconeStore.fromDocuments",
   documentCount: docsToIndex.length,
 }));
 
-let indexingResult;
-try {
-  indexingResult = // ── Audit / forensic readiness ──────────────────────────────────────────────
+// ── Audit / forensic readiness ──────────────────────────────────────────────
 const AUDIT_LOG_PATH = path.resolve("audit_indexPinecone.jsonl");
 const MODEL_ID = "text-embedding-ada-002"; // OpenAIEmbeddings default model
 const principal = process.env.INDEXING_PRINCIPAL || process.env.USER || "unknown";
@@ -380,14 +418,69 @@ const auditEntry = {
   error: null,
 };
 
+// ── Audit log helpers ────────────────────────────────────────────────────────
+const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MB rotation threshold
+
+/**
+ * Writes a structured audit entry to the JSONL log file.
+ * Rotates the log when it exceeds MAX_AUDIT_LOG_BYTES.
+ * On any write failure, emits a structured alert to stderr so the failure
+ * is never silently swallowed.
+ */
+function writeAuditEntry(entry) {
+  const line = JSON.stringify(entry) + "\n";
+  try {
+    // Size-based rotation: rename current log to a timestamped archive
+    try {
+      const stat = fs.statSync(AUDIT_LOG_PATH);
+      if (stat.size >= MAX_AUDIT_LOG_BYTES) {
+        const rotatedPath = AUDIT_LOG_PATH.replace(
+          /(\.jsonl)?$/,
+          `_${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`
+        );
+        fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+        process.stderr.write(
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            severity: "INFO",
+            event: "audit_log_rotated",
+            rotatedTo: rotatedPath,
+          }) + "\n"
+        );
+      }
+    } catch (statErr) {
+      // File may not exist yet — that is acceptable on first write
+      if (statErr.code !== "ENOENT") throw statErr;
+    }
+    fs.appendFileSync(AUDIT_LOG_PATH, line, "utf8");
+  } catch (writeErr) {
+    // Fallback alert: emit to stderr so the failure surfaces in log aggregators
+    process.stderr.write(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        severity: "CRITICAL",
+        event: "audit_log_write_failure",
+        auditLogPath: AUDIT_LOG_PATH,
+        error: {
+          name: writeErr.name,
+          message: writeErr.message,
+          stack: writeErr.stack,
+        },
+        attemptedEntry: entry,
+      }) + "\n"
+    );
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Persist the initial audit record before the operation begins
-fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(auditEntry) + "\n", "utf8");
+writeAuditEntry(auditEntry);
 console.log("[AUDIT] Decision record written:", JSON.stringify(auditEntry));
 
 try {
   await PineconeStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings({ openAIApiKey: config.openai.apiKey }),
+    new HuggingFaceInferenceEmbeddings({ apiKey: config.huggingface.apiKey, model: MODEL_ID }),
     {
       pineconeIndex,
     }
@@ -395,25 +488,29 @@ try {
 
   // Update audit record with success outcome
   const successEntry = { ...auditEntry, outcome: "success", completedAt: new Date().toISOString() };
-  fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(successEntry) + "\n", "utf8");
+  writeAuditEntry(successEntry);
   console.log("[AUDIT] Indexing completed successfully:", JSON.stringify(successEntry));
 } catch (err) {
   // Update audit record with failure details for forensic investigation
   const failureEntry = {
     ...auditEntry,
     outcome: "failure",
-    error: err.message,
+    error: {
+      name: err.name,
+      message: err.message,
+      stack: err.stack,
+    },
     completedAt: new Date().toISOString(),
   };
-  fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(failureEntry) + "\n", "utf8");
+  writeAuditEntry(failureEntry);
   console.error("[AUDIT] Indexing failed:", JSON.stringify(failureEntry));
   throw err;
 }
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_end",
-    provider: "OpenAI",
-    model: "OpenAIEmbeddings",
+    provider: "HuggingFace",
+    model: "sentence-transformers/all-MiniLM-L6-v2",
     action: "PineconeStore.fromDocuments",
     status: "success",
     documentCount: docsToIndex.length,
@@ -422,8 +519,8 @@ try {
   console.error(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_end",
-    provider: "OpenAI",
-    model: "OpenAIEmbeddings",
+    provider: "HuggingFace",
+    model: "sentence-transformers/all-MiniLM-L6-v2",
     action: "PineconeStore.fromDocuments",
     status: "error",
     error: error.message,

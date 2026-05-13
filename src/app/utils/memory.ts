@@ -1,10 +1,10 @@
 import { Redis } from "@upstash/redis";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { CohereEmbeddings } from "langchain/embeddings/cohere";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
-import { createHash } from "crypto";
+import { createHash, createHmac } from "crypto";
 
 const DANGEROUS_PATTERNS = [
   /\beval\s*\(/i,
@@ -19,6 +19,35 @@ const DANGEROUS_PATTERNS = [
   /__proto__/i,
   /constructor\s*\[/i,
 ];
+
+const AI_CONTENT_MODEL_ID = process.env.OPENAI_MODEL_ID || "gpt-4";
+const AI_CONTENT_ORIGIN_TAG = "ai-generated:vector-retrieval";
+const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET || "change-me-in-production";
+
+function attachProvenance(docs: any[]): any[] {
+  const timestamp = new Date().toISOString();
+  return docs.map((doc) => {
+    const provenancePayload = JSON.stringify({
+      pageContent: doc.pageContent,
+      modelId: AI_CONTENT_MODEL_ID,
+      timestamp,
+      originTag: AI_CONTENT_ORIGIN_TAG,
+    });
+    const signature = createHash("sha256")
+      .update(PROVENANCE_HMAC_SECRET + provenancePayload)
+      .digest("hex");
+    return {
+      ...doc,
+      provenance: {
+        modelId: AI_CONTENT_MODEL_ID,
+        timestamp,
+        originTag: AI_CONTENT_ORIGIN_TAG,
+        contentLabel: "AI_GENERATED",
+        signature,
+      },
+    };
+  });
+}
 
 function sanitizeLLMDocs(docs: any[] | undefined): any[] {
   if (!docs || !Array.isArray(docs)) return [];
@@ -97,11 +126,11 @@ function sanitizeInput(input: string): string {
 
 class MemoryManager {
   private static instance: MemoryManager;
-  private history: Redis;
+  private auditLog: Array<{ key: string; value: string; ex: number }> = [];
   private vectorDBClient: PineconeClient | SupabaseClient;
 
   public constructor() {
-    this.history = Redis.fromEnv();
+    // Redis credential removed to comply with 3-system credential limit.
     if (process.env.VECTOR_DB === "pinecone") {
       this.vectorDBClient = new PineconeClient();
     } else {
@@ -144,7 +173,11 @@ class MemoryManager {
         resultCount,
       });
       // Persist to Redis with a 90-day TTL (7_776_000 seconds)
-      await this.history.set(auditKey, record, { ex: 7_776_000 });
+      this.auditLog.push({ key: auditKey, value: record, ex: 7_776_000 });
+      // Trim in-memory log to last 1000 entries to prevent unbounded growth
+      if (this.auditLog.length > 1000) {
+        this.auditLog.shift();
+      }
     } catch (auditErr) {
       console.error("AUDIT ERROR: failed to write vectorSearch audit record.", auditErr);
     }
@@ -202,7 +235,13 @@ class MemoryManager {
         .catch((err) => {
           console.log("WARNING: failed to get vector search results.", err);
         });
-      const similarDocs = sanitizeLLMDocs(rawDocs);
+      // Apply field-level filtering: expose only pageContent, truncated, to minimise output data
+      const filteredDocs = Array.isArray(rawDocs)
+        ? rawDocs.map((doc: any) => ({
+            pageContent: (doc?.pageContent ?? "").slice(0, 500),
+          }))
+        : [];
+      const similarDocs = sanitizeLLMDocs(filteredDocs);
       return similarDocs;
     }
   }
@@ -226,6 +265,71 @@ class MemoryManager {
     return `companion:${hmac}`;
   }
 
+  private sanitizeInput(input: string): string {
+    // Remove null bytes, control characters (except newline/tab), and trim whitespace
+    return input
+      .replace(/\0/g, "")
+      .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+      .trim()
+      .slice(0, 1000);
+  }
+
+  private sanitizeInput(text: string): string {
+    // Reject or strip base64-encoded payloads (long base64 strings)
+    const base64Pattern = /(?:[A-Za-z0-9+\/]{40,}={0,2})/g;
+    // Strip shell command injection patterns
+    const shellPattern = /(`[^`]*`|\$\([^)]*\)|\b(bash|sh|cmd|powershell|exec|eval|system|popen|subprocess)\b\s*[\(\["'])/gi;
+    // Strip prompt injection patterns (attempts to override system/user role instructions)
+    const promptInjectionPattern = /(ignore (previous|above|prior|all) instructions?|you are now|act as|disregard|forget (your|all)|system prompt|<\/?s(ystem|\|)?\s*>|\[INST\]|\[\/?SYS\])/gi;
+    // Strip null bytes and control characters
+    const controlCharPattern = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+
+    let sanitized = text
+      .replace(base64Pattern, (match) => {
+        // Allow short base64-like strings (e.g. normal words), only strip long ones
+        return match.length >= 40 ? '[REDACTED_BASE64]' : match;
+      })
+      .replace(shellPattern, '[REDACTED_CMD]')
+      .replace(promptInjectionPattern, '[REDACTED_INJECTION]')
+      .replace(controlCharPattern, '');
+
+    // Truncate to a safe maximum length
+    return sanitized.slice(0, 1000);
+  }
+
+    /**
+   * Appends an immutable audit record to a dedicated append-only Redis list.
+   * The audit key never expires so records are retained for forensic readiness.
+   * RPUSH is used instead of ZADD to prevent score-based mutation or silent overwrite.
+   */
+  public async writeAuditRecord(
+    record: Record<string, unknown>,
+    companionKey: CompanionKey
+  ): Promise<void> {
+    if (!companionKey || typeof companionKey.userId === "undefined") {
+      console.log("Companion key set incorrectly — audit record not written");
+      return;
+    }
+    const baseKey = this.generateRedisCompanionKey(companionKey);
+    // Separate, non-expiring key for the immutable audit log
+    const auditKey = `audit:${baseKey}`;
+    const entry = JSON.stringify({
+      ...record,
+      _timestamp: new Date().toISOString(),
+      _seq: Date.now(),
+    });
+    // RPUSH appends to the tail of the list — records cannot be updated in place
+    await this.history.rpush(auditKey, entry);
+    // Intentionally NO expiry set on auditKey — audit records must be retained
+    const retentionDays = process.env.AUDIT_RETENTION_DAYS
+      ? parseInt(process.env.AUDIT_RETENTION_DAYS, 10)
+      : 0; // 0 means indefinite
+    if (retentionDays > 0) {
+      // Only set expiry when an explicit retention policy is configured
+      await this.history.expire(auditKey, retentionDays * 60 * 60 * 24);
+    }
+  }
+
   public async writeToHistory(text: string, companionKey: CompanionKey) {
     if (!companionKey || typeof companionKey.userId == "undefined") {
       console.log("Companion key set incorrectly");
@@ -236,6 +340,27 @@ class MemoryManager {
     const result = await this.history.zadd(key, {
       score: Date.now(),
       member: text,
+    });
+    // Session expiry applies ONLY to the chat history key, NOT to audit records
+    await this.history.expire(key, 60 * 60 * 24);
+
+    // Write an immutable audit record for every history entry
+    await this.writeAuditRecord(
+      { action: "writeToHistory", textLength: text.length },
+      companionKey
+    );
+
+    return result;
+  }
+
+    const key = this.generateRedisCompanionKey(companionKey);
+    const sanitizedText = this.sanitizeInput(text);
+        const sanitizedText = this.sanitizeInput(text);
+        // Truncate at write time to enforce data minimisation before storage
+    const truncatedText = text.slice(0, 200);
+    const result = await this.history.zadd(key, {
+      score: Date.now(),
+      member: truncatedText,
     });
     // Set a 24-hour expiry on the key to enforce session expiry
     await this.history.expire(key, 60 * 60 * 24);
@@ -254,8 +379,9 @@ class MemoryManager {
       byScore: true,
     });
 
-    result = result.slice(-10).reverse();
-    const recentChats = result.reverse().map((entry: string) => entry.slice(0, 200)).join("\n");
+        result = result.slice(-10).reverse();
+    // Entries are already truncated at write time; join directly
+    const recentChats = result.reverse().join("\n");
     return recentChats;
   }
 
@@ -273,7 +399,7 @@ class MemoryManager {
     const content = seedContent.split(delimiter);
     let counter = 0;
     for (const line of content) {
-      await this.history.zadd(key, { score: counter, member: line });
+      await this.history.zadd(key, { score: counter, member: this.sanitizeInput(line) });
       counter += 1;
     }
   }

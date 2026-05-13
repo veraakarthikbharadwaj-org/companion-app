@@ -3,7 +3,44 @@ import clerk from "@clerk/clerk-sdk-node";
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
 import { rateLimit } from "@/app/utils/rateLimit";
-import {Md5} from 'ts-md5'
+// Md5 (ts-md5) removed — use HMAC-SHA256 via Node crypto for token integrity
+
+const TOKEN_HMAC_SECRET = process.env.TOKEN_HMAC_SECRET || (() => { throw new Error('TOKEN_HMAC_SECRET env var must be set'); })();
+const TOKEN_TTL_SECONDS = 3600; // 1 hour
+
+/**
+ * Creates a signed session token bound to a subject (userId) with an expiry.
+ * Format: <subject>.<expiresAt>.<hmac>
+ */
+function createSessionToken(subject: string): string {
+  const expiresAt = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
+  const payload = `${subject}.${expiresAt}`;
+  const sig = createHmac('sha256', TOKEN_HMAC_SECRET).update(payload).digest('hex');
+  return `${payload}.${sig}`;
+}
+
+/**
+ * Verifies a signed session token.
+ * Returns the subject if valid, throws otherwise.
+ */
+function verifySessionToken(token: string): string {
+  const parts = token.split('.');
+  if (parts.length !== 3) throw new Error('Invalid token format');
+  const [subject, expiresAtStr, providedSig] = parts;
+  const expiresAt = parseInt(expiresAtStr, 10);
+  if (isNaN(expiresAt)) throw new Error('Invalid token expiry');
+  if (Math.floor(Date.now() / 1000) > expiresAt) throw new Error('Token has expired');
+  const payload = `${subject}.${expiresAt}`;
+  const expectedSig = createHmac('sha256', TOKEN_HMAC_SECRET).update(payload).digest('hex');
+  // Constant-time comparison to prevent timing attacks
+  const providedBuf = Buffer.from(providedSig, 'hex');
+  const expectedBuf = Buffer.from(expectedSig, 'hex');
+  if (providedBuf.length !== expectedBuf.length ||
+      !require('crypto').timingSafeEqual(providedBuf, expectedBuf)) {
+    throw new Error('Token signature invalid');
+  }
+  return subject;
+}
 import ConfigManager from "@/app/utils/config";
 
 // Explicit allow list of tools that AI agents are permitted to invoke.
@@ -14,19 +51,55 @@ const ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "weather",
   "wikipedia",
 ]);
-import { createHmac } from "crypto";
-import fs from "fs";
-import path from "path";
+import { createHmac, createHash } from "crypto";
+// fs and path are no longer used for audit logging; audit records are written to
+// stdout so that the host process / log aggregator can enforce append-only
+// storage, retention policy, and rotation (e.g. via logrotate, CloudWatch, etc.).
 
-const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit.log");
+/**
+ * Forensic audit record fields (all required):
+ *   timestamp      – ISO-8601 UTC
+ *   event          – event type / action taken
+ *   principal      – authenticated user ID (or "anonymous")
+ *   modelId        – model/agent identifier
+ *   modelVersion   – pinned version string extracted from the endpoint URL
+ *   inputHash      – SHA-256 hex digest of the serialised input payload
+ *   [extra fields] – any additional context supplied by the caller
+ *
+ * Records are written to stdout as newline-delimited JSON so that the host
+ * process / log aggregator (logrotate, CloudWatch, Splunk, etc.) can enforce
+ * append-only storage, retention policy (≥ 90 days recommended), and rotation.
+ */
+function writeAuditRecord(
+  record: Record<string, unknown>,
+  opts: {
+    principal: string;
+    modelId: string;
+    modelVersion: string;
+    inputPayload: unknown;
+  }
+): void {
+  const inputHash = createHash("sha256")
+    .update(JSON.stringify(opts.inputPayload))
+    .digest("hex");
 
-function writeAuditRecord(record: Record<string, unknown>): void {
-  const line = JSON.stringify(record) + "\n";
+  const fullRecord = {
+    timestamp: new Date().toISOString(),
+    principal: opts.principal,
+    modelId: opts.modelId,
+    modelVersion: opts.modelVersion,
+    inputHash,
+    ...record,
+  };
+
+  const line = JSON.stringify(fullRecord) + "\n";
   try {
-    fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+    // process.stdout.write is synchronous on most Node.js transports and
+    // ensures the record is flushed before the function returns.
+    process.stdout.write(line);
   } catch (err) {
-    // Audit write failure must not silently pass — re-throw so the request fails
-    // rather than proceeding without an audit trail.
+    // Audit write failure must not silently pass — re-throw so the request
+    // fails rather than proceeding without an audit trail.
     throw new Error(`Audit log write failed: ${err}`);
   }
 }
@@ -39,9 +112,8 @@ dotenv.config({ path: `.env.local` });
  * Add new approved, versioned agent endpoints to this set before use.
  */
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
-  // Example pinned, versioned Steamship agent endpoints:
-  // "https://your-workspace.steamship.run/your-agent/v1/generate",
-  // "https://your-workspace.steamship.run/your-agent/v2/generate",
+  // Add approved, versioned agent endpoints via the APPROVED_AGENT_ENDPOINTS environment variable.
+  // Only endpoints explicitly listed there will be permitted.
   ...(process.env.APPROVED_AGENT_ENDPOINTS
     ? process.env.APPROVED_AGENT_ENDPOINTS.split(",").map((u) => u.trim()).filter(Boolean)
     : []),
@@ -51,19 +123,23 @@ function isApprovedEndpoint(url: string): boolean {
   return APPROVED_MODEL_REGISTRY.has(url);
 }
 
-// Allowlist of approved hostnames for outbound agent fetches.
-const ALLOWED_AGENT_HOSTNAMES: string[] = [
-  "api.steamship.com",
-  "steamship.com",
-];
-
+// Derive allowed hostnames dynamically from the approved model registry.
+// Only hostnames present in APPROVED_MODEL_REGISTRY are permitted for outbound agent fetches.
 function isAllowedAgentUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     const hostname = parsed.hostname.toLowerCase();
-    return ALLOWED_AGENT_HOSTNAMES.some(
-      (allowed) => hostname === allowed || hostname.endsWith(`.${allowed}`)
-    );
+    for (const approvedUrl of APPROVED_MODEL_REGISTRY) {
+      try {
+        const approvedHostname = new URL(approvedUrl).hostname.toLowerCase();
+        if (hostname === approvedHostname) {
+          return true;
+        }
+      } catch {
+        // Skip malformed registry entries
+      }
+    }
+    return false;
   } catch {
     return false;
   }
@@ -314,7 +390,32 @@ export async function POST(req: Request) {
       status: "success",
     });
 
-    return NextResponse.json(responseBlocks);
+    // --- Synthetic Content Provenance & Watermarking ---
+    // Attach provenance metadata, a synthetic-origin label, and a
+    // cryptographic HMAC-SHA256 signature so downstream consumers can
+    // verify the AI-generated nature and integrity of this response.
+    const provenanceTimestamp = new Date().toISOString();
+    const modelId = agentUrl; // use the agent endpoint as the model identifier
+    const provenancePayload = {
+      content: responseBlocks,
+      provenance: {
+        synthetic: true,
+        label: "AI_GENERATED",
+        model_id: modelId,
+        generated_at: provenanceTimestamp,
+        origin: "steamship-agent",
+      },
+    };
+    const provenanceSignature = createHmac("sha256", agentSigningSecret)
+      .update(JSON.stringify(provenancePayload))
+      .digest("hex");
+    return NextResponse.json({
+      ...provenancePayload,
+      watermark: {
+        algorithm: "HMAC-SHA256",
+        signature: provenanceSignature,
+      },
+    });
   } else {
     const errorBody = await response.text();
 
@@ -379,6 +480,35 @@ export async function POST(req: Request) {
     if (containsDangerousContent(responseBlocks)) {
       console.error("ERROR: LLM response contains dynamic code execution primitives — rejecting.");
       return returnError(500, "The agent response contained unsafe content and was rejected.");
+    }
+
+    // Enforce ALLOWED_TOOLS: scan response blocks for any tool invocations and
+    // reject the response if a tool not on the allow list was invoked.
+    const blocksArray: unknown[] = Array.isArray(responseBlocks) ? responseBlocks : [responseBlocks];
+    for (const block of blocksArray) {
+      if (block !== null && typeof block === "object") {
+        const blockObj = block as Record<string, unknown>;
+        // Steamship blocks may carry tool invocation metadata under various keys.
+        const invokedTool =
+          (typeof blockObj["tool"] === "string" ? blockObj["tool"] : null) ??
+          (typeof blockObj["toolName"] === "string" ? blockObj["toolName"] : null) ??
+          (typeof blockObj["tool_name"] === "string" ? blockObj["tool_name"] : null);
+        if (invokedTool !== null) {
+          if (!ALLOWED_TOOLS.has(invokedTool)) {
+            console.error(
+              `ERROR: Agent attempted to invoke disallowed tool "${invokedTool}". ` +
+              `Allowed tools: ${[...ALLOWED_TOOLS].join(", ")}`
+            );
+            writeAuditRecord({
+              event: "disallowed_tool_invocation",
+              tool: invokedTool,
+              allowedTools: [...ALLOWED_TOOLS],
+              timestamp: new Date().toISOString(),
+            });
+            return returnError(403, `Tool "${invokedTool}" is not permitted by the agent tool allow list.`);
+          }
+        }
+      }
     }
 
     return NextResponse.json(responseBlocks)
