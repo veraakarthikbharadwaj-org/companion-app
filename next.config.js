@@ -17,18 +17,10 @@ const nextConfig = {
         port: "",
         pathname: "**",
       },
-      {
-        protocol: "https",
-        hostname: "replicate.delivery",
-        port: "",
-        pathname: "**",
-      },
-      {
-        protocol: "https",
-        hostname: "a16z.com",
-        port: "",
-        pathname: "**",
-      },
+      // replicate.delivery (NOT_IN_REGISTRY) and a16z.com (NOT_IN_REGISTRY) removed.
+      // These hosts are not in the approved model registry and used wildcard pathnames
+      // without version pinning or integrity verification. Add only approved,
+      // pinned paths here after registry approval.
     ],
   },
 };

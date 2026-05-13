@@ -83,8 +83,8 @@ export default function Examples() {
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
                   {example.title}. Running on <b>{example.llm}</b>.
-                  {example.telegramLink && (
-                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault}} href={example.telegramLink}>Chat on <b>Telegram</b></a>.</span>
+                  {getAllowedUrl(example.telegramLink, TELEGRAM_ALLOWED_HOSTNAMES) && (
+                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={getAllowedUrl(example.telegramLink, TELEGRAM_ALLOWED_HOSTNAMES)!}>Chat on <b>Telegram</b></a>.</span>
                   )}
                 </dd>
               </dl>
@@ -96,7 +96,7 @@ export default function Examples() {
                       data-tip="Helpful tip goes here"
                       className="text-sm text-slate-400 inline-block"
                     >
-                      📱Text me at: <b>{example.phone}</b>
+                      📱Text me at: <b>{maskPhone(example.phone)}</b>
                       &nbsp;
                       <svg
                         data-tooltip-id="help-tooltip"
@@ -125,7 +125,64 @@ export default function Examples() {
   );
 }
 
+const TELEGRAM_ALLOWED_HOSTNAMES: string[] = ['t.me', 'telegram.me', 'telegram.dog'];
+
+function getAllowedUrl(url: string | undefined, allowedHostnames: string[]): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:') return null;
+    if (allowedHostnames.includes(parsed.hostname)) {
+      return parsed.href;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function isPhoneNumber(input: string): boolean {
   const phoneNumberRegex = /^\+\d{1,11}$/;
   return phoneNumberRegex.test(input);
+}
+
+function getSafeTelegramLink(url: string): string | undefined {
+  try {
+    const parsed = new URL(url);
+    // Only allow https: protocol and restrict to t.me or telegram.me domains
+    if (
+      parsed.protocol === 'https:' &&
+      (parsed.hostname === 't.me' ||
+        parsed.hostname === 'telegram.me' ||
+        parsed.hostname.endsWith('.t.me') ||
+        parsed.hostname.endsWith('.telegram.me'))
+    ) {
+      return parsed.href;
+    }
+  } catch {
+    // Invalid URL
+  }
+  return undefined;
+}
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length < 4) return '***';
+  // Keep the '+' and country code (up to 3 chars after '+'), mask the middle, show last 2 digits
+  const visiblePrefix = phone.startsWith('+') ? phone.slice(0, 2) : phone.slice(0, 1);
+  const visibleSuffix = phone.slice(-2);
+  const maskedLength = phone.length - visiblePrefix.length - visibleSuffix.length;
+  const masked = '*'.repeat(Math.max(maskedLength, 1));
+  return `${visiblePrefix}${masked}${visibleSuffix}`;
+}
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length <= 4) return '****';
+  const lastFour = phone.slice(-4);
+  const masked = phone.slice(0, -4).replace(/\d/g, '*');
+  return masked + lastFour;
+}
+
+function maskPhone(phone: string): string {
+  if (!phone || phone.length < 4) return '****';
+  return '*'.repeat(phone.length - 4) + phone.slice(-4);
 }
