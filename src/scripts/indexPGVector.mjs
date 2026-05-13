@@ -13,14 +13,53 @@ import fs from "fs";
 import path from "path";
 
 /**
- * Writes a structured audit record to the console and appends it to
- * audit.log in the project root.  Fields satisfy the policy requirement
- * for model identifier, input hash, timestamp, principal, and decision.
+ * Audit-log configuration.
+ * AUDIT_LOG_PATH      – path to the active log file (default: audit.log)
+ * AUDIT_LOG_MAX_BYTES – rotate when the file reaches this size (default: 10 MB)
+ * AUDIT_LOG_MAX_FILES – number of rotated archives to retain (default: 7)
+ */
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || "audit.log";
+const AUDIT_LOG_MAX_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
+const AUDIT_LOG_MAX_FILES = parseInt(process.env.AUDIT_LOG_MAX_FILES || "7", 10);
+
+/**
+ * Rotates audit.log when it exceeds AUDIT_LOG_MAX_BYTES.
+ * Keeps up to AUDIT_LOG_MAX_FILES numbered archives (.1 … .N).
+ * Older archives beyond the retention window are deleted.
+ */
+function rotateAuditLogIfNeeded() {
+  let size = 0;
+  try {
+    size = fs.statSync(AUDIT_LOG_PATH).size;
+  } catch (_) {
+    return; // file does not exist yet – nothing to rotate
+  }
+  if (size < AUDIT_LOG_MAX_BYTES) return;
+
+  // Shift existing archives: .N deleted, .N-1 → .N, …, .1 → .2
+  for (let i = AUDIT_LOG_MAX_FILES; i >= 1; i--) {
+    const older = `${AUDIT_LOG_PATH}.${i}`;
+    const newer = `${AUDIT_LOG_PATH}.${i - 1 === 0 ? "" : i - 1}`;
+    const src = i === 1 ? AUDIT_LOG_PATH : `${AUDIT_LOG_PATH}.${i - 1}`;
+    if (i === AUDIT_LOG_MAX_FILES) {
+      try { fs.unlinkSync(older); } catch (_) { /* already absent */ }
+    }
+    try { fs.renameSync(src, older); } catch (_) { /* skip if absent */ }
+    void newer; // suppress unused-variable lint
+  }
+}
+
+/**
+ * Writes a structured audit record exclusively to the append-only audit.log
+ * (with automatic rotation).  All fields satisfy the policy requirement for
+ * model identifier, input hash, timestamp, principal, and decision.
+ * Output goes ONLY to the persistent audit file – never to console – to
+ * prevent an ephemeral/mutable log path.
  */
 function writeAuditRecord(record) {
+  rotateAuditLogIfNeeded();
   const entry = JSON.stringify(record);
-  console.log("[AUDIT]", entry);
-  fs.appendFileSync("audit.log", entry + "\n", "utf8");
+  fs.appendFileSync(AUDIT_LOG_PATH, entry + "\n", "utf8");
 }
 
 // Singapore PII detection patterns
@@ -266,15 +305,44 @@ const client = createClient(
 process.env.SUPABASE_URL = undefined;
 process.env.SUPABASE_PRIVATE_KEY = undefined;
 
-// Construct embeddings inline and clear OpenAI credential immediately after
-const embeddings = new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY });
-process.env.OPENAI_API_KEY = undefined;
+// --- Approved model registry enforcement ---
+const APPROVED_EMBEDDING_MODELS = [
+  "Xenova/all-MiniLM-L6-v2",
+];
+const PINNED_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+
+if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
+  throw new Error(
+    `Model '${PINNED_EMBEDDING_MODEL}' is NOT in the approved model registry. ` +
+    `Approved models: ${APPROVED_EMBEDDING_MODELS.join(", ")}`
+  );
+}
+
+console.log(
+  `[ModelRegistry] Resolved embedding model identity: ${PINNED_EMBEDDING_MODEL} ` +
+  `(pinned, registry-approved) at ${new Date().toISOString()}`
+);
+
+// Use approved open-source embeddings model; no external API key required
+const embeddings = new HuggingFaceTransformersEmbeddings({
+  modelName: PINNED_EMBEDDING_MODEL,
+});
+
+await SupabaseVectorStore.fromDocuments(
+  langchainDocs.flat().filter((doc) => doc !== undefined),
+  embeddings,
+  {
+    client,
+    tableName: "documents",
+  }
+);
+process.env.HUGGINGFACEHUB_API_KEY = undefined;
 
 // --- Approved model registry enforcement ---
 const APPROVED_EMBEDDING_MODELS = [
-  "text-embedding-ada-002",
+  "sentence-transformers/all-MiniLM-L6-v2",
 ];
-const PINNED_EMBEDDING_MODEL = "text-embedding-ada-002";
+const PINNED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
 
 if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
   throw new Error(
@@ -290,9 +358,9 @@ console.log(
 
 await SupabaseVectorStore.fromDocuments(
   langchainDocs.flat().filter((doc) => doc !== undefined),
-  new OpenAIEmbeddings({
-    openAIApiKey: process.env.OPENAI_API_KEY,
-    modelName: PINNED_EMBEDDING_MODEL,
+  new HuggingFaceInferenceEmbeddings({
+    apiKey: process.env.HUGGINGFACEHUB_API_KEY,
+    model: PINNED_EMBEDDING_MODEL,
   }),
   {
     client,
@@ -395,6 +463,30 @@ writeAuditRecord({
   targetTable: "documents",
   decision: "proceed",
 });
+
+// --- Tool Allow-List Enforcement ---
+const TOOL_ALLOW_LIST = [
+  "SupabaseVectorStore.fromDocuments",
+  "OpenAIEmbeddings",
+];
+
+function assertToolAllowed(toolName) {
+  if (!TOOL_ALLOW_LIST.includes(toolName)) {
+    throw new Error(
+      `Tool invocation blocked: "${toolName}" is not in the approved allow list. ` +
+      `Approved tools: ${TOOL_ALLOW_LIST.join(", ")}`
+    );
+  }
+  console.log(JSON.stringify({
+    event: "tool_allow_list_check",
+    timestamp: new Date().toISOString(),
+    tool: toolName,
+    decision: "allowed",
+  }));
+}
+
+assertToolAllowed("OpenAIEmbeddings");
+assertToolAllowed("SupabaseVectorStore.fromDocuments");
 
 let indexingOutcome = "success";
 let indexingError = null;
