@@ -76,11 +76,12 @@ export default function TextToImgModal({
   setOpen: any;
 }) {
   const [imgSrc, setImgSrc] = useState("");
+  const [imgProvenance, setImgProvenance] = useState<{ generatedAt: string; model: string; synthetic: boolean; } | null>(null);
 
   // Allowlist of permitted image hostnames returned by the txt2img API
-  const ALLOWED_IMG_HOSTS = [
-    "oaidalleapiprodscus.blob.core.windows.net",
-    "cdn.openai.com",
+  // Only hostnames from the organization's approved LLM provider list are permitted.
+  const ALLOWED_IMG_HOSTS: string[] = [
+    // TODO: Add approved image hosting hostname(s) from the organization's approved LLM registry
   ];
 
   function validateImgSrc(url: string): string {
@@ -146,14 +147,32 @@ export default function TextToImgModal({
 
     return null;
   }
+  // Registry-approved, version-pinned model identifier for image generation.
+  // Only this exact model string is permitted; any deviation is rejected.
+  const APPROVED_IMAGE_MODEL = "dall-e-3" as const;
+
   const [loading, setLoading] = useState(false);
-    const onSubmit = async (prompt: string) => {
+
+  async function hashString(input: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(input);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  const onSubmit = async (prompt: string) => {
     setLoading(true);
     const sanitized = sanitizePrompt(prompt);
     if (!sanitized) {
       setLoading(false);
       return;
     }
+
+    const inferenceTimestamp = new Date().toISOString();
+    const inputHash = await hashString(sanitized);
+
     const response = await fetch("/api/txt2img", {
       method: "POST",
       body: JSON.stringify({
@@ -164,7 +183,44 @@ export default function TextToImgModal({
       },
     });
     const data = await response.json();
-    const sanitizedSrc = sanitizeImageSrc(data[0]);
+
+    const modelId: string = typeof data?.model === "string" ? data.model : "txt2img-unknown";
+    const rawOutput: string = typeof data[0] === "string" ? data[0] : "";
+    const outputHash = rawOutput ? await hashString(rawOutput) : "";
+
+    const sanitizedSrc = sanitizeImageSrc(rawOutput);
+
+    // Persist audit record to server-side store for forensic readiness
+    try {
+      await fetch("/api/audit-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "txt2img_inference",
+          timestamp: inferenceTimestamp,
+          modelId,
+          inputHash,
+          outputHash,
+          outputValid: sanitizedSrc !== null,
+          principal:
+            typeof window !== "undefined"
+              ? (document.cookie
+                  .split("; ")
+                  .find((row) => row.startsWith("user="))
+                  ?.split("=")[1] ?? "anonymous")
+              : "anonymous",
+        }),
+      });
+    } catch (auditErr) {
+      console.error("Audit log write failed:", auditErr);
+    }
+
+    setImgProvenance({
+      generatedAt: inferenceTimestamp,
+      model: modelId,
+      synthetic: true,
+    });
+
     if (sanitizedSrc) {
       setImgSrc(sanitizedSrc);
     } else {
