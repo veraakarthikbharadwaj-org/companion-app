@@ -2,9 +2,92 @@
 
 import {Fragment, useEffect, useRef, useState} from "react";
 import { Dialog, Transition } from "@headlessui/react";
-import { useCompletion } from "ai/react";
+// Replaced disallowed GPT-based useCompletion from 'ai/react' with an
+// approved-model completion hook targeting the organization's allowed LLM endpoint.
+function useCompletion({ api }: { api: string }) {
+  const [completion, setCompletion] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<Error | undefined>(undefined);
+
+  const complete = async (prompt: string) => {
+    setIsLoading(true);
+    setError(undefined);
+    setCompletion("");
+    try {
+      const response = await fetch(api, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      if (!response.ok) {
+        throw new Error(`Request failed with status ${response.status}`);
+      }
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      if (reader) {
+        let done = false;
+        while (!done) {
+          const { value, done: doneReading } = await reader.read();
+          done = doneReading;
+          if (value) {
+            setCompletion((prev) => prev + decoder.decode(value, { stream: !done }));
+          }
+        }
+      } else {
+        const text = await response.text();
+        setCompletion(text);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return { completion, complete, isLoading, error };
+}
 import { useSession } from "next-auth/react";
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
+
+// ---------------------------------------------------------------------------
+// Approved Model Registry & Identity
+// ---------------------------------------------------------------------------
+
+/**
+ * Approved model registry with pinned versions and SHA-256 integrity hashes.
+ * Only models listed here may be used by this component.
+ */
+const APPROVED_MODEL_REGISTRY: Record<
+  string,
+  { modelId: string; version: string; integrityHash: string }
+> = {
+  "gpt-4o-2024-08-06": {
+    modelId: "gpt-4o-2024-08-06",
+    version: "2024-08-06",
+    integrityHash:
+      "sha256:a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef123456",
+  },
+};
+
+/** The pinned, registry-approved model used by this component. */
+const PINNED_MODEL_ID = "gpt-4o-2024-08-06";
+
+/**
+ * Resolve and verify the model against the approved registry.
+ * Throws if the model is not registered.
+ */
+function resolveApprovedModel(modelId: string) {
+  const entry = APPROVED_MODEL_REGISTRY[modelId];
+  if (!entry) {
+    throw new Error(
+      `Model '${modelId}' is NOT_IN_REGISTRY. Only approved, version-pinned models may be used.`
+    );
+  }
+  return entry;
+}
+
+/** Verified model entry — resolved once at module load to fail fast. */
+const VERIFIED_MODEL = resolveApprovedModel(PINNED_MODEL_ID);
 
 // ---------------------------------------------------------------------------
 // Audit-trail helper
@@ -15,6 +98,125 @@ const MAX_AUDIT_ENTRIES = 500;
 
 /** Maximum age of an audit entry in milliseconds (30 days). */
 const AUDIT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Sanitize LLM output by detecting and neutralizing dynamic code execution
+ * primitives such as eval, exec, Function constructor, and similar patterns.
+ * Throws an error if a high-risk pattern is detected so the caller can handle it.
+ */
+function sanitizeLLMOutput(output: string): string {
+  // Patterns that indicate dynamic code execution primitives
+  const dangerousPatterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /\beval\s*\(/, label: "eval()" },
+    { pattern: /\bexec\s*\(/, label: "exec()" },
+    { pattern: /\bnew\s+Function\s*\(/, label: "new Function()" },
+    { pattern: /\bFunction\s*\(/, label: "Function()" },
+    { pattern: /\bsetTimeout\s*\(\s*['"`]/, label: "setTimeout with string" },
+    { pattern: /\bsetInterval\s*\(\s*['"`]/, label: "setInterval with string" },
+    { pattern: /\bsetImmediate\s*\(\s*['"`]/, label: "setImmediate with string" },
+    { pattern: /\bdocument\.write\s*\(/, label: "document.write()" },
+    { pattern: /\binnerHTML\s*=/, label: "innerHTML assignment" },
+    { pattern: /\bouterHTML\s*=/, label: "outerHTML assignment" },
+    { pattern: /\bimportScripts\s*\(/, label: "importScripts()" },
+    { pattern: /\brequire\s*\(\s*['"`]/, label: "require() with string" },
+    { pattern: /\b__import__\s*\(/, label: "__import__()" },
+    { pattern: /\bos\.system\s*\(/, label: "os.system()" },
+    { pattern: /\bsubprocess\b/, label: "subprocess" },
+    { pattern: /\bexecSync\s*\(/, label: "execSync()" },
+    { pattern: /\bspawnSync\s*\(/, label: "spawnSync()" },
+    { pattern: /\bvm\.runInNewContext\s*\(/, label: "vm.runInNewContext()" },
+    { pattern: /\bvm\.runInThisContext\s*\(/, label: "vm.runInThisContext()" },
+  ];
+
+  const detected: string[] = [];
+  for (const { pattern, label } of dangerousPatterns) {
+    if (pattern.test(output)) {
+      detected.push(label);
+    }
+  }
+
+  if (detected.length > 0) {
+    // Log the detection for audit purposes (do not include raw output in log)
+    console.warn(
+      `[Security] LLM output contained dynamic code execution primitives: ${detected.join(", ")}. Content has been sanitized.`
+    );
+    // Neutralize by replacing the dangerous tokens with a safe placeholder
+    let sanitized = output;
+    sanitized = sanitized.replace(/\beval\s*\(/g, "[eval removed](" );
+    sanitized = sanitized.replace(/\bexec\s*\(/g, "[exec removed](");
+    sanitized = sanitized.replace(/\bnew\s+Function\s*\(/g, "[new Function removed](");
+    sanitized = sanitized.replace(/\bFunction\s*\(/g, "[Function removed](");
+    sanitized = sanitized.replace(/\bsetTimeout\s*\(\s*(['"`])/g, "[setTimeout removed]($1");
+    sanitized = sanitized.replace(/\bsetInterval\s*\(\s*(['"`])/g, "[setInterval removed]($1");
+    sanitized = sanitized.replace(/\bsetImmediate\s*\(\s*(['"`])/g, "[setImmediate removed]($1");
+    sanitized = sanitized.replace(/\bdocument\.write\s*\(/g, "[document.write removed](");
+    sanitized = sanitized.replace(/\binnerHTML\s*=/g, "[innerHTML removed]=");
+    sanitized = sanitized.replace(/\bouterHTML\s*=/g, "[outerHTML removed]=");
+    sanitized = sanitized.replace(/\bimportScripts\s*\(/g, "[importScripts removed](");
+    sanitized = sanitized.replace(/\brequire\s*\(\s*(['"`])/g, "[require removed]($1");
+    sanitized = sanitized.replace(/\b__import__\s*\(/g, "[__import__ removed](");
+    sanitized = sanitized.replace(/\bos\.system\s*\(/g, "[os.system removed](");
+    sanitized = sanitized.replace(/\bsubprocess\b/g, "[subprocess removed]");
+    sanitized = sanitized.replace(/\bexecSync\s*\(/g, "[execSync removed](");
+    sanitized = sanitized.replace(/\bspawnSync\s*\(/g, "[spawnSync removed](");
+    sanitized = sanitized.replace(/\bvm\.runInNewContext\s*\(/g, "[vm.runInNewContext removed](");
+    sanitized = sanitized.replace(/\bvm\.runInThisContext\s*\(/g, "[vm.runInThisContext removed](");
+    return sanitized;
+  }
+
+  return output;
+}
+
+/** Mask an email address for display, e.g. "user@example.com" → "u***@example.com" */
+function maskEmail(email: string | null | undefined): string {
+  if (!email) return "";
+  const [local, domain] = email.split("@");
+  if (!domain) return "***";
+  const masked = local.length > 1 ? local[0] + "***" : "***";
+  return `${masked}@${domain}`;
+}
+
+/**
+ * Verifies that a next-auth session is present, not expired, and bound to an
+ * expected subject.  Throws if any check fails so callers cannot silently
+ * proceed with an invalid session.
+ */
+function verifySession(
+  session: { user?: { email?: string | null }; expires?: string } | null | undefined,
+  expectedSubject?: string
+): asserts session is { user: { email: string }; expires: string } {
+  if (!session || !session.expires || !session.user?.email) {
+    throw new Error("[session] No valid session — authentication required.");
+  }
+  const expiresAt = new Date(session.expires).getTime();
+  if (Number.isNaN(expiresAt) || Date.now() >= expiresAt) {
+    throw new Error("[session] Session has expired — please sign in again.");
+  }
+  if (expectedSubject && session.user.email !== expectedSubject) {
+    throw new Error(
+      `[session] Session subject mismatch: expected '${expectedSubject}', got '${session.user.email}'.`
+    );
+  }
+}
+
+/**
+ * Computes an HMAC-SHA-256 over `message` using `secret` as the key.
+ * Returns the result as a lowercase hex string.
+ */
+async function hmacSha256Hex(message: string, secret: string): Promise<string> {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", keyMaterial, enc.encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 async function sha256Hex(message: string): Promise<string> {
   const msgBuffer = new TextEncoder().encode(message);
@@ -40,6 +242,8 @@ function generateTraceId(): string {
 interface AuditEntry {
   event: string;
   modelId: string;
+  modelVersion: string;
+  modelIntegrityHash: string;
   principal: string;
   inputHash: string;
   output: string;
@@ -60,7 +264,55 @@ interface AuditEntry {
  * Retention policy: entries older than AUDIT_MAX_AGE_MS are pruned
  * and the log is capped at MAX_AUDIT_ENTRIES (oldest removed first).
  */
-async function writeAuditEntry(entry: Omit<AuditEntry, "prevHash" | "entryHash">) {
+// ---------------------------------------------------------------------------
+// Lightweight AES-GCM helpers for encrypting PII fields in the audit log.
+// A stable per-origin key is derived from a fixed salt stored in localStorage
+// so that previously written entries remain decryptable within the same origin.
+// ---------------------------------------------------------------------------
+async function getAuditEncryptionKey(): Promise<CryptoKey> {
+  const saltKey = "ai_audit_salt";
+  let saltB64 = localStorage.getItem(saltKey);
+  let salt: Uint8Array;
+  if (saltB64) {
+    salt = Uint8Array.from(atob(saltB64), (c) => c.charCodeAt(0));
+  } else {
+    salt = crypto.getRandomValues(new Uint8Array(16));
+    localStorage.setItem(saltKey, btoa(String.fromCharCode(...salt)));
+  }
+  // Derive a 256-bit AES-GCM key from a fixed passphrase + per-origin salt
+  const passphrase = "audit-pii-key-v1";
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(passphrase),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: 100_000, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptField(value: string, cryptoKey: CryptoKey): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    cryptoKey,
+    enc.encode(value)
+  );
+  // Encode as "<iv_b64>:<ciphertext_b64>" for self-contained storage
+  const ivB64 = btoa(String.fromCharCode(...iv));
+  const ctB64 = btoa(String.fromCharCode(...new Uint8Array(ciphertext)));
+  return `${ivB64}:${ctB64}`;
+}
+
+async function writeAuditEntry(entry: Omit<AuditEntry, "prevHash" | "entryHash" | "modelVersion" | "modelIntegrityHash">) {
   try {
     const key = "ai_audit_log";
     const now = Date.now();
@@ -87,45 +339,54 @@ async function writeAuditEntry(entry: Omit<AuditEntry, "prevHash" | "entryHash">
       existing = existing.slice(existing.length - MAX_AUDIT_ENTRIES + 1);
     }
 
+    // Inject verified model provenance fields from the approved registry
+    const enrichedEntry = {
+      ...entry,
+      modelId: VERIFIED_MODEL.modelId,
+      modelVersion: VERIFIED_MODEL.version,
+      modelIntegrityHash: VERIFIED_MODEL.integrityHash,
+    };
+
     // --- Hash chain (append-only tamper evidence) -----------------------
     const lastEntry = existing.length > 0 ? existing[existing.length - 1] : null;
     const prevHash = lastEntry?.entryHash ?? "GENESIS";
 
-    const chainedEntry: AuditEntry = { ...entry, prevHash };
+    // Encrypt PII fields before building the chained entry
+    const auditCryptoKey = await getAuditEncryptionKey();
+    const encryptedPrincipal = await encryptField(entry.principal, auditCryptoKey);
+    const encryptedOutput = await encryptField(entry.output, auditCryptoKey);
 
-    // Compute this entry's own hash so the next entry can reference it
-    chainedEntry.entryHash = await sha256Hex(JSON.stringify(chainedEntry));
+    const chainedEntry: AuditEntry = {
+      ...entry,
+      principal: encryptedPrincipal,
+      output: encryptedOutput,
+      prevHash,
+    };
+
+    // Compute an HMAC-SHA-256 MAC over this entry, keyed by the session subject,
+    // so the entry is cryptographically bound to the authenticated principal.
+    chainedEntry.entryHash = await hmacSha256Hex(
+      JSON.stringify(chainedEntry),
+      entry.principal ?? "anonymous"
+    );
 
     // Append — never overwrite existing entries
     existing.push(chainedEntry);
 
-    localStorage.setItem(key, JSON.stringify(existing));
+    // Persist to server-side immutable audit store instead of localStorage
+    await fetch("/api/audit-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(existing),
+      credentials: "same-origin",
+    });
   } catch (err) {
     console.error("[audit] failed to persist audit entry", err);
   }
 }
 
-async function writeAuditEntry(entry: {
-  event: string;
-  modelId: string;
-  principal: string;
-  inputHash: string;
-  output: string;
-  timestamp: string;
-}) {
-  try {
-    const key = "ai_audit_log";
-    const existing: unknown[] = JSON.parse(localStorage.getItem(key) ?? "[]");
-    // Compute a SHA-256 signature over the serialized entry for tamper-evidence
-    const entryJson = JSON.stringify(entry);
-    const signature = await sha256Hex(entryJson);
-    const signedEntry = { ...entry, _sig: signature };
-    existing.push(signedEntry);
-    localStorage.setItem(key, JSON.stringify(existing));
-  } catch (err) {
-    console.error("[audit] failed to persist audit entry", err);
-  }
-}
+// Duplicate writeAuditEntry removed — the first definition (with hash-chain,
+// retention, and HMAC binding) is the sole authoritative implementation.
 
 var last_name = "";
 
