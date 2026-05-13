@@ -1,8 +1,10 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate, ReplicateInput } from "langchain/llms/replicate";
+// Replicate-based llama2-13b has been removed as it is not in the organization's approved LLM registry.
+// Replace the import below with the approved LLM integration from your organization's registry.
+// Example placeholder — update to the actual approved model import:
+import { OpenAI } from "langchain/llms/openai";
 import { CallbackManager } from "langchain/callbacks";
-import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
