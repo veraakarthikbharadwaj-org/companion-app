@@ -20,7 +20,7 @@ FROM base as build
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends python-is-python3 pkg-config build-essential && \
     apt-get clean && \
-    find /var/lib/apt/lists -mindepth 1 -delete
+    rm -rf /var/lib/apt/lists/*
 
 # Install node modules
 COPY --link package-lock.json package.json ./
