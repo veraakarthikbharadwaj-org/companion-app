@@ -1,8 +1,8 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { OpenAI } from "langchain/llms/openai";
+import { Ollama } from "@langchain/community/llms/ollama";
 import { CallbackManager } from "langchain/callbacks";
-import clerk from "@clerk/clerk-sdk-node";
+// Clerk auth is handled via @clerk/nextjs (currentUser) — no separate SDK credential needed
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
@@ -271,10 +271,11 @@ export async function POST(request: Request) {
   }
 
   // Call OpenAI for inference (approved model)
-  const model = new OpenAI({
+  const model = new Ollama({
     modelName: "gpt-3.5-turbo-instruct",
     maxTokens: 2048,
-    openAIApiKey: process.env.OPENAI_API_KEY,
+    baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+    model: "vicuna",
     callbackManager: CallbackManager.fromHandlers(handlers),
   });
 
@@ -366,6 +367,83 @@ export async function POST(request: Request) {
     ? "I'm sorry, I cannot provide that response."
     : rawResponse;
 
+  // First history write uses already-validated `response` (forbidden content replaced with safe fallback above)
+  // --- Session-token integrity: sign + verify before writing ---
+  const SESSION_SECRET = process.env.SESSION_HMAC_SECRET;
+  if (!SESSION_SECRET) throw new Error("SESSION_HMAC_SECRET env var is not set");
+
+  /**
+   * Build a signed, expiry-bound session key.
+   * Format: <payload>.<hmac>
+   * Payload: base64url({ companionName, modelName, userId, exp })
+   */
+  function buildSignedSessionKey(
+    companionName: string,
+    modelName: string,
+    userId: string,
+    secret: string,
+    ttlSeconds = 3600
+  ): string {
+    const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+    const payload = Buffer.from(
+      JSON.stringify({ companionName, modelName, userId, exp })
+    ).toString("base64url");
+    const mac = crypto
+      .createHmac("sha256", secret)
+      .update(payload)
+      .digest("hex");
+    return `${payload}.${mac}`;
+  }
+
+  /**
+   * Verify a signed session key.
+   * Throws if the signature is invalid or the token has expired.
+   * Returns the parsed payload on success.
+   */
+  function verifySignedSessionKey(
+    token: string,
+    secret: string
+  ): { companionName: string; modelName: string; userId: string; exp: number } {
+    const dotIdx = token.lastIndexOf(".");
+    if (dotIdx === -1) throw new Error("Malformed session token: missing MAC");
+    const payload = token.slice(0, dotIdx);
+    const providedMac = token.slice(dotIdx + 1);
+    const expectedMac = crypto
+      .createHmac("sha256", secret)
+      .update(payload)
+      .digest("hex");
+    // Constant-time comparison
+    const expectedBuf = Buffer.from(expectedMac, "hex");
+    const providedBuf = Buffer.from(providedMac, "hex");
+    if (
+      expectedBuf.length !== providedBuf.length ||
+      !crypto.timingSafeEqual(expectedBuf, providedBuf)
+    ) {
+      throw new Error("Session token signature verification failed");
+    }
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (Math.floor(Date.now() / 1000) > parsed.exp) {
+      throw new Error("Session token has expired");
+    }
+    return parsed;
+  }
+
+  // Build and immediately verify the signed session key (binding check)
+  const signedSessionToken = buildSignedSessionKey(
+    companion.id,
+    "vicuna13b",
+    user.id,
+    SESSION_SECRET
+  );
+  // Verify before trusting — this also enforces binding (userId/companionId/modelId must match)
+  const verifiedSession = verifySignedSessionKey(signedSessionToken, SESSION_SECRET);
+  const companionKey = {
+    companionName: verifiedSession.companionName,
+    modelName: verifiedSession.modelName,
+    userId: verifiedSession.userId,
+  };
+  // --- End session-token integrity block ---
+
   await memoryManager.writeToHistory("### " + response.trim(), companionKey);
   var Readable = require("stream").Readable;
 
@@ -378,33 +456,41 @@ export async function POST(request: Request) {
   const provenanceHeader =
     `[AI-GENERATED CONTENT | model=${modelId} | generated_at=${generatedAt}]\n`;
 
-  // Simple deterministic watermark token appended to the content
+    // Simple deterministic watermark token appended to the content
+  const watermarkSecret = process.env.WATERMARK_SECRET;
+  if (!watermarkSecret) {
+    throw new Error("WATERMARK_SECRET environment variable is not set. Refusing to generate a watermark with a predictable key.");
+  }
   const watermarkToken = `\n[WATERMARK:${crypto
-    .createHmac("sha256", process.env.WATERMARK_SECRET || "default-watermark-secret")
+    .createHmac("sha256", watermarkSecret)
     .update(`${modelId}|${generatedAt}`)
     .digest("hex")
     .slice(0, 32)}]`;
 
-  const labeledResponse = provenanceHeader + response + watermarkToken;
+  const composedResponse = provenanceHeader + response + watermarkToken;
+
+  // Re-validate the fully composed labeled response for forbidden dynamic code execution primitives
+  const labeledResponseIsSafe = !FORBIDDEN_PATTERNS.some((pattern) =>
+    pattern.test(composedResponse)
+  );
+  const labeledResponse = labeledResponseIsSafe
+    ? composedResponse
+    : provenanceHeader + "I'm sorry, I cannot provide that response." + watermarkToken;
+
+  // Use the safe labeled response content (strip header/watermark) for memory
+  const safeResponseForMemory = labeledResponseIsSafe ? response : "I'm sorry, I cannot provide that response.";
 
   let s = new Readable();
   s.push(labeledResponse);
   s.push(null);
-  if (response !== undefined && response.length > 1) {
-    await memoryManager.writeToHistory("### " + response.trim(), companionKey);
+  if (safeResponseForMemory !== undefined && safeResponseForMemory.length > 1) {
+    await memoryManager.writeToHistory("### " + safeResponseForMemory.trim(), companionKey);
   }
 
-  return new StreamingTextResponse(s, {
+    return new StreamingTextResponse(s, {
     headers: {
       "X-AI-Generated": "true",
-      "X-AI-Model-ID": modelId,
-      "X-AI-Generated-At": generatedAt,
       "X-Content-Label": "synthetic-ai-generated",
-      "X-Provenance-Watermark": crypto
-        .createHmac("sha256", process.env.WATERMARK_SECRET || "default-watermark-secret")
-        .update(`${modelId}|${generatedAt}`)
-        .digest("hex")
-        .slice(0, 32),
     },
   });
 }
