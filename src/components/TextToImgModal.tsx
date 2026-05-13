@@ -6,6 +6,68 @@ import { Fragment, useState } from "react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
 
+function sanitizePrompt(input: string): string {
+  if (!input || typeof input !== "string") return "";
+
+  // Enforce maximum length
+  let sanitized = input.slice(0, 500);
+
+  // Remove control characters and null bytes
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Reject if base64-encoded content is detected
+  if (/^[A-Za-z0-9+/]{20,}={0,2}$/.test(sanitized.trim())) {
+    throw new Error("Encoded content is not allowed in prompts.");
+  }
+
+  // Reject URL-encoded sequences
+  if (/%[0-9A-Fa-f]{2}/.test(sanitized)) {
+    throw new Error("URL-encoded content is not allowed in prompts.");
+  }
+
+  // Block shell command patterns
+  const shellPatterns = [
+    /`[^`]*`/,
+    /\$\([^)]*\)/,
+    /;\s*(rm|curl|wget|bash|sh|python|perl|ruby|nc|ncat|exec|eval)\b/i,
+    /&&\s*(rm|curl|wget|bash|sh|python|perl|ruby|nc|ncat|exec|eval)\b/i,
+    /\|\s*(rm|curl|wget|bash|sh|python|perl|ruby|nc|ncat|exec|eval)\b/i,
+    /\b(eval|exec|system|popen|subprocess)\s*\(/i,
+  ];
+  for (const pattern of shellPatterns) {
+    if (pattern.test(sanitized)) {
+      throw new Error("Shell commands are not allowed in prompts.");
+    }
+  }
+
+  // Block prompt injection patterns
+  const injectionPatterns = [
+    /ignore (previous|all|above|prior) instructions?/i,
+    /disregard (previous|all|above|prior) instructions?/i,
+    /forget (previous|all|above|prior) instructions?/i,
+    /you are now/i,
+    /act as (a |an )?(?!image)/i,
+    /system prompt/i,
+    /<\s*script[^>]*>/i,
+    /\[INST\]/i,
+    /<<SYS>>/i,
+  ];
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(sanitized)) {
+      throw new Error("Prompt injection content is not allowed.");
+    }
+  }
+
+  return sanitized.trim();
+}
+
+function sanitizePrompt(input: string): string {
+  // Trim whitespace and enforce a maximum length
+  const trimmed = input.trim().slice(0, 500);
+  // Remove characters commonly used in prompt injection attacks
+  return trimmed.replace(/[`<>{}\\]/g, "");
+}
+
 export default function TextToImgModal({
   open,
   setOpen,
@@ -14,21 +76,100 @@ export default function TextToImgModal({
   setOpen: any;
 }) {
   const [imgSrc, setImgSrc] = useState("");
+
+  // Allowlist of permitted image hostnames returned by the txt2img API
+  const ALLOWED_IMG_HOSTS = [
+    "oaidalleapiprodscus.blob.core.windows.net",
+    "cdn.openai.com",
+  ];
+
+  function validateImgSrc(url: string): string {
+    try {
+      const parsed = new URL(url);
+      if (
+        (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+        ALLOWED_IMG_HOSTS.includes(parsed.hostname)
+      ) {
+        return url;
+      }
+    } catch {
+      // invalid URL
+    }
+    return "";
+  }
+
+  function sanitizePrompt(raw: string): string {
+    // Strip control characters and limit length to reduce prompt injection risk
+    return raw.replace(/[\x00-\x1F\x7F]/g, "").slice(0, 500);
+  }
+  const [imgProvenance, setImgProvenance] = useState<{
+    generatedAt: string;
+    model: string;
+    synthetic: boolean;
+  } | null>(null);
+
+  /**
+   * Validates and sanitizes an image source returned from the AI model.
+   * Accepts only:
+   *   - Base64-encoded image data URIs (data:image/...;base64,...)
+   *   - HTTPS URLs pointing to image resources
+   * Rejects any value containing dynamic code execution primitives.
+   */
+  function sanitizeImageSrc(src: unknown): string | null {
+    if (typeof src !== "string") return null;
+
+    // Block any dynamic code execution primitives
+    const forbidden = [
+      /\beval\b/i,
+      /javascript:/i,
+      /vbscript:/i,
+      /data:text/i,
+      /data:application/i,
+      /<script/i,
+      /on\w+\s*=/i,
+    ];
+    for (const pattern of forbidden) {
+      if (pattern.test(src)) return null;
+    }
+
+    // Allow only safe base64 image data URIs
+    const base64ImagePattern = /^data:image\/(png|jpeg|jpg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$/;
+    if (base64ImagePattern.test(src)) return src;
+
+    // Allow only HTTPS image URLs
+    try {
+      const url = new URL(src);
+      if (url.protocol === "https:") return src;
+    } catch {
+      // Not a valid URL
+    }
+
+    return null;
+  }
   const [loading, setLoading] = useState(false);
-  const onSubmit = async (e: any) => {
-    e.preventDefault();
+    const onSubmit = async (prompt: string) => {
     setLoading(true);
+    const sanitized = sanitizePrompt(prompt);
+    if (!sanitized) {
+      setLoading(false);
+      return;
+    }
     const response = await fetch("/api/txt2img", {
       method: "POST",
       body: JSON.stringify({
-        prompt: e.target.value,
+        prompt: sanitized,
       }),
       headers: {
         "Content-Type": "application/json",
       },
     });
     const data = await response.json();
-    setImgSrc(data[0]);
+    const sanitizedSrc = sanitizeImageSrc(data[0]);
+    if (sanitizedSrc) {
+      setImgSrc(sanitizedSrc);
+    } else {
+      console.error("Invalid or unsafe image source returned from AI model.");
+    }
     setLoading(false);
   };
   return (
@@ -62,23 +203,20 @@ export default function TextToImgModal({
                   <input
                     className="w-full flex-auto rounded-md border-0 bg-white/5 px-3.5 py-2 text-white shadow-sm focus:outline-none  sm:text-sm sm:leading-6"
                     placeholder="Describe the image you want"
+                    value={promptValue}
+                    onChange={handlePromptChange}
+                    maxLength={500}
                     // when user click enter key, submit the form
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
-                        onSubmit(e);
+                        onSubmit((e.target as HTMLInputElement).value);
                       }
                     }}
                   ></input>
-                  <div className="mt-3">
+                  <div className="mt-3" role="region" aria-label="AI-generated image output">
                     <div className="my-2">
-                      <p className="text-sm text-gray-500">
-                        Powered by{" "}
-                        <a
-                          className="underline"
-                          href="https://replicate.com/stability-ai/stable-diffusion"
-                        >
-                          stability-ai/stable-diffusion
-                        </a>
+                                            <p className="text-sm text-gray-500">
+                        Powered by an approved image generation service
                       </p>
                     </div>
                   </div>
