@@ -1,5 +1,25 @@
 import { PromptTemplate } from "langchain/prompts";
 
+// Explicit tool allow list — only these LangChain capabilities may be invoked.
+const TOOL_ALLOW_LIST = Object.freeze([
+  "PromptTemplate",
+  "LLMChain",
+]);
+
+/**
+ * Enforces the tool allow list before any LangChain tool/capability is executed.
+ * Throws if the requested tool is not in the approved allow list.
+ * @param {string} toolName - The name of the tool or capability to be invoked.
+ */
+function enforceToolAllowList(toolName) {
+  if (!TOOL_ALLOW_LIST.includes(toolName)) {
+    throw new Error(
+      `[tool-allow-list] Blocked: "${toolName}" is not in the approved tool allow list. ` +
+      `Approved tools: ${TOOL_ALLOW_LIST.join(", ")}`
+    );
+  }
+}
+
 import path from "path";
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -14,7 +34,50 @@ const AUDIT_LOG_MAX_FILES = 30;       // retain at most 30 audit log files
 const AUDIT_LOG_MAX_AGE_DAYS = 30;   // delete files older than 30 days
 
 /**
+ * Prompts a human operator for approval before performing a destructive operation.
+ * In non-interactive / CI environments, set AUDIT_RETENTION_AUTO_APPROVE=true to
+ * skip the prompt (must be an explicit opt-in by a human operator).
+ *
+ * @param {string[]} filesToDelete - List of file names scheduled for deletion.
+ * @returns {Promise<boolean>} Resolves to true if the operator approved.
+ */
+async function requestHITLApproval(filesToDelete) {
+  if (process.env.AUDIT_RETENTION_AUTO_APPROVE === "true") {
+    console.warn(
+      "[audit] HITL: AUDIT_RETENTION_AUTO_APPROVE is set — skipping interactive prompt. " +
+        `${filesToDelete.length} file(s) will be deleted.`
+    );
+    return true;
+  }
+
+  // Interactive approval via stdin.
+  const { createInterface } = await import("readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  console.warn("[audit] HITL approval required before deleting audit log files.");
+  console.warn(`[audit] The following ${filesToDelete.length} file(s) are scheduled for deletion:`);
+  filesToDelete.forEach((f) => console.warn(`  - ${f}`));
+
+  return new Promise((resolve) => {
+    rl.question(
+      "[audit] Type 'yes' to approve deletion, anything else to cancel: ",
+      (answer) => {
+        rl.close();
+        const approved = answer.trim().toLowerCase() === "yes";
+        if (approved) {
+          console.warn("[audit] HITL: deletion approved by operator.");
+        } else {
+          console.warn("[audit] HITL: deletion cancelled by operator.");
+        }
+        resolve(approved);
+      }
+    );
+  });
+}
+
+/**
  * Enforces retention policy: removes audit log files beyond MAX_FILES or older than MAX_AGE_DAYS.
+ * Requires explicit Human-in-the-Loop (HITL) approval before any files are deleted.
  */
 async function enforceAuditRetention() {
   try {
@@ -25,11 +88,25 @@ async function enforceAuditRetention() {
       .sort((a, b) => b.ts - a.ts); // newest first
 
     const cutoffMs = Date.now() - AUDIT_LOG_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
-    for (let i = 0; i < auditFiles.length; i++) {
-      const { name, ts } = auditFiles[i];
-      if (i >= AUDIT_LOG_MAX_FILES || ts < cutoffMs) {
-        await fs.unlink(path.join(AUDIT_LOG_DIR, name)).catch(() => {});
-      }
+
+    // Collect files that would be deleted under the retention policy.
+    const filesToDelete = auditFiles
+      .filter(({ ts }, i) => i >= AUDIT_LOG_MAX_FILES || ts < cutoffMs)
+      .map(({ name }) => name);
+
+    if (filesToDelete.length === 0) {
+      return; // Nothing to delete — no approval needed.
+    }
+
+    // HITL gate: a human must approve before any deletion proceeds.
+    const approved = await requestHITLApproval(filesToDelete);
+    if (!approved) {
+      console.warn("[audit] Retention sweep aborted — operator did not approve deletion.");
+      return;
+    }
+
+    for (const name of filesToDelete) {
+      await fs.unlink(path.join(AUDIT_LOG_DIR, name)).catch(() => {});
     }
   } catch (err) {
     console.warn("[audit] retention sweep failed:", err.message);
@@ -361,13 +438,76 @@ function sanitizeLLMOutput(text) {
   return text;
 }
 
+const MAX_SPAWNS = 3;
+
+/**
+ * Validates and sanitizes a spawn input question before it is passed to a subagent.
+ * Only questions matching expected prefixes are allowed; others are rejected.
+ * The companion name segment is also length-capped to prevent injection via long inputs.
+ */
+function sanitizeSpawnInput(question, idx) {
+  if (typeof question !== "string") {
+    throw new Error(`[subagent:guard] index=${idx} question is not a string`);
+  }
+  const ALLOWED_PREFIXES = [
+    "Greeting:",
+    "Short Description:",
+    "Long Description:",
+  ];
+  const hasAllowedPrefix = ALLOWED_PREFIXES.some((prefix) =>
+    question.startsWith(prefix)
+  );
+  if (!hasAllowedPrefix) {
+    throw new Error(
+      `[subagent:guard] index=${idx} question does not match any allowed prefix. Refusing spawn.`
+    );
+  }
+  // Cap total length to prevent excessively large task instructions
+  const MAX_QUESTION_LENGTH = 512;
+  if (question.length > MAX_QUESTION_LENGTH) {
+    console.warn(
+      `[subagent:guard] index=${idx} question exceeds max length; truncating.`
+    );
+    question = question.slice(0, MAX_QUESTION_LENGTH);
+  }
+  // Reject any dynamic code execution primitives embedded in the task instruction
+  const dangerousSpawnPatterns = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /\bnew\s+Function\s*\(/gi,
+    /\bimport\s*\(/gi,
+    /\brequire\s*\(/gi,
+    /\bspawn\s*\(/gi,
+    /\bsubprocess/gi,
+    /\bchild_process/gi,
+  ];
+  for (const pattern of dangerousSpawnPatterns) {
+    if (pattern.test(question)) {
+      throw new Error(
+        `[subagent:guard] index=${idx} question contains dangerous pattern ${pattern}. Refusing spawn.`
+      );
+    }
+  }
+  return question;
+}
+
 const questions = [
   `Greeting: What would ${safeCompanionName} say to start a conversation?`,
   `Short Description: In a few sentences, how would ${safeCompanionName} describe themselves?`,
   `Long Description: In a few sentences, how would ${safeCompanionName} describe themselves?`,
 ];
+
+// Enforce spawn counter guard before launching any parallel subagents
+if (questions.length > MAX_SPAWNS) {
+  throw new Error(
+    `[subagent:guard] Spawn count ${questions.length} exceeds MAX_SPAWNS=${MAX_SPAWNS}. Aborting.`
+  );
+}
+
 const results = await Promise.all(
   questions.map(async (question, idx) => {
+    // Validate and sanitize the task instruction before passing it to the subagent
+    question = sanitizeSpawnInput(question, idx);
     // Traceability: log each subagent spawn with index and question
     console.log(`[subagent:spawn] index=${idx} question="${question}"`);
     const timeoutPromise = new Promise((_, reject) =>
@@ -438,8 +578,19 @@ ${safeText}
 }
 output += `Definition (Advanced)\n[${recentChatTrimmed.length} recent chat entries — content omitted]`;
 
-await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, recentChat.join("\n"));
-const MODEL_ID_USED = "gpt-4o";
+import crypto from 'crypto';
+const CHAT_ENCRYPTION_KEY_HEX = process.env.CHAT_HISTORY_ENCRYPTION_KEY;
+if (!CHAT_ENCRYPTION_KEY_HEX || Buffer.from(CHAT_ENCRYPTION_KEY_HEX, 'hex').length !== 32) {
+  throw new Error('CHAT_HISTORY_ENCRYPTION_KEY must be set to a 64-character hex string (32 bytes) for AES-256-CBC encryption.');
+}
+const chatEncKey = Buffer.from(CHAT_ENCRYPTION_KEY_HEX, 'hex');
+const chatIv = crypto.randomBytes(16);
+const chatCipher = crypto.createCipheriv('aes-256-cbc', chatEncKey, chatIv);
+const chatPlaintext = recentChat.join('\n');
+const chatEncrypted = Buffer.concat([chatCipher.update(chatPlaintext, 'utf8'), chatCipher.final()]);
+const chatEncryptedPayload = chatIv.toString('hex') + ':' + chatEncrypted.toString('hex');
+await fs.writeFile(`${COMPANION_NAME}_chat_history.enc`, chatEncryptedPayload);
+const MODEL_ID_USED = "gpt-4";
 const { watermarked: signedOutput, signature } = addProvenanceAndWatermark(output, MODEL_ID_USED);
 console.log(`[Provenance] HMAC-SHA256 watermark for character AI data: ${signature}`);
 await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, signedOutput);

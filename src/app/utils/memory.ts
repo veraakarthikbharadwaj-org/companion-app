@@ -1,7 +1,5 @@
 import { Redis } from "@upstash/redis";
 import { CohereEmbeddings } from "langchain/embeddings/cohere";
-import { PineconeClient } from "@pinecone-database/pinecone";
-import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
 import { createHash, createHmac } from "crypto";
@@ -20,9 +18,14 @@ const DANGEROUS_PATTERNS = [
   /constructor\s*\[/i,
 ];
 
-const AI_CONTENT_MODEL_ID = process.env.OPENAI_MODEL_ID || "gpt-4";
+const AI_CONTENT_MODEL_ID = process.env.APPROVED_MODEL_ID || "command-r-plus";
 const AI_CONTENT_ORIGIN_TAG = "ai-generated:vector-retrieval";
-const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET || "change-me-in-production";
+const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET;
+if (!PROVENANCE_HMAC_SECRET || PROVENANCE_HMAC_SECRET === "change-me-in-production") {
+  throw new Error(
+    "PROVENANCE_HMAC_SECRET environment variable must be set to a strong secret before use."
+  );
+}
 
 function attachProvenance(docs: any[]): any[] {
   const timestamp = new Date().toISOString();
@@ -33,11 +36,17 @@ function attachProvenance(docs: any[]): any[] {
       timestamp,
       originTag: AI_CONTENT_ORIGIN_TAG,
     });
-    const signature = createHash("sha256")
-      .update(PROVENANCE_HMAC_SECRET + provenancePayload)
+    const signature = createHmac("sha256", PROVENANCE_HMAC_SECRET)
+      .update(provenancePayload)
       .digest("hex");
+    const watermark = `[AI_GENERATED | model:${AI_CONTENT_MODEL_ID} | ts:${timestamp}]`;
+    const watermarkedContent =
+      typeof doc.pageContent === "string"
+        ? `${doc.pageContent}\n${watermark}`
+        : doc.pageContent;
     return {
       ...doc,
+      pageContent: watermarkedContent,
       provenance: {
         modelId: AI_CONTENT_MODEL_ID,
         timestamp,
@@ -126,7 +135,7 @@ function sanitizeInput(input: string): string {
 
 class MemoryManager {
   private static instance: MemoryManager;
-  private auditLog: Array<{ key: string; value: string; ex: number }> = [];
+  private auditLog: Array<{ keyHash: string; action: string; principal: string; resultCount: number; ttl: number }> = [];
   private vectorDBClient: PineconeClient | SupabaseClient;
 
   public constructor() {
@@ -154,6 +163,34 @@ class MemoryManager {
     }
   }
 
+    /**
+   * Rotate the persistent audit log by removing entries older than AUDIT_RETENTION_MS.
+   * Reads the NDJSON file, filters out expired lines, and rewrites the file.
+   */
+  private rotateAuditLog(): void {
+    const logPath = MemoryManager.AUDIT_LOG_PATH;
+    if (!fs.existsSync(logPath)) return;
+    try {
+      const cutoff = Date.now() - MemoryManager.AUDIT_RETENTION_MS;
+      const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+      const retained = lines.filter((line) => {
+        try {
+          const entry = JSON.parse(line) as { timestamp: string };
+          return new Date(entry.timestamp).getTime() >= cutoff;
+        } catch {
+          return false; // drop malformed lines
+        }
+      });
+      fs.writeFileSync(logPath, retained.join("\n") + (retained.length ? "\n" : ""), { flag: "w" });
+    } catch (rotateErr) {
+      console.error("AUDIT ERROR: failed to rotate audit log.", rotateErr);
+    }
+  }
+
+  /**
+   * Append a single audit record to the persistent append-only NDJSON log.
+   * Includes principal, model version, input hash, and timestamp for forensic readiness.
+   */
   private async writeAuditRecord(
     principal: string,
     modelId: string,
@@ -162,18 +199,39 @@ class MemoryManager {
     backend: string
   ): Promise<void> {
     try {
-      const auditKey = `audit:vectorSearch:${Date.now()}:${principal}`;
+      const logDir = path.dirname(MemoryManager.AUDIT_LOG_PATH);
+      if (!fs.existsSync(logDir)) {
+        fs.mkdirSync(logDir, { recursive: true });
+      }
       const record = JSON.stringify({
         timestamp: new Date().toISOString(),
         action: "vectorSearch",
         principal,
-        modelId,
+        modelVersion: modelId,
         backend,
         inputHash,
         resultCount,
+        retentionPolicy: "90d",
       });
+      // Append-only write: each record is a newline-delimited JSON entry
+      fs.appendFileSync(MemoryManager.AUDIT_LOG_PATH, record + "\n", { flag: "a" });
+      // Enforce retention policy by rotating old entries periodically
+      this.rotateAuditLog();
+    } catch (auditErr) {
+      console.error("AUDIT ERROR: failed to write vectorSearch audit record.", auditErr);
+    }
+  }:${principal}`;
+      // Store only a hash of the key and minimal metadata — never the full record value
+      const crypto = await import("crypto");
+      const keyHash = crypto.createHash("sha256").update(auditKey).digest("hex");
       // Persist to Redis with a 90-day TTL (7_776_000 seconds)
-      this.auditLog.push({ key: auditKey, value: record, ex: 7_776_000 });
+      this.auditLog.push({
+        keyHash,
+        action: "vectorSearch",
+        principal,
+        resultCount,
+        ttl: 7_776_000,
+      });
       // Trim in-memory log to last 1000 entries to prevent unbounded growth
       if (this.auditLog.length > 1000) {
         this.auditLog.shift();

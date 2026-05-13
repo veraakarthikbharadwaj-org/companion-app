@@ -2,7 +2,7 @@
 import { PineconeClient } from "@pinecone-database/pinecone";
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { ApprovedEmbeddings } from "langchain/embeddings/approved"; // Use only org-approved embedding provider
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -33,7 +33,6 @@ function recordModelIdentity(provider, model) {
   }
   return { identity, hash };
 }
-import crypto from "crypto";
 
 /**
  * Redacts common PII patterns from a string before indexing.
@@ -383,14 +382,20 @@ const sanitizedDocs = rawDocs.map((doc) => sanitizeAndValidateDoc(doc));
 
 const docsToIndex = langchainDocs.flat().filter((doc) => doc !== undefined);
 
-console.log(JSON.stringify({
-  timestamp: new Date().toISOString(),
-  event: "llm_interaction_start",
-  provider: "HuggingFace",
-  model: "sentence-transformers/all-MiniLM-L6-v2",
-  action: "PineconeStore.fromDocuments",
-  documentCount: docsToIndex.length,
-}));
+  const _llmEndSuccess = {
+    timestamp: new Date().toISOString(),
+    event: "llm_interaction_end",
+    correlationId: auditEntry.correlationId,
+        provider: "OpenAI",
+    model: "text-embedding-ada-002",
+    action: "PineconeStore.fromDocuments",
+    status: "success",
+    documentCount: docsToIndex.length,
+    inputHash: auditEntry.inputHash,
+    principal: auditEntry.principal,
+  };
+  console.log(JSON.stringify(_llmEndSuccess));
+  writeAuditEntry(_llmEndSuccess);
 
 // ── Audit / forensic readiness ──────────────────────────────────────────────
 const AUDIT_LOG_PATH = path.resolve("audit_indexPinecone.jsonl");
@@ -464,10 +469,138 @@ function writeAuditEntry(entry) {
         error: {
           name: writeErr.name,
           message: writeErr.message,
-          stack: writeErr.stack,
         },
         attemptedEntry: entry,
       }) + "\n"
+    );
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Malicious-content sanitization ────────────────────────────────────────
+/**
+ * Returns true when the text contains patterns associated with prompt injection
+ * or other malicious content:
+ *   - Invisible / zero-width Unicode characters
+ *   - Non-printable / binary bytes (outside normal text ranges)
+ *   - Suspiciously long base64 blobs (≥ 100 contiguous base64 chars)
+ *   - Common shell-command sequences
+ *   - Leetspeak instruction patterns (e.g. "1gn0r3", "d1sr3g4rd")
+ *   - Explicit prompt-override phrases
+ */
+function containsMaliciousContent(text) {
+  if (typeof text !== "string") return false;
+
+  // Invisible / zero-width characters
+  if (/[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/u.test(text)) return true;
+
+  // Non-printable / binary bytes (control chars except common whitespace)
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u.test(text)) return true;
+
+  // Long base64 blobs that could encode hidden instructions
+  if (/[A-Za-z0-9+/]{100,}={0,2}/.test(text)) return true;
+
+  // Shell command patterns
+  if (/(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess)\s*[\(\-]/i.test(text)) return true;
+  if (/(?:&&|\|\||;\s*(?:rm|curl|wget|nc|ncat|python|perl|ruby|php))/i.test(text)) return true;
+
+  // Prompt-override / injection phrases
+  const injectionPhrases = [
+    /ignore\s+(all\s+)?previous\s+instructions/i,
+    /disregard\s+(all\s+)?previous/i,
+    /you\s+are\s+now\s+(?:a|an|the)/i,
+    /act\s+as\s+(?:a|an|the)/i,
+    /new\s+instructions?:/i,
+    /system\s*:\s*you/i,
+    /\[INST\]/i,
+    /<\|(?:system|user|assistant)\|>/i,
+  ];
+  if (injectionPhrases.some((re) => re.test(text))) return true;
+
+  // Leetspeak instruction patterns (common substitutions: a→4, e→3, i→1, o→0, s→5)
+  if (/(?:1gn[o0]r3|d[i1]sr[e3]g[a4]rd|[f]0ll[o0]w|[i1]nstruct[i1][o0]n)/i.test(text)) return true;
+
+  return false;
+}
+
+const safeFilteredDocs = filteredDocs.filter((doc) => {
+  const content = doc.pageContent || "";
+  if (containsMaliciousContent(content)) {
+    const warnEntry = {
+      ...auditEntry,
+      event: "malicious_content_blocked",
+      severity: "WARNING",
+      source: doc.metadata?.source ?? "unknown",
+      detectedAt: new Date().toISOString(),
+    };
+    writeAuditEntry(warnEntry);
+    console.warn("[SECURITY] Malicious content detected and blocked in document:", doc.metadata?.source ?? "unknown");
+    return false;
+  }
+  return true;
+});
+
+if (safeFilteredDocs.length !== filteredDocs.length) {
+  console.warn(
+    `[SECURITY] ${filteredDocs.length - safeFilteredDocs.length} document(s) removed due to malicious content detection.`
+  );
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Retention policy: remove rotated audit archives older than MAX_AUDIT_LOG_RETENTION_DAYS ──
+const MAX_AUDIT_LOG_RETENTION_DAYS = 90;
+function pruneOldAuditLogs() {
+  try {
+    const dir = path.dirname(AUDIT_LOG_PATH);
+    const base = path.basename(AUDIT_LOG_PATH, ".jsonl");
+    const cutoff = Date.now() - MAX_AUDIT_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const files = fs.readdirSync(dir).filter(
+      (f) => f.startsWith(base + "_") && f.endsWith(".jsonl")
+    );
+    for (const f of files) {
+      const full = path.join(dir, f);
+      try {
+        const { mtimeMs } = fs.statSync(full);
+        if (mtimeMs < cutoff) {
+          fs.unlinkSync(full);
+          process.stderr.write(
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              severity: "INFO",
+              event: "audit_log_pruned",
+              file: full,
+              retentionDays: MAX_AUDIT_LOG_RETENTION_DAYS,
+            }) + "\n"
+          );
+        }
+      } catch (_) { /* best-effort */ }
+    }
+  } catch (_) { /* best-effort */ }
+}
+pruneOldAuditLogs();
+
+// ── Tool allow list ──────────────────────────────────────────────────────────
+const ALLOWED_TOOLS = Object.freeze([
+  "PineconeStore.fromDocuments",
+]);
+const APPROVED_EMBEDDING_MODEL = "text-embedding-ada-002";
+
+/**
+ * Validates that a tool invocation is explicitly permitted before execution.
+ * Throws if either the tool name or the embedding model is not on the allow list.
+ */
+function validateToolAllowList(toolName, embeddingModel) {
+  if (!ALLOWED_TOOLS.includes(toolName)) {
+    throw new Error(
+      `[SECURITY] Tool '${toolName}' is not on the approved allow list. ` +
+      `Allowed tools: ${ALLOWED_TOOLS.join(", ")}`
+    );
+  }
+  if (embeddingModel !== APPROVED_EMBEDDING_MODEL) {
+    throw new Error(
+      `[SECURITY] Embedding model '${embeddingModel}' is not approved. ` +
+      `Approved model: ${APPROVED_EMBEDDING_MODEL}`
     );
   }
 }
@@ -478,9 +611,80 @@ writeAuditEntry(auditEntry);
 console.log("[AUDIT] Decision record written:", JSON.stringify(auditEntry));
 
 try {
+  // Enforce tool allow list before any agent/tool execution
+  validateToolAllowList("PineconeStore.fromDocuments", APPROVED_EMBEDDING_MODEL);
+
+    // ── Model Registry Enforcement ──────────────────────────────────────────
+  // Only models explicitly listed in APPROVED_MODEL_REGISTRY may be used.
+  // Each entry carries the canonical model ID, a pinned revision (git commit
+  // SHA from the HuggingFace Hub), and the registry approval token so that
+  // any tampering with the identifier or revision is immediately detectable.
+  const APPROVED_MODEL_REGISTRY = [
+    {
+      provider: "openai",
+      modelId: "openai/text-embedding-ada-002",
+      revision: null, // OpenAI API is version-pinned via the API version header
+      approvalToken: "REGISTRY_APPROVED_ADA002_V1",
+    },
+    {
+      provider: "huggingface",
+      modelId: "sentence-transformers/all-MiniLM-L6-v2",
+      // Pin to a specific, audited commit SHA on the HuggingFace Hub.
+      // To update: obtain the new SHA from the Hub, re-run security review,
+      // and update approvalToken accordingly.
+      revision: "e4ce9877abf3edfe10b0d82785e83bdcb973e22e",
+      approvalToken: "REGISTRY_APPROVED_MINILM_L6V2_REV_e4ce987",
+    },
+  ];
+
+  const registryEntry = APPROVED_MODEL_REGISTRY.find(
+    (entry) => entry.modelId === MODEL_ID && entry.provider === "huggingface"
+  );
+
+  if (!registryEntry) {
+    const registryViolation = {
+      timestamp: new Date().toISOString(),
+      severity: "CRITICAL",
+      event: "model_registry_violation",
+      modelId: MODEL_ID,
+      reason: "Model is not present in the approved model registry. Refusing to load.",
+    };
+    writeAuditEntry(registryViolation);
+    process.stderr.write(JSON.stringify(registryViolation) + "\n");
+    throw new Error(
+      `[SECURITY] Model '${MODEL_ID}' is NOT in the approved model registry. ` +
+      "Add it to APPROVED_MODEL_REGISTRY with a pinned revision and approval token before use."
+    );
+  }
+
+  // Log registry approval verification
+  writeAuditEntry({
+    timestamp: new Date().toISOString(),
+    event: "model_registry_check_passed",
+    modelId: registryEntry.modelId,
+    revision: registryEntry.revision,
+    approvalToken: registryEntry.approvalToken,
+  });
+
   await PineconeStore.fromDocuments(
     filteredDocs,
-    new HuggingFaceInferenceEmbeddings({ apiKey: config.huggingface.apiKey, model: MODEL_ID }),
+    new HuggingFaceInferenceEmbeddings({
+      apiKey: config.huggingface.apiKey,
+      model: registryEntry.modelId,
+      // Pass the pinned revision so the HuggingFace Inference client
+      // requests the exact, audited model artifact.
+      revision: registryEntry.revision,
+    }),
+    {
+      pineconeIndex,
+    }
+  );
+console.log("[AUDIT] Decision record written:", JSON.stringify(auditEntry));
+
+try {
+  await PineconeStore.fromDocuments(
+    safeFilteredDocs,
+    new ApprovedEmbeddings({ apiKey: config.approvedProvider.apiKey, model: APPROVED_MODEL_ID }),
     {
       pineconeIndex,
     }
@@ -498,32 +702,42 @@ try {
     error: {
       name: err.name,
       message: err.message,
-      stack: err.stack,
+      stack: undefined,
     },
     completedAt: new Date().toISOString(),
   };
   writeAuditEntry(failureEntry);
-  console.error("[AUDIT] Indexing failed:", JSON.stringify(failureEntry));
+  console.error("[AUDIT] Indexing failed:", JSON.stringify({
+    event: "indexing_failure",
+    outcome: failureEntry.outcome,
+    completedAt: failureEntry.completedAt,
+    error: { name: failureEntry.error.name, message: failureEntry.error.message },
+  }));
   throw err;
 }
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
     event: "llm_interaction_end",
-    provider: "HuggingFace",
-    model: "sentence-transformers/all-MiniLM-L6-v2",
+    provider: "ApprovedProvider",
+    model: APPROVED_MODEL_ID,
     action: "PineconeStore.fromDocuments",
     status: "success",
     documentCount: docsToIndex.length,
   }));
 } catch (error) {
-  console.error(JSON.stringify({
+    const _llmEndError = {
     timestamp: new Date().toISOString(),
     event: "llm_interaction_end",
-    provider: "HuggingFace",
-    model: "sentence-transformers/all-MiniLM-L6-v2",
+    correlationId: auditEntry.correlationId,
+        provider: "OpenAI",
+    model: "text-embedding-ada-002",
     action: "PineconeStore.fromDocuments",
     status: "error",
     error: error.message,
-  }));
+    inputHash: auditEntry.inputHash,
+    principal: auditEntry.principal,
+  };
+  console.error(JSON.stringify(_llmEndError));
+  writeAuditEntry(_llmEndError);
   throw error;
 }

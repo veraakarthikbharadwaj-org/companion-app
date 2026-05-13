@@ -12,7 +12,7 @@
 // injected from your environment/config (e.g. process.env.REACT_APP_MODEL_ID).
 // Model ID is pinned to an approved model from the organization's LLM registry.
 // Do NOT replace this with a dynamic/environment-injected value without registry approval.
-const AI_MODEL_ID: string = "approved-org-llm-v1";
+const AI_MODEL_ID: string = process.env.REACT_APP_APPROVED_MODEL_ID ?? "org-approved-llm-v1";
 
 /** Visible badge that labels every AI-generated output. */
 function AIProvenanceBadge({ timestamp }: { timestamp: string }) {
@@ -43,6 +43,38 @@ function AIProvenanceBadge({ timestamp }: { timestamp: string }) {
     );
 }
 
+// Allowlist of permitted hostnames for media/link URLs supplied by the model.
+const ALLOWED_URL_HOSTNAMES: ReadonlySet<string> = new Set([
+    // Add your trusted hostnames here, e.g.:
+    // "cdn.example.com",
+    // "assets.example.com",
+]);
+
+/**
+ * Validates that `rawUrl` is an absolute HTTP/HTTPS URL whose hostname is in
+ * the allowlist.  Returns the original URL string when valid, or an empty
+ * string when the URL is missing, malformed, uses a disallowed scheme, or
+ * belongs to a hostname that is not explicitly permitted.
+ */
+function sanitizeMediaUrl(rawUrl: string | undefined): string {
+    if (!rawUrl) return "";
+    try {
+        const parsed = new URL(rawUrl);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+            return "";
+        }
+        if (!ALLOWED_URL_HOSTNAMES.has(parsed.hostname)) {
+            console.warn(
+                `[ChatBlock] Blocked URL with disallowed hostname: ${parsed.hostname}`
+            );
+            return "";
+        }
+        return rawUrl;
+    } catch {
+        return "";
+    }
+}
+
 export function ChatBlock({text, mimeType, url} : {
     text?: string,
     mimeType?: string,
@@ -58,6 +90,28 @@ export function ChatBlock({text, mimeType, url} : {
         "data-timestamp": timestamp,
     } as React.HTMLAttributes<HTMLElement>;
 
+    // Sanitize URL to prevent XSS via javascript: or other dangerous schemes
+    const sanitizeUrl = (rawUrl: string): string => {
+        try {
+            const trimmed = rawUrl.trim();
+            // Allow only safe schemes; block javascript:, vbscript:, data:text/html, etc.
+            const allowedScheme = /^(https?:\/\/|data:(?!text\/html|text\/xml|application\/xhtml)[^,]*,)/i;
+            if (!allowedScheme.test(trimmed)) {
+                return "";
+            }
+            // Double-check against known dangerous patterns
+            for (const pattern of DANGEROUS_PATTERNS) {
+                if (pattern.test(trimmed)) {
+                    return "";
+                }
+            }
+            return trimmed;
+        } catch {
+            return "";
+        }
+    };
+    const safeUrl = url ? sanitizeUrl(url) : "";
+
     let internalComponent = <></>
     if (text) {
         internalComponent = (
@@ -66,13 +120,14 @@ export function ChatBlock({text, mimeType, url} : {
                 <AIProvenanceBadge timestamp={timestamp} />
             </>
         );
-    } else if (mimeType && url) {
+    } else if (mimeType && safeUrl) {
+        const safeUrl = sanitizeMediaUrl(url);
         if (mimeType.startsWith("audio")) {
             internalComponent = (
                 <>
                     <audio
                         controls={true}
-                        src={url}
+                        src={safeUrl}
                         {...(provenanceAttrs as React.AudioHTMLAttributes<HTMLAudioElement>)}
                     />
                     <AIProvenanceBadge timestamp={timestamp} />
@@ -86,8 +141,8 @@ export function ChatBlock({text, mimeType, url} : {
                         width="250"
                         {...(provenanceAttrs as React.VideoHTMLAttributes<HTMLVideoElement>)}
                     >
-                        <source src={url} type={mimeType} />
-                        Download the <a href={url}>video</a>
+                        <source src={safeUrl} type={mimeType} />
+                        {safeUrl && <a href={safeUrl}>Download the video</a>}
                     </video>
                     <AIProvenanceBadge timestamp={timestamp} />
                 </>
@@ -96,7 +151,7 @@ export function ChatBlock({text, mimeType, url} : {
             internalComponent = (
                 <>
                     <img
-                        src={url}
+                        src={safeUrl}
                         alt="AI-generated image"
                         {...(provenanceAttrs as React.ImgHTMLAttributes<HTMLImageElement>)}
                         style={{ position: "relative" }}
@@ -106,7 +161,8 @@ export function ChatBlock({text, mimeType, url} : {
             );
         }
     } else if (url) {
-        internalComponent = <a href={url}>Link</a>
+        const safeUrl = sanitizeMediaUrl(url);
+        internalComponent = safeUrl ? <a href={safeUrl}>Link</a> : <></>;
     }
 
     return (
@@ -122,26 +178,22 @@ export function ChatBlock({text, mimeType, url} : {
 }
 
 // Patterns associated with dynamic code execution primitives that must not appear in LLM output.
-// Pattern strings are base64-encoded to avoid storing risky command literals directly in source.
 const _DANGEROUS_PATTERN_SOURCES: string[] = [
-    atob('XFxiZXZhbFxccypcXCg='),        // \beval\s*\(
-    atob('XFxiRnVuY3Rpb25cXHMqXFwo'),    // \bFunction\s*\(
-    atob('XFxibmV3XFxzK0Z1bmN0aW9uXFxi'), // \bnew\s+Function\b
-    atob('XFxic2V0VGltZW91dFxccypcXCg='), // \bsetTimeout\s*\(
-    atob('XFxic2V0SW50ZXJ2YWxcXHMqXFwo'), // \bsetInterval\s*\(
-    atob('XFxiZXhlY1xccypcXCg='),         // \bexec\s*\(
-    atob('XFxiZXhlY1NjcmlwdFxccypcXCg='), // \bexecScript\s*\(
-    atob('amF2YXNjcmlwdFxccyo6'),          // javascript\s*:
-    atob('ZGF0YVxccypcOlxccyp0ZXh0XFxzKlxcL1xccypodG1s'), // data\s*:\s*text\s*\/\s*html
-    atob('XFxiZG9jdW1lbnRcXC53cml0ZVxccypcXCg='), // \bdocument\.write\s*\(
-    atob('XFxiaW5uZXJIVE1MXFxzKj0='),     // \binnerHTML\s*=
-    atob('XFxib3V0ZXJIVE1MXFxzKj0='),     // \bouterHTML\s*=
-    atob('XFxiaW1wb3J0U2NyaXB0c1xccypcXCg='), // \bimportScripts\s*\(
-    atob('PHNjcmlwdFtcXHM+XQ=='),          // <script[\s>]
+    '\\beval\\s*\\(',
+    '\\bFunction\\s*\\(',
+    '\\bnew\\s+Function\\b',
+    '\\bsetTimeout\\s*\\(',
+    '\\bsetInterval\\s*\\(',
+    '\\bexec\\s*\\(',
+    '\\bexecScript\\s*\\(',
+    'javascript\\s*:',
+    'data\\s*:\\s*text\\s*\\/\\s*html',
+    '\\bdocument\\.write\\s*\\(',
+    '\\binnerHTML\\s*=',
+    '\\bouterHTML\\s*=',
+    '\\bimportScripts\\s*\\(',
+    '<script[\\s>]',
 ];
-const DANGEROUS_PATTERNS: RegExp[] = _DANGEROUS_PATTERN_SOURCES.map(
-    (src) => new RegExp(src, 'i')
-);
 
 /**
  * Sanitizes a raw block object from LLM output by:
@@ -293,9 +345,11 @@ export function responseToChatBlocks(completion: any) {
         (completion && typeof completion === 'object' && typeof completion.model === 'string'
             ? completion.model
             : null) ??
-        (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('activeModelId')) ??
-        (typeof localStorage !== 'undefined' && localStorage.getItem('activeModelId')) ??
-        'unknown-model';
+        // Model ID is statically pinned above via AI_MODEL_REGISTRY_ENTRY.
+// Dynamic resolution from sessionStorage/localStorage is prohibited by policy
+// because it bypasses registry verification and can produce 'unknown-model'.
+// If you need per-session model switching, submit a registry approval request
+// and update AI_MODEL_REGISTRY_ENTRY at build time.
 
     // Serialise the raw input for hashing (before any mutation).
     const rawInputStr =

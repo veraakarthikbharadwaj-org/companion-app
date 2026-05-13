@@ -43,6 +43,87 @@ function verifySessionToken(token: string): string {
 }
 import ConfigManager from "@/app/utils/config";
 
+// ---------------------------------------------------------------------------
+// Approved Model Registry
+// All AI workloads (models, agents, embeddings) MUST resolve from this registry.
+// Each entry carries a pinned version and a SHA-256 digest of the model artifact
+// or manifest for identity verification.
+// ---------------------------------------------------------------------------
+interface ApprovedModelEntry {
+  id: string;          // canonical identifier used in requests
+  version: string;     // pinned version string
+  sha256: string;      // expected SHA-256 digest of the model artifact/manifest
+  type: "llm" | "agent" | "embedding";
+}
+
+const APPROVED_MODEL_REGISTRY: ReadonlyMap<string, ApprovedModelEntry> = new Map([
+  [
+    "gpt-4o",
+    {
+      id: "gpt-4o",
+      version: "2024-05-13",
+      sha256: process.env.REGISTRY_SHA256_GPT4O ||
+        (() => { throw new Error("REGISTRY_SHA256_GPT4O env var must be set"); })(),
+      type: "llm",
+    },
+  ],
+  [
+    "langchain-agent-v1",
+    {
+      id: "langchain-agent-v1",
+      version: "0.2.16",
+      sha256: process.env.REGISTRY_SHA256_LANGCHAIN_AGENT ||
+        (() => { throw new Error("REGISTRY_SHA256_LANGCHAIN_AGENT env var must be set"); })(),
+      type: "agent",
+    },
+  ],
+  [
+    "text-embedding-3-small",
+    {
+      id: "text-embedding-3-small",
+      version: "1",
+      sha256: process.env.REGISTRY_SHA256_EMBEDDING ||
+        (() => { throw new Error("REGISTRY_SHA256_EMBEDDING env var must be set"); })(),
+      type: "embedding",
+    },
+  ],
+]);
+
+/**
+ * Resolves a model/agent identifier against the approved registry.
+ * Throws if the identifier is not present (NOT_IN_REGISTRY).
+ * Returns the registry entry (with pinned version and digest) on success.
+ */
+function resolveFromRegistry(modelId: string): ApprovedModelEntry {
+  const entry = APPROVED_MODEL_REGISTRY.get(modelId);
+  if (!entry) {
+    throw new Error(
+      `AI workload "${modelId}" is NOT_IN_REGISTRY. ` +
+      `All AI components must be listed in the approved model registry with a pinned version and verified identity.`
+    );
+  }
+  return entry;
+}
+
+/**
+ * Verifies the runtime identity of a resolved model entry by comparing the
+ * provided artifact digest against the registry-pinned SHA-256 value.
+ * Throws if the digest does not match.
+ */
+function verifyModelIdentity(entry: ApprovedModelEntry, runtimeDigest: string): void {
+  const expected = Buffer.from(entry.sha256, "hex");
+  const actual   = Buffer.from(runtimeDigest, "hex");
+  if (
+    expected.length !== actual.length ||
+    !require("crypto").timingSafeEqual(expected, actual)
+  ) {
+    throw new Error(
+      `Identity verification FAILED for model "${entry.id}" v${entry.version}. ` +
+      `Registry digest does not match runtime digest.`
+    );
+  }
+}
+
 // Explicit allow list of tools that AI agents are permitted to invoke.
 // Any tool not present in this list will cause the request to be rejected.
 const ALLOWED_TOOLS: ReadonlySet<string> = new Set([
@@ -111,11 +192,46 @@ dotenv.config({ path: `.env.local` });
  * Only endpoints listed here (with explicit version pins) are permitted.
  * Add new approved, versioned agent endpoints to this set before use.
  */
+// Patterns identifying disallowed/unregistered GPT-based model endpoints.
+// Endpoints matching any of these patterns are rejected from the registry.
+const DISALLOWED_MODEL_PATTERNS: RegExp[] = [
+  /gpt-?[0-9]/i,          // e.g. gpt-4, gpt-3, gpt4, gpt3
+  /openai\.com/i,         // any OpenAI-hosted endpoint
+  /\/gpt\b/i,             // path segments referencing GPT
+  /text-davinci/i,        // legacy GPT-3 completions
+  /text-curie/i,
+  /text-babbage/i,
+  /text-ada/i,
+];
+
+function isDisallowedGptEndpoint(url: string): boolean {
+  return DISALLOWED_MODEL_PATTERNS.some((pattern) => pattern.test(url));
+}
+
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
   // Add approved, versioned agent endpoints via the APPROVED_AGENT_ENDPOINTS environment variable.
   // Only endpoints explicitly listed there will be permitted.
+  // Endpoints matching disallowed GPT model patterns are silently excluded.
   ...(process.env.APPROVED_AGENT_ENDPOINTS
-    ? process.env.APPROVED_AGENT_ENDPOINTS.split(",").map((u) => u.trim()).filter(Boolean)
+    ? process.env.APPROVED_AGENT_ENDPOINTS
+        .split(",")
+        .map((u) => u.trim())
+        .filter(Boolean)
+        .filter((u) => {
+          if (isDisallowedGptEndpoint(u)) {
+            // Log rejection so operators are aware of misconfiguration.
+            process.stderr.write(
+              JSON.stringify({
+                timestamp: new Date().toISOString(),
+                event: "REGISTRY_REJECTION",
+                reason: "Endpoint matches disallowed GPT model pattern",
+                endpoint: u,
+              }) + "\n"
+            );
+            return false;
+          }
+          return true;
+        })
     : []),
 ]);
 
@@ -504,6 +620,20 @@ export async function POST(req: Request) {
               tool: invokedTool,
               allowedTools: [...ALLOWED_TOOLS],
               timestamp: new Date().toISOString(),
+              principal: (requestBody as Record<string, unknown>)?.principal ?? "unknown",
+              modelId: (requestBody as Record<string, unknown>)?.modelId ?? "unknown",
+              modelVersion: (requestBody as Record<string, unknown>)?.modelVersion ?? "unknown",
+              inputHash: (() => {
+                try {
+                  const crypto = require("crypto");
+                  return crypto
+                    .createHash("sha256")
+                    .update(JSON.stringify(requestBody))
+                    .digest("hex");
+                } catch {
+                  return "unavailable";
+                }
+              })(),
             });
             return returnError(403, `Tool "${invokedTool}" is not permitted by the agent tool allow list.`);
           }
@@ -511,7 +641,46 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json(responseBlocks)
+    // Sanitize all string content in the response blocks before returning
+    // to prevent injection or malicious payloads from reaching the client.
+    function sanitizeString(s: string): string {
+      return s
+        // Remove null bytes
+        .replace(/\0/g, "")
+        // Escape HTML special characters to prevent HTML/script injection
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#x27;")
+        // Strip javascript: and data: URI schemes (case-insensitive, with optional whitespace/encoding)
+        .replace(/javascript\s*:/gi, "")
+        .replace(/data\s*:/gi, "")
+        // Strip vbscript: URI scheme
+        .replace(/vbscript\s*:/gi, "")
+        // Remove common event handler patterns (e.g. onerror=, onclick=)
+        .replace(/on\w+\s*=/gi, "");
+    }
+
+    function sanitizeValue(value: unknown): unknown {
+      if (typeof value === "string") {
+        return sanitizeString(value);
+      }
+      if (Array.isArray(value)) {
+        return value.map((item) => sanitizeValue(item));
+      }
+      if (value !== null && typeof value === "object") {
+        const sanitized: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          sanitized[sanitizeString(k)] = sanitizeValue(v);
+        }
+        return sanitized;
+      }
+      return value;
+    }
+
+    const sanitizedBlocks = sanitizeValue(responseBlocks);
+    return NextResponse.json(sanitizedBlocks)
   } else {
     return returnError(500, await response.text())
   }

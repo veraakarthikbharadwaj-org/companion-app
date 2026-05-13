@@ -37,7 +37,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 - App logic: [Next.js](https://nextjs.org/)
 - VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
 - LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
-- Text model: *(must be a pinned, digest-verified identifier from the organization's approved LLM registry — e.g. `openai/gpt-4o@sha256:<digest>` or `replicate/vicuna-13b@sha256:<digest>`; mutable aliases are prohibited)*
+- Text model: *(must be a pinned, digest-verified identifier from the organization's approved LLM registry; mutable aliases and unapproved models are prohibited — consult the internal registry for approved model identifiers)*
 - Text streaming: [ai sdk](https://github.com/vercel-labs/ai)
 - Conversation history: [Upstash](https://upstash.com/)
 - Deployment: [Fly](https://fly.io/)
@@ -46,9 +46,8 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 ## Quickstart
 
 The following instructions should get you up and running with a fully
-functional, local deployment of four AIs to chat with. Note that the companions
-running on Vicuna (Rosie and Lucky) will take more time to respond as we've not
-dealt with the cold start problem. So you may have to wait around a bit :)
+functional, local deployment of four AIs to chat with. Note that some companions
+may take more time to respond depending on the approved model used. So you may have to wait around a bit :)
 
 ### 1. Fork and Clone repo
 

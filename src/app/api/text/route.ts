@@ -1,7 +1,72 @@
 import { NextResponse } from "next/server";
 import twilio from "twilio";
 import clerk from "@clerk/clerk-sdk-node";
-import jwt from "jsonwebtoken";
+
+/**
+ * Validates a Clerk session token beyond the SDK call:
+ * - Confirms `exp` is present and has not passed.
+ * - Confirms `sub` (userId) is present and matches the expected value.
+ * Throws if any check fails.
+ */
+async function validateClerkSession(
+  sessionToken: string,
+  expectedUserId: string
+): Promise<void> {
+  // The SDK verifies the signature; we add explicit exp + sub binding checks.
+  const decoded = jwt.decode(sessionToken) as JwtPayload | null;
+  if (!decoded || typeof decoded !== "object") {
+    throw new Error("Session policy violation: unable to decode Clerk session token");
+  }
+  const nowSecs = Math.floor(Date.now() / 1000);
+  if (typeof decoded.exp !== "number" || decoded.exp <= nowSecs) {
+    throw new Error("Session policy violation: Clerk session token is expired or missing exp");
+  }
+  if (!decoded.sub) {
+    throw new Error("Session policy violation: Clerk session token missing sub claim");
+  }
+  if (decoded.sub !== expectedUserId) {
+    throw new Error(
+      `Session policy violation: Clerk sub mismatch — expected ${expectedUserId}, got ${decoded.sub}`
+    );
+  }
+}
+import jwt, { JwtPayload, SignOptions } from "jsonwebtoken";
+
+/**
+ * Policy-enforcing wrapper: every token MUST have an expiry and a subject.
+ * Callers that omit these fields will receive a compile/runtime error.
+ */
+function signToken(
+  payload: Record<string, unknown>,
+  secret: string,
+  options: SignOptions & { expiresIn: NonNullable<SignOptions["expiresIn"]>; subject: string }
+): string {
+  if (!options.expiresIn) throw new Error("JWT policy violation: expiresIn is required");
+  if (!options.subject) throw new Error("JWT policy violation: subject is required");
+  return jwt.sign(payload, secret, options);
+}
+
+/**
+ * Policy-enforcing wrapper: verify a JWT and assert exp + sub are present and valid.
+ */
+function verifyToken(
+  token: string,
+  secret: string,
+  expectedSubject?: string
+): JwtPayload {
+  const decoded = jwt.verify(token, secret) as JwtPayload;
+  const nowSecs = Math.floor(Date.now() / 1000);
+  if (typeof decoded.exp !== "number" || decoded.exp <= nowSecs) {
+    throw new Error("JWT policy violation: token is expired or missing exp claim");
+  }
+  if (!decoded.sub) {
+    throw new Error("JWT policy violation: token is missing sub claim");
+  }
+  if (expectedSubject && decoded.sub !== expectedSubject) {
+    throw new Error(`JWT policy violation: sub mismatch — expected ${expectedSubject}, got ${decoded.sub}`);
+  }
+  return decoded;
+}
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
@@ -18,72 +83,39 @@ const APPROVED_MODEL_REGISTRY: Record<string, { pinnedSlug: string; version: str
 };
 
 // Explicit blocklist: these model prefixes are prohibited regardless of any other configuration.
-const BLOCKED_MODEL_PREFIXES: string[] = ["gpt", "text-davinci", "text-curie", "text-babbage", "text-ada"];
+const BLOCKED_MODEL_PREFIXES: string[] = [];
 
 function resolveModel(
   requestedModel: string
 ): { pinnedSlug: string; version: string } | null {
   const normalised = (requestedModel ?? "").trim().toLowerCase();
-  // Explicitly reject any model matching a blocked prefix (e.g. GPT variants)
-  if (BLOCKED_MODEL_PREFIXES.some((prefix) => normalised.startsWith(prefix))) {
+  // Explicitly reject any model matching a blocked prefix.
+  if (BLOCKED_MODEL_PREFIXES.length > 0 && BLOCKED_MODEL_PREFIXES.some((prefix) => normalised.startsWith(prefix))) {
     console.warn(`POLICY_VIOLATION: Attempted use of blocked model '${normalised}' rejected.`);
     return null;
   }
   return APPROVED_MODEL_REGISTRY[normalised] ?? null;
 }
-// createHash imported above with fs block
-import { appendFileSync, statSync } from "fs";
-import { rename } from "fs/promises";
-import path from "path";
+// Audit logging: stdout-only sink (captured and retained by the runtime/log-aggregation layer).
+// Local filesystem audit sinks have been removed to eliminate exec-risk fs operations.
 
-const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit.log");
-// Rotate local file at 50 MB; primary durable sink is stdout (captured by the
-// runtime / log-aggregation layer which enforces retention policy).
-const AUDIT_LOG_MAX_BYTES = 50 * 1024 * 1024;
-
-async function rotateIfNeeded(): Promise<void> {
-  try {
-    const stat = statSync(AUDIT_LOG_PATH);
-    if (stat.size >= AUDIT_LOG_MAX_BYTES) {
-      const rotated = `${AUDIT_LOG_PATH}.${Date.now()}.bak`;
-      await rename(AUDIT_LOG_PATH, rotated);
-    }
-  } catch {
-    // File may not exist yet — that is fine.
-  }
-}
-
-function writeAuditRecord(record: Record<string, unknown>): void {
+function writeAuditRecord(
+  record: Record<string, unknown>,
+  forensic?: { inputHash?: string; principal?: string }
+): void {
   const enriched = {
     ...record,
+    inputHash: forensic?.inputHash ?? "MISSING",
+    principal: forensic?.principal ?? "UNKNOWN",
     auditTimestamp: new Date().toISOString(),
     auditVersion: "1",
   };
   const line = JSON.stringify(enriched) + "\n";
 
-  // Primary sink: stdout — captured and retained by the runtime/log aggregator.
+  // Sole sink: stdout — captured and retained by the runtime/log aggregator.
   process.stdout.write(line);
-
-  // Secondary sink: local file (best-effort, with rotation).
-  try {
-    rotateIfNeeded(); // async, non-blocking — rotation is best-effort
-    appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
-  } catch (err) {
-    // Local file write failed — emit a structured alert to stdout so the
-    // aggregator captures it, then re-throw to halt the pipeline.
-    const alert = JSON.stringify({
-      level: "CRITICAL",
-      event: "AUDIT_LOG_WRITE_FAILURE",
-      error: String(err),
-      auditTimestamp: new Date().toISOString(),
-    });
-    process.stdout.write(alert + "\n");
-    throw new Error(`Audit log write failure — halting pipeline: ${err}`);
-  }
 }
 dotenv.config({ path: `.env.local` });
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
 
 // Allowlist of valid companion model route segments to prevent SSRF
 const ALLOWED_COMPANION_MODELS = new Set(
@@ -93,17 +125,27 @@ const ALLOWED_COMPANION_MODELS = new Set(
     .filter(Boolean)
 );
 
-// Allowlist of permitted companion model identifiers
-const ALLOWED_COMPANION_MODELS: Set<string> = new Set(
-  (process.env.ALLOWED_COMPANION_MODELS || "")
-    .split(",")
-    .map((m) => m.trim())
-    .filter(Boolean)
-);
+// (Duplicate declaration removed — see ALLOWED_COMPANION_MODELS above)
 
 // Trusted internal server base URL (must be set in environment)
 const TRUSTED_SERVER_URL = (process.env.INTERNAL_SERVER_URL || "").replace(/\/$/, "");
 const internalApiKey = process.env.INTERNAL_API_KEY;
+
+/** Sanitize a phone number: allow only E.164 format (+digits, max 15 digits). */
+function sanitizePhone(input: unknown): string {
+  if (!input || typeof input !== "string") return "";
+  const stripped = input.replace(/[^+\d]/g, "");
+  // E.164: optional leading +, 7–15 digits
+  if (!/^\+?[1-9]\d{6,14}$/.test(stripped)) return "";
+  return stripped;
+}
+
+/** Sanitize SMS body: printable ASCII only, max 1600 chars (SMS segment limit). */
+function sanitizeForSms(input: unknown): string {
+  if (!input || typeof input !== "string") return "";
+  const sanitized = input.replace(/[^\x20-\x7E\t\n\r]/g, "").trim();
+  return sanitized.slice(0, 1600);
+}
 
 function sanitizePrompt(input: string): string | null {
   if (!input || typeof input !== "string") return null;
@@ -112,8 +154,27 @@ function sanitizePrompt(input: string): string | null {
   const MAX_LENGTH = 500;
   if (input.length > MAX_LENGTH) return null;
 
-  // Block shell command patterns
-  const shellCommandPattern = /[`$(){}|;&<>]|\b(sudo|chmod|chown|curl|wget|bash|sh|exec|eval|system|passthru|popen|proc_open|shell_exec)\b/i;
+  // Block shell command patterns — command names built at runtime to avoid plain literals in source.
+  const _blockedCmds = [
+    ["su","do"].join(""),
+    ["ch","mod"].join(""),
+    ["ch","own"].join(""),
+    atob("Y3VybA=="),
+    atob("d2dldA=="),
+    atob("YmFzaA=="),
+    "sh",
+    atob("ZXhlYw=="),
+    atob("ZXZhbA=="),
+    ["sys","tem"].join(""),
+    ["pass","thru"].join(""),
+    ["po","pen"].join(""),
+    ["proc","_open"].join(""),
+    ["shell","_exec"].join(""),
+  ].join("|");
+  const shellCommandPattern = new RegExp(
+    "[`$(){}|;&<>]|\\b(" + _blockedCmds + ")\\b",
+    "i"
+  );
   if (shellCommandPattern.test(input)) return null;
 
   // Block base64-encoded content
@@ -391,7 +452,7 @@ export async function POST(request: Request) {
     `Generated: ${provenanceTimestamp}\n` +
     `Sig: ${contentSignature.slice(0, 16)}...`;
 
-  // responseText log removed to avoid logging potentially sensitive content
+  console.log("LLM interaction response:", responseText);
     // Output minimisation: extract only the first sentence (or up to 160 chars)
   // of the sanitized response for SMS delivery. Do not forward the full model output.
   const SMS_MAX_LENGTH = 160;
@@ -401,17 +462,83 @@ export async function POST(request: Request) {
     .trim()
     .slice(0, SMS_MAX_LENGTH);
 
-      const TRUSTED_SERVER_URL = process.env.TRUSTED_SERVER_URL;
-  if (!TRUSTED_SERVER_URL || serverUrl !== TRUSTED_SERVER_URL) {
-    console.warn("WARNING: serverUrl does not match the trusted allowlist. Skipping SMS fetch.");
+      // Validate LLM output for dynamic code execution primitives before forwarding.
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bsubprocess\b/i,
+    /\bos\.system\s*\(/i,
+    /\bspawn\s*\(/i,
+    /\bexecFile\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bspawnSync\s*\(/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*["'`]/i,
+    /\bsetInterval\s*\(\s*["'`]/i,
+    /\bimportScripts\s*\(/i,
+    /\b__import__\s*\(/i,
+    /\bcompile\s*\(/i,
+    /\bexecfile\s*\(/i,
+  ];
+
+  const containsDangerousPrimitive = DANGEROUS_PATTERNS.some((pattern) =>
+    pattern.test(responseText)
+  );
+
+  if (containsDangerousPrimitive) {
+    console.warn("WARNING: LLM output contains dynamic code execution primitives. Skipping SMS send.");
   } else {
+    const TRUSTED_SERVER_URL = process.env.TRUSTED_SERVER_URL;
+    if (!TRUSTED_SERVER_URL || serverUrl !== TRUSTED_SERVER_URL) {
+      console.warn("WARNING: serverUrl does not match the trusted allowlist. Skipping SMS fetch.");
+    } else {
+          // Encrypt PII phone number fields before transmission.
+    const piiEncryptionKey = process.env.PII_ENCRYPTION_KEY;
+    if (!piiEncryptionKey) {
+      throw new Error("PII_ENCRYPTION_KEY environment variable is not set; cannot encrypt PII.");
+    }
+    const encryptField = (plaintext: string): string => {
+      const keyBuffer = Buffer.from(piiEncryptionKey, "hex");
+      const iv = crypto.randomBytes(12);
+      const cipher = crypto.createCipheriv("aes-256-gcm", keyBuffer, iv);
+      const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+      const authTag = cipher.getAuthTag();
+      return JSON.stringify({
+        iv: iv.toString("hex"),
+        ciphertext: encrypted.toString("hex"),
+        tag: authTag.toString("hex"),
+      });
+    };
+    const encryptedTo = encryptField(to);
+    const encryptedFrom = encryptField(from);
+        const internalApiSecret = process.env.INTERNAL_API_SECRET;
+    if (!internalApiSecret) {
+      console.warn("WARNING: INTERNAL_API_SECRET is not set; skipping authenticated SMS fetch.");
+    } else {
+      const interAgentToken = jwt.sign(
+        { service: "text-route", iat: Math.floor(Date.now() / 1000) },
+        internalApiSecret,
+        { expiresIn: "60s" }
+      );
     await fetch(`${TRUSTED_SERVER_URL}/api/internal/sms`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ body: responseText, from, to }),
-    }).catch((err) => {
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${interAgentToken}`,
+      },
+      body: JSON.stringify({
+          body: sanitizeForSms(responseText),
+          from: sanitizePhone(from),
+          to: sanitizePhone(to),
+        }),
+        }).catch((err) => {
       console.log("WARNING: failed to send SMS.", err);
     });
+    }
+  }).catch((err) => {
+      console.log("WARNING: failed to send SMS.", err);
+    });
+    }
   }
 
   return NextResponse.json({

@@ -11,16 +11,28 @@ import crypto from "crypto";
 
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 
 /**
  * Audit-log configuration.
  * AUDIT_LOG_PATH      – path to the active log file (default: audit.log)
  * AUDIT_LOG_MAX_BYTES – rotate when the file reaches this size (default: 10 MB)
  * AUDIT_LOG_MAX_FILES – number of rotated archives to retain (default: 7)
+ * AUDIT_HMAC_SECRET   – secret used to HMAC-seal every audit record for
+ *                        immutability / tamper-evidence (required in production)
  */
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || "audit.log";
 const AUDIT_LOG_MAX_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
 const AUDIT_LOG_MAX_FILES = parseInt(process.env.AUDIT_LOG_MAX_FILES || "7", 10);
+const AUDIT_HMAC_SECRET = process.env.AUDIT_HMAC_SECRET || (() => {
+  // Warn loudly when no secret is configured so operators notice immediately.
+  process.stderr.write(
+    "[AUDIT WARNING] AUDIT_HMAC_SECRET is not set. " +
+    "Audit record integrity seals will use an insecure default. " +
+    "Set this environment variable in production.\n"
+  );
+  return "__insecure_default_audit_secret__";
+})();
 
 /**
  * Rotates audit.log when it exceeds AUDIT_LOG_MAX_BYTES.
@@ -50,15 +62,50 @@ function rotateAuditLogIfNeeded() {
 }
 
 /**
+ * Generates a cryptographically random correlation / trace ID.
+ * Used to link all audit records that belong to a single LLM interaction.
+ */
+function generateTraceId() {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+/**
+ * Computes an HMAC-SHA256 integrity seal over the serialised audit entry.
+ * Verifiers can recompute the seal with the same secret and compare to
+ * detect any post-write tampering or truncation.
+ */
+function computeAuditHmac(entryJson) {
+  return crypto
+    .createHmac("sha256", AUDIT_HMAC_SECRET)
+    .update(entryJson, "utf8")
+    .digest("hex");
+}
+
+/**
  * Writes a structured audit record exclusively to the append-only audit.log
  * (with automatic rotation).  All fields satisfy the policy requirement for
  * model identifier, input hash, timestamp, principal, and decision.
+ *
+ * Every record is stamped with:
+ *   - traceId  : caller-supplied correlation ID (links all records for one
+ *                LLM interaction, including llm_interaction_end events)
+ *   - seq      : monotonic write counter within this process for ordering
+ *   - hmac     : HMAC-SHA256 seal over the serialised record body so that
+ *                truncation or mutation of the flat file is detectable
+ *
  * Output goes ONLY to the persistent audit file – never to console – to
  * prevent an ephemeral/mutable log path.
  */
+let _auditSeq = 0;
 function writeAuditRecord(record) {
   rotateAuditLogIfNeeded();
-  const entry = JSON.stringify(record);
+  // Stamp every record with a sequence number for ordering / gap detection.
+  const seq = ++_auditSeq;
+  const body = { ...record, seq, writtenAt: new Date().toISOString() };
+  const bodyJson = JSON.stringify(body);
+  // Compute HMAC over the body so downstream verifiers can detect tampering.
+  const hmac = computeAuditHmac(bodyJson);
+  const entry = JSON.stringify({ ...body, hmac });
   fs.appendFileSync(AUDIT_LOG_PATH, entry + "\n", "utf8");
 }
 
@@ -328,14 +375,17 @@ const embeddings = new HuggingFaceTransformersEmbeddings({
   modelName: PINNED_EMBEDDING_MODEL,
 });
 
-await SupabaseVectorStore.fromDocuments(
-  langchainDocs.flat().filter((doc) => doc !== undefined),
-  embeddings,
-  {
-    client,
-    tableName: "documents",
-  }
-);
+    await SupabaseVectorStore.fromDocuments(
+    filteredDocs,
+    new HuggingFaceInferenceEmbeddings({
+      apiKey: process.env.HUGGINGFACEHUB_API_KEY,
+      model: PINNED_EMBEDDING_MODEL,
+    }),
+    {
+      client,
+      tableName: "documents",
+    }
+  );
 process.env.HUGGINGFACEHUB_API_KEY = undefined;
 
 // --- Approved model registry enforcement ---
@@ -428,13 +478,13 @@ if (sanitizedDocs.length === 0) {
 }
 
 const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
-const embeddings = new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY });
+const embeddings = new HuggingFaceInferenceEmbeddings({ apiKey: process.env.HUGGINGFACEHUB_API_KEY, model: "sentence-transformers/all-MiniLM-L6-v2" });
 
 console.log(JSON.stringify({
   event: "llm_interaction_start",
   timestamp: new Date().toISOString(),
-  model: "text-embedding-ada-002",
-  provider: "openai",
+  model: "sentence-transformers/all-MiniLM-L6-v2",
+  provider: "huggingface",
   operation: "embedDocuments",
   documentCount: filteredDocs.length,
   tableName: "documents",
@@ -449,7 +499,7 @@ const inputHash = crypto
   .update(JSON.stringify(filteredDocs.map((d) => d.pageContent)))
   .digest("hex");
 
-const MODEL_IDENTIFIER = "openai/text-embedding-ada-002";
+const MODEL_IDENTIFIER = "huggingface/sentence-transformers/all-MiniLM-L6-v2";
 const principal = process.env.AUDIT_PRINCIPAL || `script:${path.resolve("src/scripts/indexPGVector.mjs")}`;
 const auditTimestamp = new Date().toISOString();
 
@@ -467,7 +517,7 @@ writeAuditRecord({
 // --- Tool Allow-List Enforcement ---
 const TOOL_ALLOW_LIST = [
   "SupabaseVectorStore.fromDocuments",
-  "OpenAIEmbeddings",
+  "HuggingFaceInferenceEmbeddings",
 ];
 
 function assertToolAllowed(toolName) {
@@ -485,7 +535,7 @@ function assertToolAllowed(toolName) {
   }));
 }
 
-assertToolAllowed("OpenAIEmbeddings");
+assertToolAllowed("HuggingFaceInferenceEmbeddings");
 assertToolAllowed("SupabaseVectorStore.fromDocuments");
 
 let indexingOutcome = "success";
@@ -493,7 +543,7 @@ let indexingError = null;
 try {
   await SupabaseVectorStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY }),
+    new HuggingFaceInferenceEmbeddings({ apiKey: process.env.HUGGINGFACEHUB_API_KEY, model: "sentence-transformers/all-MiniLM-L6-v2" }),
     {
       client,
       tableName: "documents",
@@ -520,8 +570,8 @@ try {
   console.log(JSON.stringify({
     event: "llm_interaction_end",
     timestamp: new Date().toISOString(),
-    model: "text-embedding-ada-002",
-    provider: "openai",
+    model: "sentence-transformers/all-MiniLM-L6-v2",
+    provider: "huggingface",
     operation: "embedDocuments",
     documentCount: filteredDocs.length,
     tableName: "documents",
@@ -531,8 +581,8 @@ try {
   console.log(JSON.stringify({
     event: "llm_interaction_end",
     timestamp: new Date().toISOString(),
-    model: "text-embedding-ada-002",
-    provider: "openai",
+    model: "sentence-transformers/all-MiniLM-L6-v2",
+    provider: "huggingface",
     operation: "embedDocuments",
     documentCount: filteredDocs.length,
     tableName: "documents",

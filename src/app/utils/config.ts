@@ -52,7 +52,20 @@ class ConfigManager {
         // Remove oldest rotation if it exceeds the max
         const oldest = `${ConfigManager.AUDIT_LOG_PATH}.${ConfigManager.AUDIT_MAX_ROTATIONS + 1}`;
         if (fs.existsSync(oldest)) {
-          fs.unlinkSync(oldest);
+          // HITL approval gate: deletion of audit log files requires explicit human approval.
+          // Set HITL_APPROVED_DELETION=true in the environment only after a human operator
+          // has reviewed and approved the pending log rotation/deletion.
+          const hitlApproved = process.env.HITL_APPROVED_DELETION === "true";
+          if (!hitlApproved) {
+            process.stderr.write(
+              `[HITL BLOCK] Deletion of '${oldest}' requires human approval. ` +
+              `Set HITL_APPROVED_DELETION=true after operator review to permit this operation.\n`
+            );
+          } else {
+            fs.unlinkSync(oldest);
+            // Reset approval flag after use to prevent unintended future deletions.
+            delete process.env.HITL_APPROVED_DELETION;
+          }
         }
       }
     } catch (rotateErr) {
@@ -120,8 +133,6 @@ class ConfigManager {
           this.writeAuditRecord({
             ...auditBase,
             outcome: "found",
-            resultId: result[0]?.id ?? null,
-            output: outputPayload,
             outputHash,
           });
           const allowed = ConfigManager.ALLOWED_FIELDS as readonly string[];
@@ -159,7 +170,8 @@ class ConfigManager {
         principal: process.env.AI_PRINCIPAL ?? "unknown",
         outcome: "error",
         error: e instanceof Error ? e.message : String(e),
-        stack: e instanceof Error ? e.stack : undefined,
+        correlationId: crypto.randomUUID(),
+        modelVersion: process.env.AI_MODEL_VERSION ?? "unknown",
       });
     }
   }

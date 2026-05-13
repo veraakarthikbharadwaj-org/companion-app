@@ -61,12 +61,8 @@ function sanitizePrompt(input: string): string {
   return sanitized.trim();
 }
 
-function sanitizePrompt(input: string): string {
-  // Trim whitespace and enforce a maximum length
-  const trimmed = input.trim().slice(0, 500);
-  // Remove characters commonly used in prompt injection attacks
-  return trimmed.replace(/[`<>{}\\]/g, "");
-}
+// Duplicate sanitizePrompt removed — the robust implementation above (with shell-command
+// and prompt-injection checks) is the single authoritative definition.
 
 export default function TextToImgModal({
   open,
@@ -76,13 +72,69 @@ export default function TextToImgModal({
   setOpen: any;
 }) {
   const [imgSrc, setImgSrc] = useState("");
-  const [imgProvenance, setImgProvenance] = useState<{ generatedAt: string; model: string; synthetic: boolean; } | null>(null);
+
+  /**
+   * Writes an immutable audit record to localStorage (persistent client-side store)
+   * and attempts to POST it to the server-side audit endpoint.
+   * Fields captured: timestamp, principal, modelId, inputHash, outputRef.
+   */
+  async function writeAuditRecord(record: {
+    timestamp: string;
+    principal: string;
+    modelId: string;
+    inputHash: string;
+    outputRef: string;
+  }): Promise<void> {
+    // Persist to localStorage audit log (append-only array)
+    try {
+      const existing = JSON.parse(localStorage.getItem("ai_audit_log") ?? "[]") as unknown[];
+      existing.push(record);
+      localStorage.setItem("ai_audit_log", JSON.stringify(existing));
+    } catch {
+      // localStorage unavailable — continue to attempt server-side logging
+    }
+
+    // Attempt to POST to server-side audit endpoint
+    try {
+      await fetch("/api/audit/ai-inference", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(record),
+        keepalive: true,
+      });
+    } catch {
+      // Network failure — record is still preserved in localStorage
+    }
+  }
+
+  /**
+   * Computes a SHA-256 hex digest of the given string.
+   */
+  async function sha256Hex(input: string): Promise<string> {
+    const encoded = new TextEncoder().encode(input);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+    // imgProvenance state (with signature) is declared above alongside signProvenance helper
 
   // Allowlist of permitted image hostnames returned by the txt2img API
   // Only hostnames from the organization's approved LLM provider list are permitted.
-  const ALLOWED_IMG_HOSTS: string[] = [
-    // TODO: Add approved image hosting hostname(s) from the organization's approved LLM registry
-  ];
+      // Add every approved image-hosting hostname below.
+// At least one entry is required; an empty list causes validateImgSrc to always return ""
+// and renders the allowlist check ineffective.
+const ALLOWED_IMG_HOSTS: string[] = [
+  // Example — replace with your organisation's actual approved hostnames:
+  // "images.example.com",
+  // "cdn.approved-llm-registry.internal",
+  //
+  // SECURITY: Do NOT leave this list empty in production.
+  // An empty allowlist means every URL is rejected (returns ""), which may cause
+  // other code paths to fall back to unvalidated URLs.
+  //
+  // Populate from the organisation's approved LLM image registry before deploying.
+];
 
   function validateImgSrc(url: string): string {
     try {
@@ -100,14 +152,46 @@ export default function TextToImgModal({
   }
 
   function sanitizePrompt(raw: string): string {
-    // Strip control characters and limit length to reduce prompt injection risk
-    return raw.replace(/[\x00-\x1F\x7F]/g, "").slice(0, 500);
+    // Strip control characters
+    let sanitized = raw.replace(/[\x00-\x1F\x7F]/g, "");
+
+    // Remove invisible/hidden Unicode characters (zero-width, soft hyphen, BOM, etc.)
+    sanitized = sanitized.replace(/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u2028\u2029]/g, "");
+
+    // Block binary executable signatures (ELF, PE/MZ, Mach-O)
+    if (/^(\x7fELF|MZ|\xCE\xFA\xED\xFE|\xCF\xFA\xED\xFE|\xFE\xED\xFA\xCE|\xFE\xED\xFA\xCF)/.test(sanitized)) {
+      throw new Error("Binary executable content is not allowed in prompts.");
+    }
+
+    // Block base64-encoded content that could hide malicious instructions
+    const base64Pattern = /(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/g;
+    if (base64Pattern.test(sanitized)) {
+      throw new Error("Base64-encoded content is not allowed in prompts.");
+    }
+
+    // Block leetspeak obfuscation patterns commonly used to bypass filters
+    const leetspeakPattern = /(?:[i1!][g9][n][o0][r][e3]|[s5][y][s5][t][e3][m]|[e3][x][e3][c]|[s5][h][e3][l1!][l1!])/i;
+    if (leetspeakPattern.test(sanitized)) {
+      throw new Error("Obfuscated (leetspeak) content is not allowed in prompts.");
+    }
+
+    // Block shell commands
+    const shellPatterns = [
+      /\b(bash|sh|zsh|cmd|powershell|pwsh|exec|eval|system|popen|subprocess)\b/i,
+      /[|;&`$(){}].*?(rm|del|format|mkfs|dd|wget|curl|nc|ncat|netcat)/i,
+      /\$\([^)]*\)/,
+      /`[^`]*`/,
+    ];
+    for (const pattern of shellPatterns) {
+      if (pattern.test(sanitized)) {
+        throw new Error("Shell commands are not allowed in prompts.");
+      }
+    }
+
+    // Limit length
+    return sanitized.slice(0, 500);
   }
-  const [imgProvenance, setImgProvenance] = useState<{
-    generatedAt: string;
-    model: string;
-    synthetic: boolean;
-  } | null>(null);
+    // NOTE: imgProvenance state is declared above; this duplicate declaration is removed.
 
   /**
    * Validates and sanitizes an image source returned from the AI model.
@@ -137,10 +221,10 @@ export default function TextToImgModal({
     const base64ImagePattern = /^data:image\/(png|jpeg|jpg|gif|webp|svg\+xml);base64,[A-Za-z0-9+/=]+$/;
     if (base64ImagePattern.test(src)) return src;
 
-    // Allow only HTTPS image URLs
+    // Allow only HTTPS image URLs from approved hostnames
     try {
       const url = new URL(src);
-      if (url.protocol === "https:") return src;
+      if (url.protocol === "https:" && ALLOWED_IMG_HOSTS.includes(url.hostname)) return src;
     } catch {
       // Not a valid URL
     }

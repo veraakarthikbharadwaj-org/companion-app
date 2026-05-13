@@ -8,9 +8,6 @@ import { getCompanions } from "./actions";
 
 // Approved model registry with pinned versions
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  "gpt-4": "gpt-4-0613",
-  "gpt-4-turbo": "gpt-4-turbo-2024-04-09",
-  "gpt-3.5-turbo": "gpt-3.5-turbo-0125",
   "claude-3-opus": "claude-3-opus-20240229",
   "claude-3-sonnet": "claude-3-sonnet-20240229",
   "claude-3-haiku": "claude-3-haiku-20240307",
@@ -42,9 +39,29 @@ const ALLOWED_IMAGE_HOSTNAMES = [
   'res.cloudinary.com',
 ];
 
+/** Single canonical definition — do NOT redeclare this function elsewhere in this file. */
 function maskPhoneNumber(phone: string): string {
-  if (!phone || phone.length <= 4) return '****';
-  return phone.slice(0, -4).replace(/./g, '*') + phone.slice(-4);
+  if (!phone || typeof phone !== 'string' || phone.length <= 4) return '****';
+  return phone.slice(0, -4).replace(/[\s\S]/g, '*') + phone.slice(-4);
+}
+
+/** Validates that a parsed companion entry has the expected shape. */
+function isValidCompanionEntry(entry: unknown): entry is {
+  name: string;
+  title: string;
+  imageUrl: string;
+  telegramLink?: string | null;
+} {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  const e = entry as Record<string, unknown>;
+  if (typeof e['name'] !== 'string') return false;
+  if (typeof e['title'] !== 'string') return false;
+  if (typeof e['imageUrl'] !== 'string') return false;
+  if (e['telegramLink'] !== undefined && e['telegramLink'] !== null && typeof e['telegramLink'] !== 'string') return false;
+  // Guard against prototype pollution keys
+  const dangerous = ['__proto__', 'constructor', 'prototype'];
+  if (Object.keys(e).some((k) => dangerous.includes(k))) return false;
+  return true;
 }
 
 export default function Examples() {
@@ -59,20 +76,24 @@ export default function Examples() {
       name: "",
       title: "",
       imageUrl: "",
-      telegramLink: null
     },
   ]);
 
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const companions = await getCompanions();
-        let entries = JSON.parse(companions);
-        let setme = entries.map((entry: any) => ({
+                const companions = await getCompanions();
+        const parsed: unknown = JSON.parse(companions);
+        if (!Array.isArray(parsed)) {
+          throw new Error('Companion data is not an array');
+        }
+        // Validate every entry against the expected schema before use
+        const entries = parsed.filter(isValidCompanionEntry);
+        const setme = entries.map((entry) => ({
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          telegramLink: entry.telegramLink
+          telegramLink: entry.telegramLink ?? null,
         }));
         setExamples(setme);
       } catch {
@@ -98,7 +119,7 @@ export default function Examples() {
           <li
             key={example.name}
             onClick={() => {
-              setCompParam(example);
+              setCompParam({ name: example.name, title: example.title, imageUrl: example.imageUrl });
               setQAModalOpen(true);
             }}
             className="col-span-2 flex flex-col rounded-lg bg-slate-800  text-center shadow relative ring-1 ring-white/10 cursor-pointer hover:ring-sky-300/70 transition"
