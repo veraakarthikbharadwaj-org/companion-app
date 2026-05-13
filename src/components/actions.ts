@@ -12,9 +12,16 @@ export async function getCompanions() {
   // console.log("Loading companion descriptions from "+COMPFILE);
   var fs = require('fs');
   const data = fs.readFileSync(COMPFILE);
-  console.log(String(data));
   // run a parse here to force a server side error if the JSON is improperly formatted
   // It's much more difficult to debug client side
   var js = JSON.parse(String(data));
-  return String(data);
+  // Return only a minimised subset of fields to avoid exposing internal data
+  var minimised = (Array.isArray(js) ? js : [js]).map(function(companion: Record<string, unknown>) {
+    return {
+      id: companion.id,
+      name: companion.name,
+      description: companion.description,
+    };
+  });
+  return minimised;
 }
