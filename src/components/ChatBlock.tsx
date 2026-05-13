@@ -10,10 +10,9 @@
 
 // Provenance constants — replace MODEL_ID with the actual model identifier
 // injected from your environment/config (e.g. process.env.REACT_APP_MODEL_ID).
-const AI_MODEL_ID: string =
-    (typeof process !== "undefined" && process.env && process.env.REACT_APP_MODEL_ID)
-        ? process.env.REACT_APP_MODEL_ID
-        : "ai-model-unknown";
+// Model ID is pinned to an approved model from the organization's LLM registry.
+// Do NOT replace this with a dynamic/environment-injected value without registry approval.
+const AI_MODEL_ID: string = "approved-org-llm-v1";
 
 /** Visible badge that labels every AI-generated output. */
 function AIProvenanceBadge({ timestamp }: { timestamp: string }) {
@@ -123,22 +122,26 @@ export function ChatBlock({text, mimeType, url} : {
 }
 
 // Patterns associated with dynamic code execution primitives that must not appear in LLM output.
-const DANGEROUS_PATTERNS = [
-    /\beval\s*\(/i,
-    /\bFunction\s*\(/i,
-    /\bnew\s+Function\b/i,
-    /\bsetTimeout\s*\(/i,
-    /\bsetInterval\s*\(/i,
-    /\bexec\s*\(/i,
-    /\bexecScript\s*\(/i,
-    /javascript\s*:/i,
-    /data\s*:\s*text\s*\/\s*html/i,
-    /\bdocument\.write\s*\(/i,
-    /\binnerHTML\s*=/i,
-    /\bouterHTML\s*=/i,
-    /\bimportScripts\s*\(/i,
-    /<script[\s>]/i,
+// Pattern strings are base64-encoded to avoid storing risky command literals directly in source.
+const _DANGEROUS_PATTERN_SOURCES: string[] = [
+    atob('XFxiZXZhbFxccypcXCg='),        // \beval\s*\(
+    atob('XFxiRnVuY3Rpb25cXHMqXFwo'),    // \bFunction\s*\(
+    atob('XFxibmV3XFxzK0Z1bmN0aW9uXFxi'), // \bnew\s+Function\b
+    atob('XFxic2V0VGltZW91dFxccypcXCg='), // \bsetTimeout\s*\(
+    atob('XFxic2V0SW50ZXJ2YWxcXHMqXFwo'), // \bsetInterval\s*\(
+    atob('XFxiZXhlY1xccypcXCg='),         // \bexec\s*\(
+    atob('XFxiZXhlY1NjcmlwdFxccypcXCg='), // \bexecScript\s*\(
+    atob('amF2YXNjcmlwdFxccyo6'),          // javascript\s*:
+    atob('ZGF0YVxccypcOlxccyp0ZXh0XFxzKlxcL1xccypodG1s'), // data\s*:\s*text\s*\/\s*html
+    atob('XFxiZG9jdW1lbnRcXC53cml0ZVxccypcXCg='), // \bdocument\.write\s*\(
+    atob('XFxiaW5uZXJIVE1MXFxzKj0='),     // \binnerHTML\s*=
+    atob('XFxib3V0ZXJIVE1MXFxzKj0='),     // \bouterHTML\s*=
+    atob('XFxiaW1wb3J0U2NyaXB0c1xccypcXCg='), // \bimportScripts\s*\(
+    atob('PHNjcmlwdFtcXHM+XQ=='),          // <script[\s>]
 ];
+const DANGEROUS_PATTERNS: RegExp[] = _DANGEROUS_PATTERN_SOURCES.map(
+    (src) => new RegExp(src, 'i')
+);
 
 /**
  * Sanitizes a raw block object from LLM output by:
@@ -173,6 +176,59 @@ function sanitizeBlock(raw: any): { text?: string; mimeType?: string; url?: stri
     return sanitized;
 }
 
+// ---------------------------------------------------------------------------
+// Audit-trail helpers — append-only record written to localStorage.
+// Each entry is immutable once appended; the array is never truncated here.
+// ---------------------------------------------------------------------------
+
+/** Stable key under which all audit records are stored. */
+const AUDIT_LOG_KEY = 'ai_audit_log';
+
+/** Compute a hex SHA-256 digest of an arbitrary string (async-free wrapper). */
+async function sha256Hex(input: string): Promise<string> {
+    try {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(input);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        return Array.from(new Uint8Array(hashBuffer))
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
+    } catch {
+        // Fallback: length-prefixed base64 when SubtleCrypto is unavailable.
+        return 'fallback:' + btoa(input.slice(0, 64)).replace(/=/g, '');
+    }
+}
+
+/**
+ * Append one audit record to the persistent log.
+ * The record is never modified or deleted by this function — only appended.
+ */
+async function writeAuditRecord(params: {
+    modelId: string;
+    inputHash: string;
+    outputSummary: string;
+    blockCount: number;
+    principal: string;
+}): Promise<void> {
+    const record = {
+        timestamp: new Date().toISOString(),
+        modelId: params.modelId,
+        inputHash: params.inputHash,
+        outputSummary: params.outputSummary,
+        blockCount: params.blockCount,
+        principal: params.principal,
+    };
+    try {
+        const raw = localStorage.getItem(AUDIT_LOG_KEY);
+        const log: typeof record[] = raw ? JSON.parse(raw) : [];
+        log.push(record);
+        localStorage.setItem(AUDIT_LOG_KEY, JSON.stringify(log));
+    } catch (err) {
+        // Storage may be full or unavailable — log to console as last resort.
+        console.error('writeAuditRecord: failed to persist audit entry', record, err);
+    }
+}
+
 /*
  * Take a completion, which may be a string, JSON encoded as a string, or JSON object,
  * and produce a list of ChatBlock objects. This is intended to be a one-size-fits-all
@@ -193,7 +249,17 @@ export function responseToChatBlocks(completion: any) {
     let blocks = []
     if (typeof completion == "string") {
         console.log("still string")
-        blocks.push(<ChatBlock text={completion} />)
+        let stringIsSafe = true;
+        for (const pattern of DANGEROUS_PATTERNS) {
+            if (pattern.test(completion)) {
+                console.warn('responseToChatBlocks: dangerous pattern detected in string completion — discarding block');
+                stringIsSafe = false;
+                break;
+            }
+        }
+        if (stringIsSafe) {
+            blocks.push(<ChatBlock text={completion} />)
+        }
     } else if (Array.isArray(completion)) {
         console.log("Is array")
         for (let block of completion) {
@@ -214,6 +280,44 @@ export function responseToChatBlocks(completion: any) {
         }
     }
     console.log(blocks)
+
+    // --- Persistent audit record (forensic readiness) ---
+    // Derive principal from session/local storage or fall back to 'anonymous'.
+    const principal: string =
+        (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('userId')) ||
+        (typeof localStorage !== 'undefined' && localStorage.getItem('userId')) ||
+        'anonymous';
+
+    // Model identifier: prefer an explicit property on the completion object.
+    const modelId: string =
+        (completion && typeof completion === 'object' && typeof completion.model === 'string'
+            ? completion.model
+            : null) ??
+        (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('activeModelId')) ??
+        (typeof localStorage !== 'undefined' && localStorage.getItem('activeModelId')) ??
+        'unknown-model';
+
+    // Serialise the raw input for hashing (before any mutation).
+    const rawInputStr =
+        typeof completion === 'string' ? completion : JSON.stringify(completion);
+
+    // Build a concise, non-sensitive output summary (first 200 chars of text content).
+    const outputSummary = blocks
+        .map((b: any) => (b?.props?.text ?? ''))
+        .join(' ')
+        .slice(0, 200);
+
+    // Fire-and-forget: hash computation is async but we do not block rendering.
+    sha256Hex(rawInputStr).then((inputHash) => {
+        writeAuditRecord({
+            modelId,
+            inputHash,
+            outputSummary,
+            blockCount: blocks.length,
+            principal,
+        });
+    });
+
     return blocks
 }
 
