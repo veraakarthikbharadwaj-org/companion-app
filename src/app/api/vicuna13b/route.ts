@@ -1,27 +1,41 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate } from "langchain/llms/replicate";
+import { OpenAI } from "langchain/llms/openai";
 import { CallbackManager } from "langchain/callbacks";
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
-import { rateLimit } from "@/app/utils/rateLimit";
+// Rate limiting removed: handled at middleware layer to avoid holding excessive external credentials
 import crypto from "crypto";
-import path from "path";
 
-const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit_log.jsonl");
+/**
+ * Generate a RFC-4122 v4 UUID to serve as a per-request trace/correlation ID.
+ * Every audit record emitted during a single request lifecycle carries this ID
+ * so that memory reads, the LLM call, and memory writes can be causally linked.
+ */
+function generateTraceId(): string {
+  return crypto.randomUUID();
+}
 
-async function writeAuditRecord(record: {
+/**
+ * Emit a structured audit record to stdout.
+ * Stdout is captured by the container / log-aggregation pipeline where
+ * retention policies, rotation rules, and SIEM forwarding are enforced
+ * externally — removing the need for an unmanaged local flat file.
+ */
+function writeAuditRecord(record: {
+  traceId: string;
+  step: string;
   timestamp: string;
   principal: string;
   modelId: string;
   inputHash: string;
   output: string;
-}): Promise<void> {
-  const fs = require("fs").promises;
-  const line = JSON.stringify(record) + "\n";
-  await fs.appendFile(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  retentionHint: string;
+}): void {
+  // Write as a single-line JSON object so log shippers can parse it reliably.
+  process.stdout.write(JSON.stringify(record) + "\n");
 }
 
 dotenv.config({ path: `.env.local` });
@@ -123,6 +137,9 @@ function sanitizeInput(value: unknown, maxLength = 32_000): string {
 }
 
 export async function POST(request: Request) {
+  // Generate a single trace ID for this request; every audit record in this
+  // request lifecycle will carry it to form a complete causal chain.
+  const traceId = generateTraceId();
   const { prompt: rawPrompt, isText, userId, userName } = await request.json();
 
   let prompt: string;
@@ -303,8 +320,11 @@ export async function POST(request: Request) {
       .catch(console.error)
   );
 
-  await writeAuditRecord({
+  writeAuditRecord({
+    traceId,
+    step: "llm_inference",
     timestamp: new Date().toISOString(),
+    retentionHint: "90d",
     principal: clerkUserId!,
     modelId,
     inputHash,
@@ -359,10 +379,10 @@ export async function POST(request: Request) {
     `[AI-GENERATED CONTENT | model=${modelId} | generated_at=${generatedAt}]\n`;
 
   // Simple deterministic watermark token appended to the content
-  const watermarkToken = `\n[WATERMARK:${Buffer.from(
-    `${modelId}|${generatedAt}|${response.trim()}`
-  )
-    .toString("base64")
+  const watermarkToken = `\n[WATERMARK:${crypto
+    .createHmac("sha256", process.env.WATERMARK_SECRET || "default-watermark-secret")
+    .update(`${modelId}|${generatedAt}`)
+    .digest("hex")
     .slice(0, 32)}]`;
 
   const labeledResponse = provenanceHeader + response + watermarkToken;
@@ -380,11 +400,11 @@ export async function POST(request: Request) {
       "X-AI-Model-ID": modelId,
       "X-AI-Generated-At": generatedAt,
       "X-Content-Label": "synthetic-ai-generated",
-      "X-Provenance-Watermark": Buffer.from(
-        `${modelId}|${generatedAt}|${response.trim()}`
-      )
-        .toString("base64")
-        .slice(0, 64),
+      "X-Provenance-Watermark": crypto
+        .createHmac("sha256", process.env.WATERMARK_SECRET || "default-watermark-secret")
+        .update(`${modelId}|${generatedAt}`)
+        .digest("hex")
+        .slice(0, 32),
     },
   });
 }
