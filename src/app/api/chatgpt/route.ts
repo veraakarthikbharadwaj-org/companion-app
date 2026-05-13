@@ -1,12 +1,33 @@
-import { ChatAnthropic } from "langchain/chat_models/anthropic";
+import { ChatOllama } from "langchain/chat_models/ollama";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 
+/**
+ * Audit-log every LLM interaction: request and response.
+ * Writes a structured JSON record to stdout so it can be captured
+ * by any log aggregator attached to the process.
+ */
+function logLLMInteraction(
+  interactionId: string,
+  input: Record<string, unknown>,
+  response: unknown
+): void {
+  console.log(
+    JSON.stringify({
+      event: "llm_interaction",
+      interactionId,
+      timestamp: new Date().toISOString(),
+      request: input,
+      response,
+    })
+  );
+}
+
 // Explicit tool allow list — only tools named here may be invoked by the agent
 const ALLOWED_TOOLS: ReadonlySet<string> = new Set([
-  // Add permitted tool names here, e.g.:
-  // "calculator",
-  // "web-search",
+  "calculator",
+  "web-search",
+  "memory-lookup",
 ]);
 
 /**
@@ -19,6 +40,15 @@ function assertToolAllowed(toolName: string): void {
       `Tool "${toolName}" is not on the allow list and cannot be executed.`
     );
   }
+}
+
+/**
+ * Run a tool by name after validating it against the allow list.
+ * All agent tool invocations MUST go through this function.
+ */
+function runTool(toolName: string, execute: () => unknown): unknown {
+  assertToolAllowed(toolName);
+  return execute();
 }
 import { StreamingTextResponse, LangChainStream } from "ai";
 import clerk from "@clerk/clerk-sdk-node";
@@ -513,18 +543,62 @@ Below is a relevant conversation history
   );
   console.log("INFO: chat history record updated");
   // --- Synthetic Content Provenance & Labeling ---
-  const provenanceTimestamp = new Date().toISOString();
-  const modelId = process.env.OPENAI_MODEL_ID ?? "gpt-3.5-turbo";
+    const provenanceTimestamp = new Date().toISOString();
+  // Expiry: tokens are valid for 5 minutes from issuance
+  const tokenExpiryMs = 5 * 60 * 1000;
+  const provenanceExpiry = new Date(Date.now() + tokenExpiryMs).toISOString();
+  // Subject binding: tie the token to the companion/user key
+  const tokenSubject = companionKey
+    ? `${companionKey.companionName}:${companionKey.userId}`
+    : "anonymous";
+  // Model ID is pinned via PINNED_MODEL_ID constant above; env-var resolution is prohibited.
+const modelId = PINNED_MODEL_ID;
   const syntheticLabel = "AI-GENERATED";
 
   // Compute HMAC-SHA256 signature over (modelId + timestamp + content)
   const crypto = await import("crypto");
-  const signingSecret = process.env.AI_SIGNING_SECRET ?? "default-insecure-secret";
+  const signingSecret = process.env.AI_SIGNING_SECRET;
+  if (!signingSecret || signingSecret.trim().length === 0) {
+    console.error("FATAL: AI_SIGNING_SECRET environment variable is not set. Refusing to sign content with an insecure default.");
+    return new NextResponse("Server misconfiguration: signing secret unavailable", { status: 500 });
+  }
 
-  const provenanceHeaders: Record<string, string> = {
+  // Persist a final decision log entry that includes traceId, model info,
+  // input hash, output hash, principal, and timestamp for forensic readiness.
+  const outputHash = crypto
+    .createHash("sha256")
+    .update(sanitizedText)
+    .digest("hex");
+
+  const decisionLogEntry = JSON.stringify({
+    event: "ai_decision",
+    traceId,
+    timestamp: provenanceTimestamp,
+    principal: clerkUserId,
+    modelId,
+    modelVersion: (model as { modelName?: string }).modelName ?? "unknown",
+    inputHash,
+    outputHash,
+    companionName: name,
+    retentionDays: LOG_RETENTION_DAYS,
+    rotationDays: LOG_ROTATION_DAYS,
+  }) + "\n";
+
+  try {
+    await fs.appendFile("logs/llm_interactions.log", decisionLogEntry);
+  } catch (err) {
+    console.error("FATAL: Failed to write AI decision audit log:", err);
+    throw new Error(
+      "Audit log write failure — halting to preserve forensic integrity"
+    );
+  }
+
+    const provenanceHeaders: Record<string, string> = {
     "X-AI-Generated": syntheticLabel,
     "X-AI-Model-ID": modelId,
     "X-AI-Timestamp": provenanceTimestamp,
+    "X-AI-Expiry": provenanceExpiry,
+    "X-AI-Subject": tokenSubject,
     "X-Content-Type-Options": "nosniff",
   };
 
@@ -539,18 +613,28 @@ Below is a relevant conversation history
     };
     const signature = crypto
       .createHmac("sha256", signingSecret)
-      .update(modelId + provenanceTimestamp + sanitizedText)
+      .update(modelId + provenanceTimestamp + provenanceExpiry + tokenSubject + sanitizedText)
       .digest("hex");
     provenanceHeaders["X-AI-Signature"] = `sha256=${signature}`;
-    return NextResponse.json(payload, { headers: provenanceHeaders });
+    return NextResponse.json(payload, { headers: provenanceHeaders }); // traceId: included in X-AI-Trace-ID header and decision log
   }
 
   // Streaming path: attach provenance metadata as response headers
-  const streamContent = sanitizedText; // use sanitized text for signature
+  // streamContent has been validated above for eval, exec, new Function, subprocess, and other
+  // dynamic code execution primitives; use it directly instead of the raw LLM stream.
+  const streamContent = sanitizedText; // validated and sanitized LLM output
   const streamSignature = crypto
     .createHmac("sha256", signingSecret)
-    .update(modelId + provenanceTimestamp + streamContent)
+    .update(modelId + provenanceTimestamp + provenanceExpiry + tokenSubject + streamContent)
     .digest("hex");
   provenanceHeaders["X-AI-Signature"] = `sha256=${streamSignature}`;
-  return new StreamingTextResponse(stream, { headers: provenanceHeaders });
+  // Build a new ReadableStream from the validated text so the raw LLM stream
+  // (which has not been sanitized) is never sent to the client.
+  const validatedStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(streamContent));
+      controller.close();
+    },
+  });
+  return new StreamingTextResponse(validatedStream, { headers: provenanceHeaders });
 }
