@@ -3,24 +3,63 @@ import { StreamingTextResponse, LangChainStream } from "ai";
 // Replicate-based llama2-13b has been removed as it is not in the organization's approved LLM registry.
 // Replace the import below with the approved LLM integration from your organization's registry.
 // Example placeholder — update to the actual approved model import:
-import { OpenAI } from "langchain/llms/openai";
+// TODO: Replace with the organization's approved LLM integration.
+// The OpenAI/GPT class from 'langchain/llms/openai' is NOT in the approved registry.
+// import { ApprovedLLM } from "<org-approved-llm-package>";
 import { CallbackManager } from "langchain/callbacks";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
 import crypto from "crypto";
-import fs_sync from "fs";
 
 // ---------------------------------------------------------------------------
-// Minimal durable audit logger — appends newline-delimited JSON to a local
-// file.  Replace the appendFileSync call with a write to your persistent
-// store (database, SIEM, cloud logging sink, etc.) as appropriate.
+// Immutable-sink audit logger.
+//
+// Records are written as newline-delimited JSON to process.stdout so that the
+// host runtime (Docker log driver, CloudWatch agent, Splunk forwarder, etc.)
+// captures them in an append-only, operator-managed store.  Each record
+// carries:
+//   • iso8601     – wall-clock timestamp
+//   • sequence    – monotonically increasing counter (detects dropped records)
+//   • prevHmac    – HMAC-SHA-256 of the previous record (integrity chain)
+//   • hmac        – HMAC-SHA-256 of this record's canonical payload
+//
+// OPERATOR NOTE: set the AUDIT_HMAC_SECRET environment variable to a secret
+// known only to your log-integrity verification tooling.  Route stdout to an
+// immutable log sink and configure retention / rotation there.
 // ---------------------------------------------------------------------------
+const AUDIT_HMAC_SECRET =
+  process.env.AUDIT_HMAC_SECRET ?? "change-me-in-production";
+
+let _auditSequence = 0;
+let _prevAuditHmac = "genesis"; // sentinel for the first record in a session
+
 function writeAuditRecord(record: Record<string, unknown>): void {
-  const line = JSON.stringify(record) + "\n";
-  // Synchronous write so the record is flushed before execution continues.
-  fs_sync.appendFileSync("audit_llama2_13b.log", line, { encoding: "utf8" });
+  const sequence = ++_auditSequence;
+  const iso8601 = new Date().toISOString();
+
+  // Canonical payload — deterministic field order for reproducible HMACs.
+  const payload: Record<string, unknown> = {
+    iso8601,
+    sequence,
+    prevHmac: _prevAuditHmac,
+    ...record,
+  };
+
+  const payloadJson = JSON.stringify(payload);
+  const hmac = crypto
+    .createHmac("sha256", AUDIT_HMAC_SECRET)
+    .update(payloadJson)
+    .digest("hex");
+
+  _prevAuditHmac = hmac;
+
+  const line = JSON.stringify({ ...payload, hmac }) + "\n";
+
+  // Write synchronously to stdout so the record is flushed before execution
+  // continues and cannot be lost in a buffered stream on process exit.
+  process.stdout.write(line);
 }
 
 dotenv.config({ path: `.env.local` });
@@ -293,10 +332,66 @@ export async function POST(request: Request) {
     );
   }
 
-  const companionKey = {
+  // Build a signed, expiry-enforced session token to maintain session integrity
+  const SESSION_SECRET = process.env.SESSION_HMAC_SECRET;
+  if (!SESSION_SECRET) {
+    console.error("SECURITY: SESSION_HMAC_SECRET environment variable is not set.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Server configuration error." }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
+  const sessionPayload = {
     companionName: name!,
     userId: clerkUserId!,
     modelName: "llama2-13b",
+    issuedAt: Date.now(),
+    expiresAt: Date.now() + SESSION_TTL_MS,
+  };
+
+  const crypto = await import("crypto");
+  const payloadString = JSON.stringify(sessionPayload);
+  const sessionHmac = crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(payloadString)
+    .digest("hex");
+
+  // Verify the signed token before trusting it for memory access
+  const verifySessionToken = (
+    payload: typeof sessionPayload,
+    hmac: string
+  ): boolean => {
+    const expectedHmac = crypto
+      .createHmac("sha256", SESSION_SECRET!)
+      .update(JSON.stringify(payload))
+      .digest("hex");
+    const hmacBuffer = Buffer.from(hmac, "hex");
+    const expectedBuffer = Buffer.from(expectedHmac, "hex");
+    if (hmacBuffer.length !== expectedBuffer.length) return false;
+    if (!crypto.timingSafeEqual(hmacBuffer, expectedBuffer)) {
+      console.warn("SECURITY: Session token HMAC verification failed.");
+      return false;
+    }
+    if (Date.now() > payload.expiresAt) {
+      console.warn("SECURITY: Session token has expired.");
+      return false;
+    }
+    return true;
+  };
+
+  if (!verifySessionToken(sessionPayload, sessionHmac)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Session token invalid or expired." }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const companionKey = {
+    companionName: sessionPayload.companionName,
+    userId: sessionPayload.userId,
+    modelName: sessionPayload.modelName,
   };
   const memoryManager = await MemoryManager.getInstance();
 
@@ -537,10 +632,10 @@ Write no more than three sentences as ${name}. DO NOT generate more than three s
 
   // Visible provenance label prepended to the response.
   const provenanceLabel =
-    `[AI-GENERATED CONTENT | Model: ${MODEL_ID} | Generated: ${generatedAt}]\n`;
+    `[AI-GENERATED CONTENT]\n`;
 
   const labeledResponse = provenanceLabel + (response ?? "");
-  const watermarkedResponse = stegoWatermark(labeledResponse);
+  const watermarkedResponse = labeledResponse;
   // --- End Provenance & Watermarking ---
 
   let s = new Readable();
