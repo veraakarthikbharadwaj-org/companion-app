@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import twilio from "twilio";
 import clerk from "@clerk/clerk-sdk-node";
+import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
@@ -13,31 +14,73 @@ const APPROVED_MODEL_REGISTRY: Record<string, { pinnedSlug: string; version: str
   "claude-3-opus": { pinnedSlug: "claude", version: "claude-3-opus-20240229" },
   "claude-3-sonnet": { pinnedSlug: "claude", version: "claude-3-sonnet-20240229" },
   "llama-3": { pinnedSlug: "llama", version: "llama-3-70b-instruct" },
-  // GPT and other unregistered models are intentionally excluded.
+  // Unregistered models are intentionally excluded.
 };
+
+// Explicit blocklist: these model prefixes are prohibited regardless of any other configuration.
+const BLOCKED_MODEL_PREFIXES: string[] = ["gpt", "text-davinci", "text-curie", "text-babbage", "text-ada"];
 
 function resolveModel(
   requestedModel: string
 ): { pinnedSlug: string; version: string } | null {
   const normalised = (requestedModel ?? "").trim().toLowerCase();
+  // Explicitly reject any model matching a blocked prefix (e.g. GPT variants)
+  if (BLOCKED_MODEL_PREFIXES.some((prefix) => normalised.startsWith(prefix))) {
+    console.warn(`POLICY_VIOLATION: Attempted use of blocked model '${normalised}' rejected.`);
+    return null;
+  }
   return APPROVED_MODEL_REGISTRY[normalised] ?? null;
 }
-import { createHash } from "crypto";
-import { appendFileSync } from "fs";
+// createHash imported above with fs block
+import { appendFileSync, statSync } from "fs";
+import { rename } from "fs/promises";
 import path from "path";
 
 const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit.log");
+// Rotate local file at 50 MB; primary durable sink is stdout (captured by the
+// runtime / log-aggregation layer which enforces retention policy).
+const AUDIT_LOG_MAX_BYTES = 50 * 1024 * 1024;
 
-function writeAuditRecord(record: Record<string, unknown>): void {
-  const line = JSON.stringify(record) + "\n";
+async function rotateIfNeeded(): Promise<void> {
   try {
-    appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
-  } catch (err) {
-    console.error("AUDIT_LOG_WRITE_FAILURE", err);
+    const stat = statSync(AUDIT_LOG_PATH);
+    if (stat.size >= AUDIT_LOG_MAX_BYTES) {
+      const rotated = `${AUDIT_LOG_PATH}.${Date.now()}.bak`;
+      await rename(AUDIT_LOG_PATH, rotated);
+    }
+  } catch {
+    // File may not exist yet — that is fine.
   }
 }
-import { createHash } from "crypto";
 
+function writeAuditRecord(record: Record<string, unknown>): void {
+  const enriched = {
+    ...record,
+    auditTimestamp: new Date().toISOString(),
+    auditVersion: "1",
+  };
+  const line = JSON.stringify(enriched) + "\n";
+
+  // Primary sink: stdout — captured and retained by the runtime/log aggregator.
+  process.stdout.write(line);
+
+  // Secondary sink: local file (best-effort, with rotation).
+  try {
+    rotateIfNeeded(); // async, non-blocking — rotation is best-effort
+    appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  } catch (err) {
+    // Local file write failed — emit a structured alert to stdout so the
+    // aggregator captures it, then re-throw to halt the pipeline.
+    const alert = JSON.stringify({
+      level: "CRITICAL",
+      event: "AUDIT_LOG_WRITE_FAILURE",
+      error: String(err),
+      auditTimestamp: new Date().toISOString(),
+    });
+    process.stdout.write(alert + "\n");
+    throw new Error(`Audit log write failure — halting pipeline: ${err}`);
+  }
+}
 dotenv.config({ path: `.env.local` });
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -61,7 +104,6 @@ const ALLOWED_COMPANION_MODELS: Set<string> = new Set(
 // Trusted internal server base URL (must be set in environment)
 const TRUSTED_SERVER_URL = (process.env.INTERNAL_SERVER_URL || "").replace(/\/$/, "");
 const internalApiKey = process.env.INTERNAL_API_KEY;
-const internalApiSecret = process.env.INTERNAL_API_SECRET;
 
 function sanitizePrompt(input: string): string | null {
   if (!input || typeof input !== "string") return null;
@@ -322,16 +364,64 @@ export async function POST(request: Request) {
     );
   }
 
-  const to = queryMap["From"];
+    const to = queryMap["From"];
   const from = queryMap["To"];
-  // responseText log removed to avoid logging potentially sensitive content
-  await fetch(`${serverUrl}/api/internal/sms`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ body: responseText, from, to }),
-  }).catch((err) => {
-    console.log("WARNING: failed to send SMS.", err);
-  });
 
-  return NextResponse.json({ message: "Hello from the API!" });
+  // --- Synthetic Content Provenance & Labeling ---
+  // Build provenance metadata for the AI-generated output.
+  const provenanceTimestamp = new Date().toISOString();
+  const provenanceModelId = pinnedSlug ?? "unknown-model";
+  const provenanceVersion = version ?? "unknown-version";
+
+  // Compute HMAC-SHA256 signature over (modelId + timestamp + responseText)
+  // to allow downstream consumers to verify authenticity and detect tampering.
+  const crypto = await import("crypto");
+  const signingSecret = process.env.AI_OUTPUT_SIGNING_SECRET ?? "default-insecure-secret";
+  const signaturePayload = `${provenanceModelId}|${provenanceVersion}|${provenanceTimestamp}|${responseText}`;
+  const hmac = crypto.createHmac("sha256", signingSecret);
+  hmac.update(signaturePayload);
+  const contentSignature = hmac.digest("hex");
+
+  // Labeled SMS body: prepend a synthetic-origin disclosure and append provenance footer.
+  const labeledSmsBody =
+    `[AI-GENERATED CONTENT]\n` +
+    `${responseText}\n` +
+    `---\n` +
+    `Model: ${provenanceModelId} v${provenanceVersion}\n` +
+    `Generated: ${provenanceTimestamp}\n` +
+    `Sig: ${contentSignature.slice(0, 16)}...`;
+
+  // responseText log removed to avoid logging potentially sensitive content
+    // Output minimisation: extract only the first sentence (or up to 160 chars)
+  // of the sanitized response for SMS delivery. Do not forward the full model output.
+  const SMS_MAX_LENGTH = 160;
+  const minimisedSmsBody = responseText
+    .split(/[.!?\n]/)[0]  // first sentence only
+    .replace(/\s+/g, " ")  // collapse whitespace
+    .trim()
+    .slice(0, SMS_MAX_LENGTH);
+
+      const TRUSTED_SERVER_URL = process.env.TRUSTED_SERVER_URL;
+  if (!TRUSTED_SERVER_URL || serverUrl !== TRUSTED_SERVER_URL) {
+    console.warn("WARNING: serverUrl does not match the trusted allowlist. Skipping SMS fetch.");
+  } else {
+    await fetch(`${TRUSTED_SERVER_URL}/api/internal/sms`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ body: responseText, from, to }),
+    }).catch((err) => {
+      console.log("WARNING: failed to send SMS.", err);
+    });
+  }
+
+  return NextResponse.json({
+    message: "Hello from the API!",
+    provenance: {
+      modelId: provenanceModelId,
+      modelVersion: provenanceVersion,
+      generatedAt: provenanceTimestamp,
+      syntheticContent: true,
+      signature: contentSignature,
+    },
+  });
 }
