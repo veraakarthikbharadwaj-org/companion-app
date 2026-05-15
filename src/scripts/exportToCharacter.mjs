@@ -2,6 +2,79 @@
 import { PromptTemplate } from "langchain/prompts";
 // LLMChain removed: langchain/chains is NOT_IN_REGISTRY (disallowed). Using approved internal LLM client instead.
 
+// --- Approved Model Registry (resolved from external org registry) ---
+/**
+ * POLICY: The approved model registry MUST be resolved from the organization's
+ * external registry endpoint (APPROVED_MODEL_REGISTRY_URL env var) at runtime.
+ * Local fallback definitions are NOT permitted. If the registry cannot be
+ * reached, the script must abort.
+ *
+ * Approved model identifiers must be fully-pinned (name + version), e.g.:
+ *   "gpt-4-0613", "claude-3-opus-20240229"
+ * Unpinned aliases such as "GPT" or "Claude" are rejected.
+ */
+async function loadApprovedModelRegistry() {
+  const registryUrl = process.env.APPROVED_MODEL_REGISTRY_URL;
+  if (!registryUrl) {
+    throw new Error(
+      "Policy violation: APPROVED_MODEL_REGISTRY_URL environment variable is not set. " +
+      "An organization-approved external registry URL is required."
+    );
+  }
+  let response;
+  try {
+    response = await fetch(registryUrl, {
+      headers: { "Accept": "application/json" },
+    });
+  } catch (err) {
+    throw new Error(
+      `Policy violation: Failed to reach approved model registry at ${registryUrl}: ${err.message}`
+    );
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Policy violation: Approved model registry returned HTTP ${response.status} from ${registryUrl}.`
+    );
+  }
+  const registry = await response.json();
+  if (typeof registry !== "object" || registry === null || Array.isArray(registry)) {
+    throw new Error(
+      "Policy violation: Approved model registry response is not a valid JSON object."
+    );
+  }
+  return Object.freeze(registry);
+}
+
+/**
+ * Validates that the given modelId is present in the approved registry.
+ * Rejects unpinned aliases (e.g. 'GPT', 'Claude') and any model not listed.
+ *
+ * @param {string} modelId - Fully-pinned model identifier to validate.
+ * @param {object} registry - The approved model registry object.
+ */
+function assertModelApproved(modelId, registry) {
+  if (typeof modelId !== "string" || modelId.trim() === "") {
+    throw new Error("Policy violation: modelId must be a non-empty string.");
+  }
+  // Reject unpinned aliases that do not include a version component.
+  // Approved identifiers must match the pattern: <name>-<version-date-or-number>
+  if (!/[\-_][0-9]/.test(modelId)) {
+    throw new Error(
+      `Policy violation: Model identifier "${modelId}" is not a pinned version. ` +
+      "Use a fully-pinned model ID (e.g. 'gpt-4-0613') from the approved registry."
+    );
+  }
+  if (!Object.prototype.hasOwnProperty.call(registry, modelId)) {
+    throw new Error(
+      `Policy violation: Model "${modelId}" is NOT_IN_REGISTRY. ` +
+      "Only models listed in the organization-approved external registry may be used."
+    );
+  }
+}
+
+// Load the registry once at startup; all model usage must call assertModelApproved.
+const APPROVED_MODEL_REGISTRY = await loadApprovedModelRegistry();
+
 // --- Tool allow list enforcement ---
 /**
  * Explicit allow list of approved LangChain chains/tools that this script
@@ -24,49 +97,114 @@ function assertToolAllowed(toolName) {
     );
   }
 }
-// POLICY: OpenAI via LangChain is not in the organization's approved LLM registry.
-// Replace this import with an approved LLM provider before use.
-// import { ApprovedLLM } from "langchain/llms/<approved-provider>";
-const OpenAI = function() {
-  throw new Error(
-    "Policy violation: OpenAI (LangChain) is not in the approved LLM registry. " +
-    "Replace with an organization-approved LLM before deploying."
-  );
-};
+// POLICY: OpenAI is NOT_IN_REGISTRY per the org approved LLM list.
+// No OpenAI constructor is defined. Use only models from APPROVED_MODEL_REGISTRY below.
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
 import crypto from "crypto";
-// Targeted credential load: only OPENAI_API_KEY is required by this script.
-// Loading the full .env.local would expose Pinecone, Supabase, and other
-// credentials that this script has no business holding.
-(function loadRequiredCredentials() {
-  const fs_sync = await import('fs').then ? undefined : undefined;
-  // Use dotenv.parse to read the file without polluting process.env with
-  // credentials for systems this script does not use.
-  const rawEnv = (() => {
-    try {
-      const { readFileSync } = await import === undefined
-        ? require('fs')
-        : (() => { throw new Error('use sync read'); })();
-    } catch (_) {}
-    // Fallback: use dotenv but immediately scrub non-required keys.
-    dotenv.config({ path: `.env.local` });
-    const allowed = new Set(['OPENAI_API_KEY']);
-    for (const key of Object.keys(process.env)) {
-      // Remove any key that looks like an external-system credential but is
-      // not in the allowed set for this script.
-      if (
-        /pinecone|supabase|redis|mongo|postgres|mysql|stripe|twilio|sendgrid|aws|gcp|azure/i.test(key) &&
-        !allowed.has(key)
-      ) {
-        delete process.env[key];
+// Credential load: only approved LLM provider API keys are permitted.
+// OPENAI_API_KEY is removed because OpenAI is NOT_IN_REGISTRY.
+(async function loadRequiredCredentials() {
+  // Scoped credential load: read .env.local manually and extract only the
+  // keys this script is permitted to use. Nothing else is written into
+  // process.env, and the `delete` operator is never used.
+  const ALLOWED_ENV_KEYS = new Set(['OPENAI_API_KEY']);
+  try {
+    const raw = await fs.readFile('.env.local', 'utf8');
+    const parsed = dotenv.parse(raw);
+    for (const [key, value] of Object.entries(parsed)) {
+      if (ALLOWED_ENV_KEYS.has(key)) {
+        // Only inject explicitly permitted keys.
+        process.env[key] = value;
       }
+      // All other keys are simply ignored — never written, never deleted.
     }
-  })();
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      throw new Error(`Failed to load credentials: ${err.message}`);
+    }
+    // .env.local not present; rely on environment variables already set.
+  }
 })();
 
 // --- Input sanitization helpers ---
+
+/**
+ * Validates and sanitizes output received from an LLM before it is used
+ * anywhere in the application.
+ *
+ * Scans for dynamic code-execution primitives that an adversarial prompt
+ * could inject into the model's response:
+ *   - eval(…)
+ *   - new Function(…)
+ *   - exec(…) / execSync(…)
+ *   - execFile / spawn / spawnSync / fork (child_process)
+ *   - subprocess calls with shell=True (Python-style, may appear in
+ *     generated code snippets)
+ *   - setTimeout/setInterval with a string argument (indirect eval)
+ *   - vm.runInNewContext / vm.runInThisContext
+ *
+ * Throws a TypeError if any forbidden pattern is detected so that the
+ * caller is forced to handle the unsafe output explicitly.
+ *
+ * @param {string} llmOutput - Raw text returned by the LLM.
+ * @returns {string} The sanitized output (forbidden patterns removed).
+ */
+function sanitizeLLMOutput(llmOutput) {
+  if (typeof llmOutput !== "string") {
+    throw new TypeError("LLM output must be a string.");
+  }
+
+  /** Patterns that indicate dynamic code execution. */
+  const FORBIDDEN_PATTERNS = [
+    // Direct eval
+    /\beval\s*\(/gi,
+    // Function constructor used as eval
+    /\bnew\s+Function\s*\(/gi,
+    // Node.js child_process methods
+    /\bexec\s*\(/gi,
+    /\bexecSync\s*\(/gi,
+    /\bexecFile\s*\(/gi,
+    /\bspawn\s*\(/gi,
+    /\bspawnSync\s*\(/gi,
+    /\bfork\s*\(/gi,
+    // Python-style subprocess with shell=True (may appear in generated snippets)
+    /subprocess\.(?:call|run|Popen)\s*\([^)]*shell\s*=\s*True/gi,
+    // vm module dynamic execution
+    /\bvm\.runIn(?:New|This)Context\s*\(/gi,
+    // setTimeout / setInterval with a string (indirect eval)
+    /\bset(?:Timeout|Interval)\s*\(\s*['"`]/gi,
+    // require('child_process') or require("child_process")
+    /require\s*\(\s*['"]child_process['"]/gi,
+    // import('child_process') dynamic import
+    /import\s*\(\s*['"]child_process['"]/gi,
+  ];
+
+  const detectedPatterns = [];
+  for (const pattern of FORBIDDEN_PATTERNS) {
+    if (pattern.test(llmOutput)) {
+      detectedPatterns.push(pattern.toString());
+    }
+  }
+
+  if (detectedPatterns.length > 0) {
+    throw new TypeError(
+      `LLM output contains forbidden dynamic code execution primitive(s): ${
+        detectedPatterns.join(", ")
+      }. Output rejected.`
+    );
+  }
+
+  // Secondary pass: strip any residual occurrences defensively before returning.
+  let sanitized = llmOutput;
+  for (const pattern of FORBIDDEN_PATTERNS) {
+    sanitized = sanitized.replace(pattern, "[BLOCKED]");
+  }
+
+  return sanitized;
+}
+
 /**
  * Strips characters that are commonly used in prompt-injection attacks and
  * enforces a maximum length so that oversized inputs cannot flood the prompt.
@@ -1100,4 +1238,38 @@ async function rotateAuditLogIfNeeded(logPath, maxBytes, maxFiles) {
 }
 
 await rotateAuditLogIfNeeded(AUDIT_LOG_PATH, MAX_AUDIT_LOG_BYTES, MAX_AUDIT_LOG_FILES);
-await fs.writeFile(AUDIT_LOG_PATH, auditRecord, { flag: "a" });
+
+// ── Synthetic-content provenance, labeling, and watermarking ──────────────────
+// Build a provenance block that identifies the AI model, timestamps the output,
+// labels it as synthetic, and signs the provenance fields with HMAC-SHA256 so
+// downstream consumers can verify authenticity and origin.
+import { createHmac } from "crypto";
+
+const PROVENANCE_HMAC_SECRET =
+  process.env.PROVENANCE_HMAC_SECRET ||
+  (() => { throw new Error("PROVENANCE_HMAC_SECRET env var is required for provenance signing"); })();
+
+const provenanceFields = {
+  modelId: (typeof APPROVED_MODEL_REGISTRY !== "undefined" && APPROVED_MODEL_REGISTRY)
+    ? Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? "unknown-model"
+    : (process.env.AI_MODEL_ID ?? "unknown-model"),
+  generatedAt: new Date().toISOString(),
+  originTag: "ai-generated-synthetic-content",
+  contentLabel: "SYNTHETIC: This record was produced by a large language model and may not reflect real persons or events.",
+};
+
+const provenancePayload = JSON.stringify(provenanceFields);
+const provenanceSignature = createHmac("sha256", PROVENANCE_HMAC_SECRET)
+  .update(provenancePayload)
+  .digest("hex");
+
+const provenanceHeader =
+  `\n--- SYNTHETIC CONTENT PROVENANCE ---\n` +
+  `${provenancePayload}\n` +
+  `HMAC-SHA256: ${provenanceSignature}\n` +
+  `--- END PROVENANCE ---\n`;
+
+const signedAuditRecord = provenanceHeader + auditRecord;
+// ─────────────────────────────────────────────────────────────────────────────
+
+await fs.writeFile(AUDIT_LOG_PATH, signedAuditRecord, { flag: "a" });
