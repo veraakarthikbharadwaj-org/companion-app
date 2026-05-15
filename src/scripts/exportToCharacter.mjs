@@ -1,7 +1,7 @@
 import { Redis } from "@upstash/redis";
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { ChatAnthropic } from "langchain/chat_models/anthropic";
+import { ChatOpenAI } from "langchain/chat_models/openai";
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -87,7 +87,26 @@ const companionFilePath = join(COMPANIONS_DIR, COMPANION_NAME + ".txt");
 if (!companionFilePath.startsWith(COMPANIONS_DIR + "/") && companionFilePath !== COMPANIONS_DIR) {
   throw new Error("Path traversal detected: companion file path is outside the allowed directory.");
 }
-const data = await fs.readFile(companionFilePath, "utf8");
+// Redact PII from file contents before any processing
+function redactPII(text) {
+  if (typeof text !== "string") return text;
+  // Redact email addresses
+  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
+  // Redact phone numbers (various formats)
+  text = text.replace(/(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}/g, "[REDACTED_PHONE]");
+  // Redact US Social Security Numbers
+  text = text.replace(/\b\d{3}[\s.-]\d{2}[\s.-]\d{4}\b/g, "[REDACTED_SSN]");
+  // Redact credit card numbers (16-digit, optionally grouped)
+  text = text.replace(/\b(?:\d{4}[\s.-]?){3}\d{4}\b/g, "[REDACTED_CC]");
+  // Redact IPv4 addresses
+  text = text.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]");
+  // Redact common name patterns (Title + capitalized words)
+  text = text.replace(/\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/g, "[REDACTED_NAME]");
+  return text;
+}
+
+const rawData = await fs.readFile(companionFilePath, "utf8");
+const data = redactPII(rawData);
 
 // Sanitize file contents to prevent prompt injection
 function sanitizeForPrompt(text) {
@@ -343,7 +362,48 @@ for (let i = 0; i < questions.length; i++) {
   });
 
   try {
-    const result = await chain.call({ question });
+          const result = await chain.call({ question });
+      // Persistent, append-only audit entry for this LLM interaction
+      const _inputHash = crypto.createHash("sha256").update(question).digest("hex");
+      const _outputHash = crypto.createHash("sha256").update(result?.text ?? "").digest("hex");
+      const _interactionEntry = {
+        timestamp: new Date().toISOString(),
+        principal: USER_ID,
+        companionName: COMPANION_NAME,
+        modelName: MODEL_NAME,
+        modelVersion: AI_MODEL_VERSION,
+        status: "success",
+        inputHash: _inputHash,
+        outputHash: _outputHash,
+      };
+      await history.zadd(AUDIT_LOG_KEY, {
+        score: Date.now(),
+        member: JSON.stringify(_interactionEntry),
+      });
+      // Retention policy: keep only the most recent 10 000 audit entries
+      await history.zremrangebyrank(AUDIT_LOG_KEY, 0, -(10001));
+      return result;
+    } catch (error) {
+      const _errorEntry = {
+        timestamp: new Date().toISOString(),
+        principal: USER_ID,
+        companionName: COMPANION_NAME,
+        modelName: MODEL_NAME,
+        modelVersion: AI_MODEL_VERSION,
+        status: "error",
+        errorMessage: error?.message ?? String(error),
+        errorStack: error?.stack ?? null,
+      };
+      await history.zadd(AUDIT_LOG_KEY, {
+        score: Date.now(),
+        member: JSON.stringify(_errorEntry),
+      });
+      // Retention policy: keep only the most recent 10 000 audit entries
+      await history.zremrangebyrank(AUDIT_LOG_KEY, 0, -(10001));
+    });
+    if (result?.text != null) {
+      validateLLMOutput(result.text, `auditedChainCall index=${index}`);
+    }
     const outputHash = crypto
       .createHash("sha256")
       .update(result?.text ?? "")
@@ -358,6 +418,8 @@ for (let i = 0; i < questions.length; i++) {
       score: Date.now(),
       member: JSON.stringify(successEntry),
     });
+    // Retention policy: keep only the most recent 10 000 audit entries
+    await history.zremrangebyrank(AUDIT_LOG_KEY, 0, -(10001));
     return result;
   } catch (error) {
     const errorEntry = {
@@ -367,19 +429,75 @@ for (let i = 0; i < questions.length; i++) {
       errorStack: error?.stack ?? null,
       failedAt: new Date().toISOString(),
     };
-    console.error(error);
+    // Error already captured in errorEntry below; no console.error to avoid ephemeral-only logging
     await history.zadd(AUDIT_LOG_KEY, {
       score: Date.now(),
       member: JSON.stringify(errorEntry),
     });
+    // Retention policy: keep only the most recent 10 000 audit entries
+    await history.zremrangebyrank(AUDIT_LOG_KEY, 0, -(10001));
     return null;
   }
+}
+
+/**
+ * Validates LLM output for dynamic code execution primitives.
+ * Throws if dangerous patterns are detected.
+ */
+function validateLLMOutput(text, context = "") {
+  if (typeof text !== "string") return text;
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*['"`]/i,
+    /\bsetInterval\s*\(\s*['"`]/i,
+    /\bimport\s*\(/i,
+    /\brequire\s*\(/i,
+    /\bprocess\.binding\s*\(/i,
+    /\bvm\.runInNewContext\s*\(/i,
+    /\bvm\.runInThisContext\s*\(/i,
+    /\bvm\.runInContext\s*\(/i,
+    /\bchild_process/i,
+    /\bspawnSync\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bexecFileSync\s*\(/i,
+    /__import__/i,
+    /\bcompile\s*\(/i,
+    /\bexecfile\s*\(/i,
+  ];
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(text)) {
+      const err = new Error(
+        `[LLM OUTPUT VALIDATION] Dangerous code execution primitive detected in LLM output${context ? ` (${context})` : ""}. Pattern: ${pattern}`
+      );
+      console.error(err.message);
+      throw err;
+    }
+  }
+  return text;
 }
 
 const results = await Promise.all(
   questions.map((question, index) => auditedChainCall(question, index))
 );
+      console.log(`[spawn ${index}/${questions.length - 1}] Calling chain with question: "${question}"`);
+      const result = await withTimeout(
+        chain.call({ question }),
+        CALL_TIMEOUT_MS,
+        question
+      );
+      console.log(`[spawn ${index}] Completed successfully. Output: ${JSON.stringify(result)}`);
+      return result;
+    } catch (error) {
+      console.error(`[spawn ${index}] Chain call failed:`, error.message);
+    }
+  })
+);
       const result = await chain.call({ question });
+      if (result?.text != null) {
+        validateLLMOutput(result.text, "chain.call inline");
+      }
       console.log(`[LLM INTERACTION] Output: ${JSON.stringify(result)}`);
       return result;
     } catch (error) {
@@ -390,7 +508,32 @@ const results = await Promise.all(
 
 // --- Provenance metadata ---
 const GENERATION_TIMESTAMP = new Date().toISOString();
-const AI_MODEL_ID = "gpt-3.5-turbo-16k";
+// OpenAI model removed to comply with 3-system credential limit; use ANTHROPIC_MODEL_ID instead.
+
+// Canonical provenance fields — these are what the signature covers.
+// Any change to these values will invalidate the signature.
+const PROVENANCE_FIELDS = [
+  `model_id=${AI_MODEL_ID}`,
+  `generated=${GENERATION_TIMESTAMP}`,
+  `script=src/scripts/exportToCharacter.mjs`,
+  `companion=${COMPANION_NAME}`,
+].join("\n");
+
+// PROVENANCE_SIGNING_SECRET must be set in the environment.
+// It should be a long, random secret known to the verification party.
+const PROVENANCE_SIGNING_SECRET = process.env.PROVENANCE_SIGNING_SECRET;
+if (!PROVENANCE_SIGNING_SECRET) {
+  throw new Error(
+    "PROVENANCE_SIGNING_SECRET environment variable is not set. " +
+    "A secret is required to sign provenance headers."
+  );
+}
+
+const provenanceSignature = crypto
+  .createHmac("sha256", PROVENANCE_SIGNING_SECRET)
+  .update(PROVENANCE_FIELDS)
+  .digest("hex");
+
 const PROVENANCE_HEADER = [
   "=== AI-GENERATED CONTENT — SYNTHETIC ORIGIN ====",
   `Model ID   : ${AI_MODEL_ID}`,
@@ -399,13 +542,19 @@ const PROVENANCE_HEADER = [
   `Companion  : ${COMPANION_NAME}`,
   "WARNING: This file was produced by a large language model and does not",
   "represent statements made by any real person.",
+  `Signature  : hmac-sha256=${provenanceSignature}`,
   "================================================",
   "",
 ].join("\n");
 
 let output = "";
 for (let i = 0; i < questions.length; i++) {
-  output += `*****${questions[i]}*****\n${results[i].text}\n\n`;
+    const llmText = results[i]?.text ?? "";
+  validateLLMOutput(llmText, `output assembly index=${i}`);
+  output += `*****${questions[i]}*****
+${llmText}
+
+`;
 }
 output += `Definition (Advanced)\n${recentChat.join("\n")}`;
 
