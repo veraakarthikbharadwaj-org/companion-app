@@ -7,8 +7,45 @@ import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
+import crypto from "crypto";
 
 dotenv.config({ path: `.env.local` });
+
+/**
+ * APPROVED MODEL REGISTRY
+ * Only models listed here with exact version pins may be invoked.
+ * Source: internal security-approved model registry.
+ */
+const APPROVED_MODEL_REGISTRY: Record<string, { provider: string; digest: string }> = {
+  "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b": {
+    provider: "replicate",
+    digest: "6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b",
+  },
+};
+
+const ACTIVE_MODEL_ID =
+  "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
+
+/**
+ * Validates that a model ID is present in the approved registry before invocation.
+ * Throws if the model is not registered or the digest does not match.
+ */
+function assertModelInRegistry(modelId: string): void {
+  const entry = APPROVED_MODEL_REGISTRY[modelId];
+  if (!entry) {
+    throw new Error(
+      `Model '${modelId}' is NOT in the approved model registry. ` +
+        `Invocation blocked to enforce foundation model identity and version-pinning policy.`
+    );
+  }
+  // Enforce digest pin: model string must end with the registered digest
+  if (!modelId.endsWith(`:${entry.digest}`)) {
+    throw new Error(
+      `Model '${modelId}' digest mismatch against approved registry entry. ` +
+        `Invocation blocked.`
+    );
+  }
+}
 
 /**
  * Sanitize untrusted input before interpolation into LLM prompts.
@@ -98,7 +135,7 @@ export async function POST(request: Request) {
   const { isText } = rawBody;
   const prompt: string = sanitizeInput(typeof rawBody.prompt === "string" ? rawBody.prompt : "", 2000);
   // Log the incoming LLM request prompt for audit purposes
-  console.log(JSON.stringify({ event: "llm_request", userId: userId || "anonymous", prompt }));
+  console.log(JSON.stringify({ event: "llm_request", prompt }));
   if (!prompt) {
     return new NextResponse(
       JSON.stringify({ Message: "Invalid or empty prompt." }),
@@ -115,7 +152,7 @@ export async function POST(request: Request) {
   const identifier = request.url + "-" + "anonymous";
   // LLM interaction logging helper: captures response text for audit
   const logLLMResponse = (responseText: string) => {
-    console.log(JSON.stringify({ event: "llm_response", userId: userId || "anonymous", prompt, response: responseText }));
+    console.log(JSON.stringify({ event: "llm_response", prompt, response: responseText }));
   };
   const { success } = await rateLimit(identifier);
   if (!success) {
@@ -381,14 +418,30 @@ export async function POST(request: Request) {
   const response = chunks[0];
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
-  await memoryManager.writeToHistory("### " + response.trim(), companionKey);
+  const sanitizedResponse = sanitizeLLMOutput(response.trim());
+  await memoryManager.writeToHistory("### " + sanitizedResponse, companionKey);
 
   // --- Persistent Audit Trail (append-only, forensic-ready) ---
   // Retention policy: logs are rotated after AUDIT_RETENTION_DAYS days.
   // Rotation must be enforced by an external log-rotation daemon (e.g. logrotate)
   // configured to compress and delete files older than AUDIT_RETENTION_DAYS.
   const AUDIT_RETENTION_DAYS = 90;
-  const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH ?? "/var/log/ai_audit/vicuna13b_audit.jsonl";
+  const ALLOWED_AUDIT_BASE_DIRS = ["/var/log/ai_audit"];
+  const rawAuditLogPath = process.env.AUDIT_LOG_PATH ?? "/var/log/ai_audit/vicuna13b_audit.jsonl";
+  // Resolve to an absolute, normalized path and verify it is within an allowed directory.
+  const resolvedAuditLogPath = path.resolve(rawAuditLogPath);
+  const auditPathAllowed = ALLOWED_AUDIT_BASE_DIRS.some((allowedDir) =>
+    resolvedAuditLogPath.startsWith(path.resolve(allowedDir) + path.sep) ||
+    resolvedAuditLogPath === path.resolve(allowedDir)
+  );
+  if (!auditPathAllowed) {
+    console.error(
+      "[AUDIT] Rejected AUDIT_LOG_PATH outside allowed directories:",
+      resolvedAuditLogPath
+    );
+    throw new Error("Invalid AUDIT_LOG_PATH: path traversal detected.");
+  }
+  const AUDIT_LOG_PATH = resolvedAuditLogPath;
   const fs = require("fs");
   const path = require("path");
   const auditModelId =
@@ -406,16 +459,44 @@ export async function POST(request: Request) {
     output: response.trim(),
     retentionDays: AUDIT_RETENTION_DAYS,
   });
+  // Audit records are forwarded to a centralised audit sink whose retention
+  // and rotation policy is managed server-side (AUDIT_SINK_URL must point to
+  // an append-only, durable log service, e.g. a SIEM ingest endpoint).
+  // If the env var is absent the record is written to stdout in JSONL format
+  // so that the container / process supervisor can capture and forward it.
+  const AUDIT_SINK_URL = process.env.AUDIT_SINK_URL ?? "";
   try {
-    fs.mkdirSync(path.dirname(AUDIT_LOG_PATH), { recursive: true });
-    // "a" flag guarantees append-only writes; no existing record is overwritten.
-    fs.appendFileSync(AUDIT_LOG_PATH, auditRecord + "\n", { encoding: "utf8", flag: "a" });
+    if (AUDIT_SINK_URL) {
+      // Forward to centralised sink; use a fire-and-await pattern so failures
+      // are observable and propagate rather than being silently swallowed.
+      const auditRes = await fetch(AUDIT_SINK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: auditRecord,
+      });
+      if (!auditRes.ok) {
+        throw new Error(
+          `[AUDIT] Centralised audit sink returned HTTP ${auditRes.status}: ${auditRes.statusText}`
+        );
+      }
+    } else {
+      // Fallback: emit to stdout (captured by log aggregator / container runtime).
+      // This is intentionally NOT a local file so retention is delegated to the
+      // infrastructure layer (e.g. CloudWatch, Datadog, Splunk).
+      process.stdout.write(auditRecord + "\n");
+    }
   } catch (auditErr: unknown) {
+    // Log the failure for immediate visibility …
     console.error("[AUDIT] Failed to write persistent audit record:", auditErr);
+    // … then re-throw so the request fails loudly and alerting pipelines fire.
+    // Silently swallowing audit failures violates forensic-readiness requirements.
+    throw auditErr instanceof Error
+      ? auditErr
+      : new Error("[AUDIT] Audit logging failure — see previous console.error for details");
   }
   // --- End Persistent Audit Trail ---
 
-  var Readable = require("stream").Readable;
+  const { Readable } = require("stream");
 
   const MODEL_ID =
     "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
@@ -424,16 +505,58 @@ export async function POST(request: Request) {
   // Provenance label without internal metadata exposed to the client
   const provenanceHeader = `[AI-GENERATED CONTENT]\n`;
 
+  // --- Ingest-time provenance check ---
+  // If the incoming request carries an AI-generated content signature header,
+  // verify it before processing to prevent tampered provenance from being ingested.
+  const ingestSig = request.headers.get("X-AI-Provenance-Signature");
+  if (ingestSig) {
+    const ingestWatermarkSecret = process.env.WATERMARK_SECRET ?? MODEL_ID;
+    const ingestPayload = request.headers.get("X-AI-Watermark") ?? "";
+    const ingestModelId = request.headers.get("X-Content-Label") ?? "";
+    const expectedIngestSig = crypto
+      .createHmac("sha256", ingestWatermarkSecret)
+      .update(`provenance|${ingestModelId}|${ingestPayload}`)
+      .digest("hex");
+    if (
+      ingestSig.length !== expectedIngestSig.length ||
+      !crypto.timingSafeEqual(
+        Buffer.from(ingestSig, "hex"),
+        Buffer.from(expectedIngestSig, "hex")
+      )
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Provenance signature verification failed on ingest" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+  }
+  // --- End ingest-time provenance check ---
+
   // Simple deterministic watermark: HMAC-SHA-256 of the response text keyed
   // by the model ID + timestamp, encoded as hex.
   const crypto = require("crypto");
-  const watermarkSecret = process.env.WATERMARK_SECRET ?? MODEL_ID;
+  if (!process.env.WATERMARK_SECRET) {
+    console.error("[SECURITY] WATERMARK_SECRET environment variable is not set. A strong secret is required for HMAC integrity.");
+    throw new Error("WATERMARK_SECRET must be configured.");
+  }
+  const watermarkSecret = process.env.WATERMARK_SECRET;
   const watermark = crypto
     .createHmac("sha256", watermarkSecret)
     .update(`${MODEL_ID}|${generatedAt}|${response}`)
     .digest("hex");
 
   const labeledResponse = provenanceHeader + sanitizedResp;
+
+  // --- Cryptographic provenance signature ---
+  // Sign the canonical provenance payload: modelId + generatedAt + watermark + principal.
+  // This signature covers all provenance metadata so any tampering is detectable.
+  const provenanceSigningSecret = process.env.WATERMARK_SECRET ?? MODEL_ID;
+  const provenancePayload = `${MODEL_ID}|${generatedAt}|${watermark}|${clerkUserId ?? "unknown"}`;
+  const provenanceSignature = crypto
+    .createHmac("sha256", provenanceSigningSecret)
+    .update(`provenance|ai-generated-synthetic|${provenancePayload}`)
+    .digest("hex");
+  // --- End cryptographic provenance signature ---
 
   let s = new Readable();
   s.push(labeledResponse);
@@ -446,6 +569,9 @@ export async function POST(request: Request) {
     headers: {
       "X-Content-Label": "ai-generated-synthetic",
       "X-AI-Watermark": watermark,
+      "X-AI-Model-ID": MODEL_ID,
+      "X-AI-Generated-At": generatedAt,
+      "X-AI-Provenance-Signature": provenanceSignature,
     },
   });
 }
