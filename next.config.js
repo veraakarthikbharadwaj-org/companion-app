@@ -11,24 +11,9 @@ const nextConfig = {
         port: "",
         pathname: "**",
       },
-      {
-        protocol: "https",
-        hostname: "tjzk.replicate.delivery",
-        port: "",
-        pathname: "**",
-      },
-      {
-        protocol: "https",
-        hostname: "replicate.delivery",
-        port: "",
-        pathname: "**",
-      },
-      {
-        protocol: "https",
-        hostname: "a16z.com",
-        port: "",
-        pathname: "**",
-      },
+      // Removed: tjzk.replicate.delivery, replicate.delivery, and a16z.com
+      // These domains are NOT_IN_REGISTRY and do not meet foundation model
+      // identity, version pinning, or integrity verification requirements.
     ],
   },
 };
