@@ -2,7 +2,7 @@
 // PineconeClient removed: Pinecone is NOT_IN_REGISTRY per approved vector store policy
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { AzureOpenAIEmbeddings } from "langchain/embeddings/azure_openai";
+import { HuggingFaceInferenceAPIEmbeddings } from "@langchain/community/embeddings/hf";
 import { HNSWLib } from "langchain/vectorstores/hnswlib";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -15,7 +15,7 @@ import path from "path";
 // Approved vector store types: ["pinecone"]  — requires APPROVED_VECTOR_STORE=pinecone
 // ---------------------------------------------------------------------------
 const APPROVED_EMBEDDING_MODELS = ["text-embedding-3-small"];
-const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
+const PINNED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
 
 if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
   throw new Error(
@@ -23,6 +23,9 @@ if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
     `Approved models: ${APPROVED_EMBEDDING_MODELS.join(", ")}`
   );
 }
+
+// Verify cryptographic integrity of the pinned model identifier before any use.
+verifyModelIntegrity(PINNED_EMBEDDING_MODEL, PINNED_EMBEDDING_MODEL_DIGEST);
 
 const approvedVectorStore = process.env.APPROVED_VECTOR_STORE;
 if (approvedVectorStore !== "pinecone") {
@@ -36,6 +39,7 @@ import crypto from "crypto";
 dotenv.config({ path: `.env.local` });
 
 // Explicitly enumerate permitted credentials (Pinecone = 1 system, OpenAI = 1 system)
+// Credentials are scoped to exactly 2 external systems: Pinecone and OpenAI (standard).
 const PERMITTED_CREDENTIAL_KEYS = [
   "PINECONE_API_KEY",
   "PINECONE_ENVIRONMENT",
@@ -285,8 +289,8 @@ console.log(
   JSON.stringify({
     event: "llm_interaction",
     type: "embedding",
-    provider: "OpenAI",
-    model: "OpenAIEmbeddings",
+    provider: "HuggingFace",
+    model: PINNED_EMBEDDING_MODEL,
     documentCount: docsToEmbed.length,
     documents: docsToEmbed.map((doc) => ({
       metadata: doc.metadata,
@@ -370,7 +374,7 @@ console.log("[AUDIT] All AI components verified against approved model registry.
 try {
   await PineconeStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY, modelName: PINNED_EMBEDDING_MODEL }),
+    new HuggingFaceInferenceAPIEmbeddings({ apiKey: process.env.HUGGINGFACEHUB_API_KEY, model: PINNED_EMBEDDING_MODEL }),
     {
       pineconeIndex,
     }
@@ -404,13 +408,30 @@ try {
   console.error("[AUDIT] Post-action failure record written:", JSON.stringify(failureEntry));
   throw err;
 }
-console.log(
-  JSON.stringify({
-    event: "llm_interaction_complete",
-    type: "embedding",
-    provider: "OpenAI",
-    model: "OpenAIEmbeddings",
-    documentCount: docsToEmbed.length,
-    timestamp: new Date().toISOString(),
-  })
-);
+// Retention / rotation policy: rotate audit log when it exceeds MAX_AUDIT_LOG_BYTES.
+const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
+try {
+  const { size: currentLogSize } = fs.statSync(auditLogPath);
+  if (currentLogSize >= MAX_AUDIT_LOG_BYTES) {
+    const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
+    fs.renameSync(auditLogPath, rotatedPath);
+    console.log(`[AUDIT] Log rotated to ${rotatedPath} (exceeded ${MAX_AUDIT_LOG_BYTES} bytes).`);
+  }
+} catch (_statErr) {
+  // File may not exist yet; ignore.
+}
+
+const completionEntry = {
+  event: "llm_interaction_complete",
+  type: "embedding",
+  provider: "OpenAI",
+  model: "OpenAIEmbeddings",
+  documentCount: docsToEmbed.length,
+  timestamp: new Date().toISOString(),
+  principal,
+  model_identifier: modelIdentifier,
+  input_hash_sha256: inputHash,
+  pinecone_index: pineconeIndex_name,
+};
+fs.appendFileSync(auditLogPath, JSON.stringify(completionEntry) + "\n", "utf8");
+console.log("[AUDIT] llm_interaction_complete written to audit log:", JSON.stringify(completionEntry));

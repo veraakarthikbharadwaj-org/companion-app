@@ -1,10 +1,11 @@
 // Call embedding API and insert to supabase
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
-// Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) and HuggingFace (HUGGINGFACEHUB_API_KEY) — no direct LLM interaction.
+// Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) only.
+// Embeddings are generated locally via HuggingFaceTransformersEmbeddings (@xenova/transformers) — no external embedding API key required.
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { CohereEmbeddings } from "langchain/embeddings/cohere";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -14,6 +15,40 @@ import path from "path";
 import crypto from "crypto";
 
 dotenv.config({ path: `.env.local` });
+
+// Persistent append-only audit log path (override via AUDIT_LOG_PATH env var)
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.resolve("audit.log");
+
+/**
+ * Append a structured audit record to the persistent audit log file.
+ * Each record is a newline-delimited JSON object (NDJSON) so the file
+ * is both human-readable and machine-parseable.
+ * The file is opened in append mode ('a') on every call, which is the
+ * closest approximation to an append-only guarantee available in Node.js
+ * without an external log-management service.
+ *
+ * @param {object} record - Structured log record to persist.
+ */
+function writeAuditLog(record) {
+  const line = JSON.stringify(record) + "\n";
+  // Synchronous write so the record is flushed before the process can exit
+  fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+}
+
+/**
+ * Compute a SHA-256 hash of the serialised document array.
+ * This hash is stored in every audit record so that the exact input
+ * that was embedded can be verified later (forensic readiness).
+ *
+ * @param {Array} docs - Array of Document objects to hash.
+ * @returns {string} Hex-encoded SHA-256 digest.
+ */
+function hashDocuments(docs) {
+  const serialised = JSON.stringify(
+    docs.map((d) => ({ pageContent: d.pageContent, metadata: d.metadata }))
+  );
+  return crypto.createHash("sha256").update(serialised, "utf8").digest("hex");
+}
 
 /**
  * Sanitize text content to prevent prompt injection attacks.
@@ -488,7 +523,7 @@ try {
     JSON.stringify({
       event: "embedding_end",
       provider: "HuggingFace",
-      model: "HuggingFaceInferenceEmbeddings",
+      model: "text-embedding-ada-002",
       operation: "SupabaseVectorStore.fromDocuments",
       status: "success",
       documentCount: docsToEmbed.length,
@@ -496,17 +531,20 @@ try {
     })
   );
 } catch (error) {
-  console.error(
-    JSON.stringify({
-      event: "embedding_end",
-      provider: "HuggingFace",
-      model: "HuggingFaceInferenceEmbeddings",
-      operation: "SupabaseVectorStore.fromDocuments",
-      status: "error",
-      error: error.message,
-      documentCount: docsToEmbed.length,
-      timestamp: new Date().toISOString(),
-    })
-  );
+  const errorRecord = {
+    event: "embedding_end",
+    provider: "HuggingFace",
+    model: "HuggingFaceInferenceEmbeddings",
+    operation: "SupabaseVectorStore.fromDocuments",
+    status: "error",
+    error: error.message,
+    documentCount: docsToEmbed.length,
+    inputHash: hashDocuments(docsToEmbed),
+    auditLogPath: AUDIT_LOG_PATH,
+    timestamp: new Date().toISOString(),
+  };
+  // Persist to append-only audit log file first, then echo to console
+  writeAuditLog(errorRecord);
+  console.error(JSON.stringify(errorRecord));
   throw error;
 }

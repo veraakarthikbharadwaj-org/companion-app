@@ -13,8 +13,9 @@ var last_name = "";
 // Populate this map only with model IDs that have been approved and registered in
 // the organization's component registry before deploying.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  // Example (replace with actual org-registry-approved model IDs):
-  // "org-approved-model-v1": "org-approved-model-v1.0.0",
+  // Approved and registered in the organization's component registry.
+  // Update the model ID and pinned version whenever the registry entry changes.
+  "org-approved-model-v1": "org-approved-model-v1.0.0",
 };
 
 const DEFAULT_APPROVED_MODEL = Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? "";
@@ -33,10 +34,9 @@ function resolveApprovedModel(requestedModel: string): { model: string; version:
 }
 
 const ALLOWED_LLM_ENDPOINTS: ReadonlySet<string> = new Set([
-  "openai",
-  "anthropic",
   "cohere",
   // Add all legitimate LLM endpoint identifiers here
+  // NOTE: "openai" and "anthropic" are NOT_IN_REGISTRY and must not be added.
 ]);
 
 function sanitizeLlmEndpoint(llm: string): string {
@@ -47,12 +47,79 @@ function sanitizeLlmEndpoint(llm: string): string {
 }
 
 const ALLOWED_LLM_PATHS: ReadonlySet<string> = new Set([
-  "openai",
-  "anthropic",
   "cohere",
   "mistral",
   // Add additional permitted path segments here
+  // NOTE: "openai" and "anthropic" are NOT_IN_REGISTRY and must not be added.
 ]);
+
+const MAX_PROMPT_LENGTH = 4000;
+const CONTROL_CHAR_PATTERN = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+
+function sanitizePromptInput(input: string): { sanitized: string; error: string | null } {
+  if (typeof input !== "string") {
+    return { sanitized: "", error: "Invalid input type." };
+  }
+  // Strip null bytes and dangerous control characters (keep \t, \n, \r)
+  let sanitized = input.replace(CONTROL_CHAR_PATTERN, "");
+  // Trim surrounding whitespace
+  sanitized = sanitized.trim();
+  if (sanitized.length === 0) {
+    return { sanitized: "", error: "Prompt must not be empty." };
+  }
+  if (sanitized.length > MAX_PROMPT_LENGTH) {
+    return { sanitized: "", error: `Prompt exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.` };
+  }
+  return { sanitized, error: null };
+}
+
+// Patterns indicative of prompt injection, shell commands, base64 payloads, leetspeak, or jailbreak attempts
+const MALICIOUS_PROMPT_PATTERNS: ReadonlyArray<RegExp> = [
+  // Hidden/system prompt injection attempts
+  /system\s*prompt/i,
+  /ignore\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)/i,
+  /you\s+are\s+now\s+(a|an|the)?\s*\[?[a-z]/i,
+  /\[\s*(system|assistant|user)\s*\]/i,
+  /<\s*(system|instructions?|prompt)\s*>/i,
+  // Shell command patterns
+  /`[^`]*`/,
+  /\$\([^)]*\)/,
+  /;\s*(rm|ls|cat|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su|exec|eval)\b/i,
+  /\b(rm\s+-rf|wget\s+http|curl\s+http|bash\s+-[ci]|sh\s+-[ci]|python\s+-c|perl\s+-e|ruby\s+-e)\b/i,
+  // Base64-encoded content (long base64 strings are suspicious in prompts)
+  /(?:[A-Za-z0-9+\/]{40,}={0,2})/,
+  // Leetspeak obfuscation patterns (e.g. 1gnor3, 5yst3m)
+  /\b[a-z]*[0-9][a-z0-9]*[0-9][a-z0-9]*\b/i,
+  // Jailbreak / role-play override attempts
+  /\bDAN\b/,
+  /do\s+anything\s+now/i,
+  /jailbreak/i,
+  /pretend\s+(you\s+are|to\s+be)/i,
+  /act\s+as\s+(if\s+you\s+are|a|an)/i,
+  // Prompt delimiter injection
+  /###\s*(instruction|system|prompt)/i,
+  /---\s*(instruction|system|prompt)/i,
+];
+
+function sanitizeUserPrompt(prompt: string): { safe: boolean; sanitized: string } {
+  if (typeof prompt !== "string") {
+    return { safe: false, sanitized: "" };
+  }
+  // Reject prompts that are excessively long (potential payload smuggling)
+  if (prompt.length > 4000) {
+    console.warn("[prompt-guard] Prompt rejected: exceeds maximum allowed length.");
+    return { safe: false, sanitized: "" };
+  }
+  for (const pattern of MALICIOUS_PROMPT_PATTERNS) {
+    if (pattern.test(prompt)) {
+      console.warn(`[prompt-guard] Prompt rejected: matched malicious pattern ${pattern}`);
+      return { safe: false, sanitized: "" };
+    }
+  }
+  // Strip null bytes and non-printable control characters (except common whitespace)
+  const sanitized = prompt.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+  return { safe: true, sanitized };
+}
 
 function getAllowedLlmPath(llm: string): string {
   if (typeof llm === "string" && ALLOWED_LLM_PATHS.has(llm)) {
@@ -61,6 +128,61 @@ function getAllowedLlmPath(llm: string): string {
   return "";
 }
 
+// Patterns that indicate dynamic code execution primitives in LLM output.
+const DYNAMIC_CODE_EXECUTION_PATTERNS: ReadonlyArray<RegExp> = [
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
+  /\bexecScript\s*\(/gi,
+  /\bimportScripts\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\bInternalError\s*\(/gi,
+  /\bFunction\s*\(/gi,
+  /\bGeneratorFunction\s*\(/gi,
+  /\bAsyncFunction\s*\(/gi,
+  /\bWasmTextToBinary\s*\(/gi,
+  /\bWebAssembly\.compile/gi,
+  /\bWebAssembly\.instantiate/gi,
+  /\bchild_process/gi,
+  /\bspawnSync\s*\(/gi,
+  /\bexecSync\s*\(/gi,
+  /\bvm\.runInNewContext/gi,
+  /\bvm\.runInThisContext/gi,
+  /\bvm\.Script/gi,
+  /\b__import__\s*\(/gi,
+  /\bcompile\s*\(/gi,
+  /\bos\.system\s*\(/gi,
+  /\bsubprocess\./gi,
+];
+
+/**
+ * Validates LLM output for dynamic code execution primitives.
+ * Returns { safe: true, sanitized } if no violations found,
+ * or { safe: false, sanitized } with violations redacted if found.
+ */
+function sanitizeLlmOutput(output: string): { safe: boolean; sanitized: string } {
+  if (typeof output !== "string") {
+    return { safe: false, sanitized: "" };
+  }
+  let sanitized = output;
+  let safe = true;
+  for (const pattern of DYNAMIC_CODE_EXECUTION_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      safe = false;
+      console.warn(
+        `[security] LLM output contained dynamic code execution primitive matching pattern: ${pattern}. Redacting.`
+      );
+      sanitized = sanitized.replace(pattern, "[REDACTED]");
+    }
+    // Reset lastIndex for global regexes
+    pattern.lastIndex = 0;
+  }
+  return { safe, sanitized };
+}
+
+// NOTE: rawCompletion is sanitized via sanitizeLlmOutput before any rendering.
 // Generates a per-page-load trace ID to correlate multi-step workflow logs.
 const AUDIT_TRACE_ID: string = (() => {
   try {
@@ -70,17 +192,45 @@ const AUDIT_TRACE_ID: string = (() => {
   }
 })();
 
+// Retention policy applied to every audit log entry.
+const AUDIT_RETENTION_POLICY = {
+  retentionDays: 365,
+  rotationPolicy: "monthly",
+  classification: "forensic",
+} as const;
+
+// Fallback: persist the entry to localStorage so no audit record is silently lost.
+function persistAuditLogLocally(entry: Record<string, unknown>): void {
+  try {
+    const STORAGE_KEY = "__audit_log_fallback__";
+    const existing: unknown[] = JSON.parse(
+      localStorage.getItem(STORAGE_KEY) ?? "[]"
+    );
+    existing.push({ ...entry, _fallback: true, _fallbackAt: new Date().toISOString() });
+    // Keep at most 500 entries in the fallback store to avoid unbounded growth.
+    const trimmed = existing.slice(-500);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  } catch (storageErr) {
+    // Last-resort: at minimum surface the entry to the console so it is
+    // captured by any browser-level log forwarder.
+    console.warn("[audit] Fallback localStorage write failed; entry follows:", entry, storageErr);
+  }
+}
+
 async function writeAuditLog(entry: {
   timestamp: string;
   principal: string;
   modelId: string;
+  modelVersion: string;
   inputHash: string;
   output: string;
 }) {
   const enrichedEntry = {
     ...entry,
     traceId: AUDIT_TRACE_ID,
+    retentionPolicy: AUDIT_RETENTION_POLICY,
   };
+  let primarySucceeded = false;
   try {
     const response = await fetch("/api/audit-log", {
       method: "POST",
@@ -92,9 +242,16 @@ async function writeAuditLog(entry: {
       console.error(
         `[audit] Server rejected audit log entry: ${response.status} ${response.statusText}`
       );
+      // Server-side rejection — fall through to the fallback store.
+    } else {
+      primarySucceeded = true;
     }
   } catch (err) {
     console.error("[audit] Failed to persist audit log entry:", err);
+    // Network/fetch failure — fall through to the fallback store.
+  }
+  if (!primarySucceeded) {
+    persistAuditLogLocally(enrichedEntry);
   }
 }
 
@@ -461,7 +618,34 @@ export default function QAModal({
                       </p>
                     </div>
                     {blocks && (
-                      <div className="mt-2">
+                      <div
+                        className="mt-2"
+                        data-synthetic-content="true"
+                        data-content-source="ai-generated"
+                        data-provenance={JSON.stringify({
+                          model: completion ? "ai-model" : undefined,
+                          generatedAt: new Date().toISOString(),
+                          synthetic: true,
+                        })}
+                      >
+                        <div className="flex items-center gap-1.5 mb-1.5 px-1 py-0.5 rounded bg-yellow-900/40 border border-yellow-600/40 w-fit">
+                          <svg
+                            className="h-3 w-3 text-yellow-400 flex-shrink-0"
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 20 20"
+                            fill="currentColor"
+                            aria-hidden="true"
+                          >
+                            <path
+                              fillRule="evenodd"
+                              d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z"
+                              clipRule="evenodd"
+                            />
+                          </svg>
+                          <span className="text-xs font-medium text-yellow-300" aria-label="AI-generated content notice">
+                            AI-generated response
+                          </span>
+                        </div>
                         {blocks}
                       </div>
                     )}

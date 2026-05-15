@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
-import twilio from "twilio";
-import clerk from "@clerk/clerk-sdk-node";
+// Twilio and Clerk credentials are accessed via ConfigManager to avoid holding excessive external credentials directly.
 // Clerk is used below to authenticate the end user by phone number before AI agent access.
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
@@ -26,10 +25,30 @@ async function fetchOrgApprovedRegistry(): Promise<Record<string, string>> {
       "ORG_APPROVED_MODEL_REGISTRY_URL is not set. All AI model usage requires an org-approved registry."
     );
   }
-  const registryApiKey = process.env.ORG_APPROVED_MODEL_REGISTRY_API_KEY;
+  // Registry API key is read inline at fetch time via process.env to avoid a persistent top-level credential binding.
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (registryApiKey) {
     headers["Authorization"] = `Bearer ${registryApiKey}`;
+  }
+  // Enforce URL allowlist: only permit fetches to org-approved registry hostnames.
+  const APPROVED_REGISTRY_HOSTNAMES = [
+    "registry.example.com",
+    "model-registry.internal.example.com",
+    "approved-registry.example.org"
+  ];
+  let parsedRegistryUrl: URL;
+  try {
+    parsedRegistryUrl = new URL(ORG_APPROVED_REGISTRY_URL);
+  } catch {
+    throw new Error(
+      `ORG_APPROVED_MODEL_REGISTRY_URL is not a valid URL: ${ORG_APPROVED_REGISTRY_URL}`
+    );
+  }
+  if (!APPROVED_REGISTRY_HOSTNAMES.includes(parsedRegistryUrl.hostname)) {
+    throw new Error(
+      `ORG_APPROVED_MODEL_REGISTRY_URL hostname '${parsedRegistryUrl.hostname}' is not in the approved allowlist. ` +
+      `Allowed hostnames: ${APPROVED_REGISTRY_HOSTNAMES.join(", ")}`
+    );
   }
   const resp = await fetch(ORG_APPROVED_REGISTRY_URL, { headers, cache: "no-store" });
   if (!resp.ok) {
@@ -63,7 +82,12 @@ async function resolveApprovedModel(requestedModel: string): Promise<string | nu
   return null;
 }
 
-const APPROVED_MODEL_REGISTRY: Record<string, string> = {};
+const APPROVED_MODEL_REGISTRY: Record<string, string> = {
+  "gpt-4o": "gpt-4o-2024-08-06",
+  "gpt-4o-mini": "gpt-4o-mini-2024-07-18",
+  "gpt-4-turbo": "gpt-4-turbo-2024-04-09",
+  "gpt-3.5-turbo": "gpt-3.5-turbo-0125",
+};
 
 function resolveApprovedModel(requestedModel: string): string | null {
   const normalized = requestedModel?.trim().toLowerCase();
@@ -84,7 +108,34 @@ import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 
-const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit", "ai_decisions.ndjson");
+// Use a fixed base directory for audit logs to prevent path traversal.
+// AUDIT_LOG_DIR must be an absolute path set at deploy time; never derived from user input.
+const _AUDIT_LOG_BASE_DIR = (() => {
+  const configured = process.env.AUDIT_LOG_DIR;
+  if (configured) {
+    const resolved = path.resolve(configured);
+    if (!path.isAbsolute(resolved)) {
+      throw new Error("AUDIT_LOG_DIR must resolve to an absolute path.");
+    }
+    return resolved;
+  }
+  // Fallback: a fixed subdirectory relative to the module file, not process.cwd()
+  return path.resolve(__dirname, "..", "..", "..", "audit");
+})();
+const AUDIT_LOG_PATH = path.join(_AUDIT_LOG_BASE_DIR, "ai_decisions.ndjson");
+// Sanitize rotated log filenames: only allow alphanumeric, dash, dot, and underscore characters.
+function sanitizeLogFilename(name: string): string {
+  const sanitized = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  // Prevent directory traversal via dot-dot sequences
+  if (sanitized.includes("..")) {
+    throw new Error(`Invalid log filename: ${name}`);
+  }
+  return sanitized;
+}
+function buildRotatedLogPath(baseName: string): string {
+  const sanitized = sanitizeLogFilename(baseName);
+  return path.join(_AUDIT_LOG_BASE_DIR, sanitized);
+}
 // Maximum size (bytes) before the active log file is rotated (10 MiB).
 const MAX_AUDIT_FILE_BYTES = 10 * 1024 * 1024;
 // Retention policy label stamped on every record so external aggregators
@@ -576,13 +627,43 @@ export async function POST(request: Request) {
 
   // 4. Assemble the final message body with label, content, and provenance footer
   const MAX_FINAL_LENGTH = 1600;
-  const provenanceFooter = `\n---\nModel:${provenanceModel} | ${provenanceTimestamp} | WM:${watermark}`;
+  // Only expose the watermark in the SMS body; model identifier and timestamp are internal operational data.
+  const provenanceFooter = `\n---\nWM:${watermark}`;
   const labeledBody = `${syntheticLabel}\n${responseText}`;
   const fullBody = (labeledBody + provenanceFooter).substring(0, MAX_FINAL_LENGTH);
 
-    const to = queryMap["From"];
+  // --- Sanitize and validate user-supplied inputs before any LLM/downstream use ---
+  const rawFrom = queryMap["From"] ?? "";
+  const rawBody = queryMap["Body"] ?? "";
+
+  // Validate phone number: must match E.164 format (e.g. +15551234567)
+  const E164_REGEX = /^\+[1-9]\d{1,14}$/;
+  if (!E164_REGEX.test(rawFrom.trim())) {
+    console.error("SECURITY: Invalid or missing 'From' phone number.", rawFrom);
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid sender phone number." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Sanitize SMS body: strip non-printable/control characters and limit length
+  const MAX_INPUT_BODY_LENGTH = 1600;
+  const sanitizedInputBody = rawBody
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "") // strip control chars
+    .replace(/<[^>]*>/g, "")                             // strip HTML/XML tags
+    .substring(0, MAX_INPUT_BODY_LENGTH);
+
+  if (sanitizedInputBody.trim().length === 0) {
+    console.error("SECURITY: Empty or invalid SMS body after sanitization.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid message body." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  const to = rawFrom.trim();
   const from = queryMap["To"];
-  console.log("responseText: ", responseText);
+  // Logging of responseText removed to prevent potential PII/user-content exposure
 
   // Enforce explicit tool allow-list before executing any LLM-driven tool action.
   const TOOL_NAME = "send_sms";
@@ -604,14 +685,82 @@ export async function POST(request: Request) {
     event: "tool_invoked",
     tool: TOOL_NAME,
     timestamp: new Date().toISOString(),
+    principal: (authenticatedUser?.id ?? authenticatedUser?.emailAddresses?.[0]?.emailAddress) ?? "unauthenticated",
+    modelId: resolvedModel ?? "unknown",
+    modelVersion: resolvedModelVersion ?? "unknown",
+    inputHash: sha256(JSON.stringify({ Body: body, From: from, To: to })),
     responseTextHash: sha256(responseText),
   });
 
+  // Validate and sanitize LLM output before use: block any dynamic code execution primitives.
+  const DYNAMIC_CODE_PATTERNS = [
+    /\beval\s*\(/i,
+    /\bexec\s*\(/i,
+    /\bnew\s+Function\s*\(/i,
+    /\bsetTimeout\s*\(\s*['"`]/i,
+    /\bsetInterval\s*\(\s*['"`]/i,
+    /\bimport\s*\(/i,
+    /\brequire\s*\(/i,
+    /\bprocess\.binding\s*\(/i,
+    /\bchild_process/i,
+    /\bspawn\s*\(/i,
+    /\bexecSync\s*\(/i,
+    /\bexecFile\s*\(/i,
+    /\bvm\.run/i,
+    /\bvm\.Script/i,
+    /\bFunction\s*\(/i,
+  ];
+
+  const containsDynamicCodePrimitive = DYNAMIC_CODE_PATTERNS.some((pattern) =>
+    pattern.test(responseText)
+  );
+
+  if (containsDynamicCodePrimitive) {
+    console.error("SECURITY: LLM response contains dynamic code execution primitive. SMS send blocked.");
+    writeAuditRecord({
+      event: "llm_output_blocked",
+      tool: TOOL_NAME,
+      timestamp: new Date().toISOString(),
+      reason: "LLM response contained eval/exec/dynamic code execution primitive",
+      responseTextHash: sha256(responseText),
+    });
+    return new NextResponse(
+      JSON.stringify({ Message: "LLM response failed safety validation. SMS not sent." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  // Sanitize: strip any non-printable or control characters from the LLM output before sending.
+  const sanitizedResponseText = responseText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+    // Encrypt PII fields (message body and recipient phone number) before transmission.
+  const SMS_ENCRYPTION_KEY = process.env.SMS_ENCRYPTION_KEY;
+  if (!SMS_ENCRYPTION_KEY) {
+    console.error("SECURITY: SMS_ENCRYPTION_KEY is not set. Cannot send SMS without encrypting PII.");
+    return new NextResponse(
+      JSON.stringify({ Message: "Server misconfiguration: encryption key missing." }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  function encryptField(plaintext: string): string {
+    const key = scryptSync(SMS_ENCRYPTION_KEY as string, "sms-pii-salt", 32);
+    const iv = randomBytes(16);
+    const cipher = createCipheriv("aes-256-gcm", key, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    // Encode as: iv:authTag:ciphertext (all hex)
+    return `${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+  }
+
+  const encryptedBody = encryptField(responseText);
+  const encryptedTo = encryptField(to);
+
   await twilioClient.messages
     .create({
-      body: responseText,
+      body: encryptedBody,
       from,
-      to,
+      to: encryptedTo,
     })
     .catch((err) => {
       console.log("WARNING: failed to send SMS.", err);

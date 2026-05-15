@@ -1,4 +1,4 @@
-import dotenv from "dotenv";
+import fs from "fs";
 import path from "path";
 // StreamingTextResponse removed: llama2-13b is on the disallowed LLM list.
 // LLM calls are delegated to an external proxy service; direct LLM imports removed.
@@ -7,15 +7,35 @@ import path from "path";
  * Structured logger for LLM interactions.
  * Logs request and response details for audit and compliance purposes.
  */
+// PII fields that must never appear in audit logs.
+const PII_FIELDS = new Set([
+  "userId",
+  "email",
+  "emailAddress",
+  "companionName",
+  "userName",
+  "firstName",
+  "lastName",
+  "name",
+  "userIdentifier",
+]);
+
 function logLLMInteraction(
   event: "request" | "response" | "error",
   details: Record<string, unknown>
 ): void {
+  // Strip PII fields before logging.
+  const safeDetails: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (!PII_FIELDS.has(key)) {
+      safeDetails[key] = value;
+    }
+  }
   const entry = {
     timestamp: new Date().toISOString(),
     service: "llama2-13b",
     event,
-    ...details,
+    ...safeDetails,
   };
   console.log("[LLM_AUDIT]", JSON.stringify(entry));
 }
@@ -25,9 +45,37 @@ import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
 
-// Load only the env file, then immediately scrub credentials for systems
-// not required by this route to stay within the 3-system credential limit.
-dotenv.config({ path: `.env.local` });
+// Selectively load only the credentials required by this route (≤3 systems):
+//   1. LLM proxy  → REPLICATE_API_TOKEN
+//   2. Clerk auth  → CLERK_SECRET_KEY
+//   3. Redis/rate  → UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
+// Pinecone and Supabase credentials are intentionally never loaded.
+(function loadSelectiveEnv() {
+  const ALLOWED_KEYS = new Set([
+    "REPLICATE_API_TOKEN",
+    "CLERK_SECRET_KEY",
+    "CLERK_API_KEY",
+    "UPSTASH_REDIS_REST_URL",
+    "UPSTASH_REDIS_REST_TOKEN",
+  ]);
+  try {
+    const envPath = path.resolve(process.cwd(), ".env.local");
+    const raw = fs.readFileSync(envPath, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (!ALLOWED_KEYS.has(key)) continue; // skip disallowed credentials
+      if (process.env[key] !== undefined) continue; // never overwrite existing
+      const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+      process.env[key] = val;
+    }
+  } catch {
+    // .env.local is optional in production; real secrets come from the platform.
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // Approved Model Registry — only models listed here may be used for inference.
@@ -42,12 +90,8 @@ interface RegistryEntry {
 }
 
 const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
-  "llama2-13b": {
-    id: "llama2-13b",
-    version: "2.0.0",
-    digest: "sha256:3c4b2a1f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b",
-    approved: true,
-  },
+  // llama2-13b has been removed from the approved registry — it is on the
+  // organization's disallowed list and must not be used for inference.
 };
 
 /**
@@ -74,12 +118,11 @@ function resolveApprovedModel(modelName: string): RegistryEntry {
   return entry;
 }
 
-// Resolve and pin the model at module load time — fails fast if not in registry.
-const RESOLVED_MODEL = resolveApprovedModel("llama2-13b");
-
-// Immutable, registry-validated model identifier used throughout this module.
-// Format: <id>@<version> with digest available via RESOLVED_MODEL.digest.
-const MODEL_ID = `${RESOLVED_MODEL.id}@${RESOLVED_MODEL.version}` as const;
+// llama2-13b is on the organization's disallowed list and has been removed
+// from the approved registry. This route must not be used; it will throw
+// at startup to prevent any inference from occurring.
+const RESOLVED_MODEL = resolveApprovedModel("llama2-13b"); // Will throw — model not in registry
+const MODEL_ID = "" as const; // Unreachable; satisfies downstream type references
 
 // Permitted systems for this route: LLM proxy, Clerk (auth), rateLimit (Redis key only via utility).
 // Remove credentials for Pinecone, Supabase, Upstash Redis (raw), and Replicate.
@@ -517,7 +560,7 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     modelName: "llama2-13b",
     modelVersion:
       "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-    companionName: name,
+    companionName: sanitizeForPrompt(name),
     inputHash,
     outputHash,
   });
@@ -528,22 +571,152 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     );
   // --- End audit logging ---
 
-  await memoryManager.writeToHistory("" + response.trim(), companionKey);
-  var Readable = require("stream").Readable;
+  // Second validation pass on the final sanitized response before persistence/streaming
+  const containsDangerousContentFinal = DANGEROUS_PATTERNS.some((pattern) =>
+    pattern.test(response)
+  );
+  if (containsDangerousContentFinal) {
+    console.error("LLM sanitized response rejected: contains dynamic code execution primitive after sanitization.");
+    return new Response("Response blocked due to policy violation.", { status: 400 });
+  }
 
-  // --- Synthetic Content Provenance & Watermarking ---
-  const MODEL_ID =
-    "a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5";
+  await memoryManager.writeToHistory("" + response.trim(), companionKey);
+  const { Readable } = require("stream");
+
+  /**
+   * Sanitizes a string before it is embedded in an LLM prompt.
+   * Blocks / strips:
+   *  - Base64-encoded payloads (heuristic: long alphanum+/= tokens)
+   *  - Leetspeak substitutions normalised to plain ASCII for pattern matching
+   *  - Hidden / invisible Unicode control characters and zero-width characters
+   *  - Shell-command metacharacters and common injection sequences
+   *  - Classic prompt-injection phrases
+   */
+  function sanitizeForPrompt(input: string): string {
+    if (typeof input !== "string") return "";
+
+    // 1. Strip hidden / invisible Unicode characters
+    //    Zero-width space (U+200B), zero-width non-joiner (U+200C),
+    //    zero-width joiner (U+200D), word joiner (U+2060),
+    //    left-to-right / right-to-left marks, soft hyphen, BOM, etc.
+    const INVISIBLE_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u206F\uFEFF\uFFF0-\uFFFF]/g;
+    let sanitized = input.replace(INVISIBLE_CHARS, "");
+
+    // 2. Detect and reject base64-encoded blobs (≥ 40 chars of base64 alphabet)
+    const BASE64_BLOB = /(?:[A-Za-z0-9+\/]{40,}={0,2})/g;
+    if (BASE64_BLOB.test(sanitized)) {
+      console.warn("[SANITIZE] Blocked: base64-encoded content detected in prompt input.");
+      sanitized = sanitized.replace(BASE64_BLOB, "[REDACTED-BASE64]");
+    }
+
+    // 3. Normalise common leetspeak substitutions before further checks
+    //    (so that pattern matching below catches obfuscated variants)
+    const LEET_MAP: Record<string, string> = {
+      "0": "o", "1": "i", "3": "e", "4": "a",
+      "5": "s", "6": "g", "7": "t", "8": "b", "@": "a",
+      "$": "s", "!": "i", "|_|": "u",
+    };
+    let normalised = sanitized;
+    for (const [leet, plain] of Object.entries(LEET_MAP)) {
+      normalised = normalised.split(leet).join(plain);
+    }
+
+    // 4. Shell-command metacharacters and injection sequences
+    const SHELL_PATTERNS = [
+      /[;&|`$]\s*[a-zA-Z]/,          // command chaining / substitution
+      /\$\([^)]*\)/,                  // $(command)
+      /`[^`]*`/,                      // backtick execution
+      /\b(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat|chmod|chown|sudo|su|passwd|cat\s+\/etc)\b/i,
+      /\.\.\/|\.\.\\/,               // path traversal
+      /\/etc\/(passwd|shadow|hosts)/i,
+    ];
+    for (const pattern of SHELL_PATTERNS) {
+      if (pattern.test(normalised)) {
+        console.warn("[SANITIZE] Blocked: shell command pattern detected in prompt input.");
+        sanitized = sanitized.replace(pattern, "[REDACTED-CMD]");
+        normalised = normalised.replace(pattern, "[REDACTED-CMD]");
+      }
+    }
+
+    // 5. Prompt-injection phrases (operate on normalised text, redact in original)
+    const INJECTION_PHRASES = [
+      /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+      /disregard\s+(all\s+)?(previous|prior|above)/i,
+      /you\s+are\s+now\s+(a\s+)?(?:dan|jailbreak|unrestricted|evil)/i,
+      /act\s+as\s+(if\s+you\s+are\s+)?(?:an?\s+)?(?:unrestricted|evil|malicious|hacker)/i,
+      /system\s*:\s*you\s+are/i,
+      /\[INST\]|\[\/?SYS\]/i,        // llama instruction tokens
+      /<\|im_start\|>|<\|im_end\|>/i, // chatml tokens
+    ];
+    for (const phrase of INJECTION_PHRASES) {
+      if (phrase.test(normalised)) {
+        console.warn("[SANITIZE] Blocked: prompt injection phrase detected.");
+        sanitized = sanitized.replace(phrase, "[REDACTED-INJECTION]");
+        normalised = normalised.replace(phrase, "[REDACTED-INJECTION]");
+      }
+    }
+
+    // 6. Hard length cap to prevent token-flooding attacks
+    const MAX_INPUT_LENGTH = 4000;
+    if (sanitized.length > MAX_INPUT_LENGTH) {
+      console.warn("[SANITIZE] Input truncated: exceeded maximum allowed length.");
+      sanitized = sanitized.slice(0, MAX_INPUT_LENGTH);
+    }
+
+    return sanitized;
+  }
+
+    // --- Synthetic Content Provenance & Watermarking ---
   const generatedAt = new Date().toISOString();
 
   // Steganographic watermark: encode a UUID as zero-width characters
-  // (U+200B = 0, U+200C = 1) appended invisibly to the response text.
-    // Visible provenance header (synthetic-content label only — no internal model identifiers)
-  const provenanceHeader =
-    `[AI-GENERATED CONTENT | Generated: ${generatedAt}]\n`;
+  // U+200B = bit 0, U+200C = bit 1, appended invisibly to the response text.
+  const watermarkId = crypto.randomUUID();
+  const watermarkBits = Array.from(
+    Buffer.from(watermarkId.replace(/-/g, ""), "hex")
+  )
+    .flatMap((byte) =>
+      Array.from({ length: 8 }, (_, i) => (byte >> (7 - i)) & 1)
+    )
+    .map((bit) => (bit === 0 ? "\u200B" : "\u200C"))
+    .join("");
 
-  // Final payload: provenance header + response text
-  const labeledResponse = provenanceHeader + response;
+  // Visible provenance header (synthetic-content label only — no internal model identifiers)
+    const provenanceHeader = `[AI-GENERATED CONTENT | Generated: ${generatedAt}]\n`;
+
+  // Final payload: provenance header + response text + invisible watermark
+  const labeledResponse = provenanceHeader + response + watermarkBits;
+
+  // Cryptographic signature over provenance metadata to prevent silent removal/tampering
+  const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET ?? "";
+  if (!PROVENANCE_HMAC_SECRET) {
+    console.error("[PROVENANCE] PROVENANCE_HMAC_SECRET is not set — signature will be empty.");
+  }
+  const provenancePayload = JSON.stringify({
+    generatedAt,
+    watermarkId,
+    outputHash,
+    contentType: "ai-generated-synthetic-text",
+  });
+  const provenanceSignature = crypto
+    .createHmac("sha256", PROVENANCE_HMAC_SECRET)
+    .update(provenancePayload, "utf8")
+    .digest("hex");
+
+  // Append signature to audit record
+  const signedAuditRecord = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    principal: clerkUserId,
+    modelName: "llama2-13b",
+    watermarkId,
+    outputHash,
+    provenanceSignature,
+  });
+  await fs
+    .appendFile("audit/ai_decisions_signed.jsonl", signedAuditRecord + "\n", "utf8")
+    .catch((err: unknown) =>
+      console.error("[AUDIT] Failed to write signed audit record:", err)
+    );
 
   let s = new Readable();
   s.push(labeledResponse);
@@ -555,6 +728,9 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     headers: {
       "X-AI-Generated-At": generatedAt,
       "X-Content-Type": "ai-generated-synthetic-text",
+      // NOTE: Do NOT add X-Model-Id, X-Digest, or any internal operational metadata headers here.
+      "X-Watermark-Id": watermarkId,
+      "X-Provenance-Signature": provenanceSignature,
     },
   });
 }

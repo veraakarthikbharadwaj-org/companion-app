@@ -1,7 +1,30 @@
 import { Redis } from "@upstash/redis";
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
-import { ChatOpenAI } from "langchain/chat_models/openai";
+
+// --- Tool allow list enforcement ---
+/**
+ * Explicit allow list of approved LangChain chains/tools that this script
+ * is permitted to invoke. Any tool not present in this set will be blocked.
+ */
+const ALLOWED_TOOLS = new Set([
+  "LLMChain",
+]);
+
+/**
+ * Asserts that the given tool name is in the approved allow list.
+ * Throws immediately if the tool is not explicitly permitted.
+ *
+ * @param {string} toolName - The name of the chain or tool to validate.
+ */
+function assertToolAllowed(toolName) {
+  if (!ALLOWED_TOOLS.has(toolName)) {
+    throw new Error(
+      `Tool invocation blocked: "${toolName}" is not in the approved tool allow list.`
+    );
+  }
+}
+import { Ollama } from "langchain/llms/ollama";
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -45,6 +68,7 @@ function validateIdentifier(value, name) {
 const COMPANION_NAME = validateIdentifier(process.argv[2], "COMPANION_NAME");
 const MODEL_NAME = validateIdentifier(process.argv[3], "MODEL_NAME");
 const USER_ID = validateIdentifier(process.argv[4], "USER_ID");
+const CALLER_TOKEN = typeof process.argv[5] === "string" ? process.argv[5] : "";
 
 if (!!!COMPANION_NAME || !!!MODEL_NAME || !!!USER_ID) {
   throw new Error(
@@ -102,6 +126,14 @@ function redactPII(text) {
   text = text.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]");
   // Redact common name patterns (Title + capitalized words)
   text = text.replace(/\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/g, "[REDACTED_NAME]");
+  // Redact Singapore NRIC/FIN numbers (e.g. S1234567D, T0123456A, F1234567N, G1234567P)
+  text = text.replace(/\b[STFG]\d{7}[A-Z]\b/g, "[REDACTED_NRIC_FIN]");
+  // Redact SingPass identifiers (SingPass ID follows same NRIC/FIN format but may appear with label)
+  text = text.replace(/(?:SingPass\s*(?:ID|identifier)?\s*[:\-]?\s*)[STFG]\d{7}[A-Z]\b/gi, "[REDACTED_SINGPASS_ID]");
+  // Redact CPF account numbers (9-digit numeric, optionally labelled)
+  text = text.replace(/(?:CPF\s*(?:account)?\s*(?:no\.?|number)?\s*[:\-]?\s*)\d{9}\b/gi, "[REDACTED_CPF]");
+  // Redact standalone 9-digit numbers that may be CPF account numbers
+  text = text.replace(/\b\d{9}\b/g, "[REDACTED_CPF]");
   return text;
 }
 
@@ -550,22 +582,98 @@ const PROVENANCE_HEADER = [
 let output = "";
 for (let i = 0; i < questions.length; i++) {
     const llmText = results[i]?.text ?? "";
+  console.log(`[LLM INTERACTION] Request index=${i} question: ${JSON.stringify(questions[i])}`);
+  console.log(`[LLM INTERACTION] Response index=${i} text: ${JSON.stringify(llmText)}`);
   validateLLMOutput(llmText, `output assembly index=${i}`);
   output += `*****${questions[i]}*****
 ${llmText}
 
 `;
 }
-output += `Definition (Advanced)\n${recentChat.join("\n")}`;
+// Data minimisation: inject only a brief excerpt (first 200 chars) of each
+// recent-chat entry rather than the full document body.
+const recentChatSummaries = recentChat.map((entry) => {
+  const text = typeof entry === "string" ? entry : JSON.stringify(entry);
+  return text.length > 200 ? text.slice(0, 200) + "…" : text;
+});
+output += `Definition (Advanced)\n${recentChatSummaries.join("\n")}`;
 
 // Prepend provenance header to all AI-generated output
 const labeledOutput = PROVENANCE_HEADER + output;
 
-// Chat history file — label as AI-assisted export
+// Data minimisation: export only the most recent 20 chat entries and strip
+// each entry down to the minimal required fields (role + first 300 chars of
+// content) rather than writing the entire raw corpus.
+const CHAT_HISTORY_MAX_ENTRIES = 20;
+const CHAT_HISTORY_CONTENT_MAX_CHARS = 300;
+
+const minimisedChatHistory = upstashChatHistory
+  .slice(-CHAT_HISTORY_MAX_ENTRIES)
+  .map((entry) => {
+    // If entries are objects, keep only role and a truncated content field.
+    if (entry && typeof entry === "object") {
+      const role = entry.role ?? entry.type ?? "unknown";
+      const rawContent =
+        typeof entry.content === "string"
+          ? entry.content
+          : JSON.stringify(entry.content ?? "");
+      const content =
+        rawContent.length > CHAT_HISTORY_CONTENT_MAX_CHARS
+          ? rawContent.slice(0, CHAT_HISTORY_CONTENT_MAX_CHARS) + "…"
+          : rawContent;
+      return `[${role}] ${content}`;
+    }
+    // Plain-string entries: truncate to max chars.
+    const text = String(entry);
+    return text.length > CHAT_HISTORY_CONTENT_MAX_CHARS
+      ? text.slice(0, CHAT_HISTORY_CONTENT_MAX_CHARS) + "…"
+      : text;
+  });
+
 const chatHistoryLabeled =
   PROVENANCE_HEADER +
-  "=== RAW CHAT HISTORY EXPORT ===\n" +
-  upstashChatHistory.join("\n");
+  `=== CHAT HISTORY EXPORT (last ${CHAT_HISTORY_MAX_ENTRIES} entries, content truncated to ${CHAT_HISTORY_CONTENT_MAX_CHARS} chars) ===\n` +
+  minimisedChatHistory.join("\n");
 
 await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, chatHistoryLabeled);
 await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, labeledOutput);
+
+// --- Append-only audit log (forensic readiness) ---
+// Compute hashes over the raw inputs and the final AI output so that
+// any post-hoc tampering with the flat files can be detected.
+const inputPayload = questions.join("\n");
+const inputHash = crypto
+  .createHash("sha256")
+  .update(inputPayload, "utf8")
+  .digest("hex");
+const outputHash = crypto
+  .createHash("sha256")
+  .update(labeledOutput, "utf8")
+  .digest("hex");
+
+// Principal: prefer an explicit env var; fall back to the OS user.
+const principal =
+  process.env.AUDIT_PRINCIPAL ||
+  process.env.USER ||
+  process.env.USERNAME ||
+  "unknown";
+
+const auditRecord = JSON.stringify({
+  timestamp: GENERATION_TIMESTAMP,
+  model_id: AI_MODEL_ID,
+  script: "src/scripts/exportToCharacter.mjs",
+  companion: COMPANION_NAME,
+  principal,
+  input_sha256: inputHash,
+  output_sha256: outputHash,
+  provenance_signature: `hmac-sha256=${provenanceSignature}`,
+  output_files: [
+    `${COMPANION_NAME}_character_ai_data.txt`,
+    `${COMPANION_NAME}_chat_history.txt`,
+  ],
+}) + "\n";
+
+// Use the 'a' (append) flag so this file is strictly append-only within
+// this process. Pair with OS-level immutability (e.g. chattr +a, S3
+// Object Lock, or a WORM store) for full retention enforcement.
+await fs.writeFile("ai_audit_log.ndjson", auditRecord, { flag: "a" });
