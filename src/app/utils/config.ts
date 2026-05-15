@@ -1,4 +1,5 @@
 import fs from "fs";
+import path from "path";
 import { Config } from "twilio/lib/twiml/VoiceResponse";
 
 class ConfigManager {
@@ -6,7 +7,8 @@ class ConfigManager {
   private config: any;
 
   private constructor() {
-    const data = fs.readFileSync("companions/companions.json", "utf8");
+    const filePath = path.resolve(__dirname, "../../companions/companions.json");
+    const data = fs.readFileSync(filePath, "utf8");
     this.config = JSON.parse(data);
   }
 
@@ -17,8 +19,17 @@ class ConfigManager {
     return ConfigManager.instance;
   }
 
+  /** Permitted field names that may be used to look up a companion entry. */
+  private static readonly ALLOWED_LOOKUP_FIELDS: ReadonlySet<string> = new Set([
+    "name",
+    "companionFileName",
+    "id",
+  ]);
+
   public getConfig(fieldName: string, configValue: string, fields?: string[]) {
-    //).filter((c: any) => c.name === companionName);
+    if (!ConfigManager.ALLOWED_LOOKUP_FIELDS.has(fieldName)) {
+      throw new Error(`Invalid fieldName: "${fieldName}" is not a permitted lookup field.`);
+    }
     const allowedFields = fields && fields.length > 0 ? fields : ["name", "companionFileName"];
     try {
       if (!!this.config && this.config.length !== 0) {
@@ -36,7 +47,8 @@ class ConfigManager {
         }
       }
     } catch (e) {
-      console.log(e);
+      console.error("ConfigManager.getConfig error:", e);
+      throw e;
     }
   }
 }
