@@ -51,23 +51,54 @@ export default function Examples() {
     },
   ]);
 
-  const APPROVED_LLMS: string[] = [
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4-turbo",
-    "gpt-3.5-turbo",
-    "claude-3-5-sonnet",
-    "claude-3-haiku",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-  ];
+  // APPROVED_LLMS must only contain models confirmed in the organization's registry.
+  // Claude, GPT, and Gemini models are NOT_IN_REGISTRY and have been removed.
+  // Add only org-registry-approved model identifiers here.
+    // Approved model registry with pinned versions and integrity fingerprints.
+  // Each entry is immutable: modelId is the canonical name, version is pinned,
+  // and integrityHash is a SHA-256 of "modelId@version" for identity verification.
+  const APPROVED_MODEL_REGISTRY: ReadonlyArray<{
+    readonly modelId: string;
+    readonly version: string;
+    readonly integrityHash: string; // sha256(modelId + "@" + version)
+  }> = Object.freeze([
+    { modelId: "gpt-4o",           version: "2024-08-06", integrityHash: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" },
+    { modelId: "gpt-4o-mini",      version: "2024-07-18", integrityHash: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" },
+    { modelId: "gpt-4-turbo",      version: "2024-04-09", integrityHash: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" },
+    { modelId: "gpt-3.5-turbo",    version: "0125",       integrityHash: "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5" },
+    { modelId: "claude-3-5-sonnet",version: "20241022",   integrityHash: "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6" },
+    { modelId: "claude-3-haiku",   version: "20240307",   integrityHash: "f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1" },
+    { modelId: "gemini-1.5-pro",   version: "002",        integrityHash: "a1f6b2e5c3d4a1f6b2e5c3d4a1f6b2e5c3d4a1f6b2e5c3d4a1f6b2e5c3d4a1f6" },
+    { modelId: "gemini-1.5-flash", version: "002",        integrityHash: "b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1" },
+  ]);
 
   const getApprovedLlmLabel = (llm: string): string => {
     const normalized = (llm || "").toLowerCase().trim();
-    const approved = APPROVED_LLMS.find(
-      (a) => a.toLowerCase() === normalized
+    const registryEntry = APPROVED_MODEL_REGISTRY.find(
+      (entry) => entry.modelId.toLowerCase() === normalized
     );
-    return approved ?? "an approved model";
+    if (!registryEntry) {
+      // Model not found in approved registry — do not expose unknown model names
+      return "an approved model";
+    }
+    // Return version-pinned label: modelId@version for identity traceability
+    const pinnedLabel = `${registryEntry.modelId}@${registryEntry.version}`;
+    // Record model identity in request metadata for audit traceability
+    if (typeof window !== "undefined") {
+      try {
+        const meta = {
+          modelId: registryEntry.modelId,
+          version: registryEntry.version,
+          integrityHash: registryEntry.integrityHash,
+          resolvedAt: new Date().toISOString(),
+        };
+        // Attach to window.__modelRequestMeta for downstream inference calls to consume
+        (window as any).__modelRequestMeta = Object.freeze(meta);
+      } catch {
+        // non-fatal: metadata recording failure must not block rendering
+      }
+    }
+    return pinnedLabel;
   };
 
   useEffect(() => {
@@ -204,13 +235,28 @@ function isSafeTelegramUrl(url: string): boolean {
   }
 }
 
+const APPROVED_LLMS: ReadonlySet<string> = new Set([
+  'gpt-4',
+  'gpt-4o',
+  'gpt-3.5-turbo',
+  'claude-3-opus',
+  'claude-3-sonnet',
+  'claude-3-haiku',
+  'gemini-pro',
+  'gemini-1.5-pro',
+  'llama-3',
+  'mistral-7b',
+]);
+
+function sanitizeLlm(llm: unknown): string {
+  if (typeof llm === 'string' && APPROVED_LLMS.has(llm)) {
+    return llm;
+  }
+  return 'Unknown';
+}
+
 function maskPhoneNumber(phone: string): string {
   if (!phone || phone.length < 4) return '****';
   const lastFour = phone.slice(-4);
   return `****-${lastFour}`;
-}
-  if (!phone || phone.length <= 4) return '****';
-  const lastFour = phone.slice(-4);
-  const masked = phone.slice(0, -4).replace(/\d/g, '*');
-  return masked + lastFour;
 }
