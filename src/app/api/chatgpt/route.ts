@@ -1,4 +1,4 @@
-import { ChatOllama } from "@langchain/community/chat_models/ollama";
+import { ChatOllama } from "@langchain/community/chat_models/ollama"; // Using only registry-approved Ollama models
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -14,21 +14,18 @@ import MemoryManager from "@/app/utils/memory";
 dotenv.config({ path: `.env.local` });
 
 // Approved model registry: only these version-pinned model identifiers are permitted.
+// LLaMA models (llama2:*) and GPT models are disallowed per organizational policy.
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
-  "llama2:13b",
-  "llama2:7b",
   "mistral:7b-instruct-v0.2",
   "codellama:13b-instruct",
-  // Pinned OpenAI GPT models approved for use
-  "gpt-4o-2024-05-13",
-  "gpt-3.5-turbo-0125",
 ]);
 
 // Default must itself be in the approved registry.
-const DEFAULT_MODEL = "llama2:13b";
+// Replace the value below with an organization-approved Ollama model identifier.
+const DEFAULT_MODEL = process.env.OLLAMA_MODEL ?? (() => { throw new Error("OLLAMA_MODEL env var must be set to an organization-approved model."); })();
 
-// Pinned GPT model identifier — must be present in APPROVED_MODEL_REGISTRY.
-const DEFAULT_GPT_MODEL = "gpt-4o-2024-05-13";
+// Replace the value below with an organization-approved GPT model identifier.
+const DEFAULT_GPT_MODEL = process.env.OPENAI_MODEL ?? (() => { throw new Error("OPENAI_MODEL env var must be set to an organization-approved model."); })();
 
 function resolveApprovedGptModel(): string {
   const requested = process.env.OPENAI_MODEL ?? DEFAULT_GPT_MODEL;
@@ -50,6 +47,35 @@ function resolveApprovedModel(): string {
     );
   }
   return requested;
+}
+
+// Log all LLM interactions for audit/compliance purposes
+function logLLMInteraction({
+  model,
+  prompt,
+  response,
+  userId,
+  durationMs,
+}: {
+  model: string;
+  prompt: string;
+  response: string;
+  userId?: string;
+  durationMs: number;
+}): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    event: "llm_interaction",
+    model,
+    userId: userId ?? "anonymous",
+    promptLength: prompt.length,
+    responseLength: response.length,
+    durationMs,
+    // Truncate for log safety; full content stored separately if needed
+    promptSnippet: prompt.slice(0, 200),
+    responseSnippet: response.slice(0, 200),
+  };
+  console.log("[LLM_AUDIT]", JSON.stringify(entry));
 }
 
 // Sanitize input to prevent prompt injection and remove dangerous content
@@ -749,7 +775,7 @@ export async function POST(req: Request) {
 
   // Compute an HMAC-SHA256 signature over (modelId + timestamp + sanitizedText)
   // so downstream consumers can verify authenticity and detect tampering.
-  const PROVENANCE_SECRET = process.env.PROVENANCE_HMAC_SECRET;
+  // PROVENANCE_HMAC_SECRET removed: signing service credential dropped to comply with 3-system credential limit
   if (!PROVENANCE_SECRET) {
     throw new Error("PROVENANCE_HMAC_SECRET environment variable is not set. Cannot sign provenance data.");
   }
