@@ -1,11 +1,12 @@
-// Call embedding API and insert to supabase
+// Index documents into Supabase pgvector store.
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
 // Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) only.
 // Embeddings are generated locally via HuggingFaceTransformersEmbeddings (@xenova/transformers) — no external embedding API key required.
+// Model: Xenova/all-MiniLM-L6-v2 (runs fully in-process via @xenova/transformers).
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -17,7 +18,80 @@ import crypto from "crypto";
 dotenv.config({ path: `.env.local` });
 
 // Persistent append-only audit log path (override via AUDIT_LOG_PATH env var)
-const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || path.resolve("audit.log");
+// Path traversal mitigation: resolve and validate that the path stays within
+// the allowed base directory (process.cwd()) before accepting the env var value.
+const _AUDIT_LOG_ALLOWED_BASE = path.resolve(process.cwd());
+const _AUDIT_LOG_DEFAULT = path.resolve(_AUDIT_LOG_ALLOWED_BASE, "audit.log");
+const AUDIT_LOG_PATH = (() => {
+  const envVal = process.env.AUDIT_LOG_PATH;
+  if (!envVal) return _AUDIT_LOG_DEFAULT;
+  // Resolve to an absolute path to neutralise "../" sequences
+  const resolved = path.resolve(envVal);
+  // Reject any path that escapes the allowed base directory
+  if (!resolved.startsWith(_AUDIT_LOG_ALLOWED_BASE + path.sep) && resolved !== _AUDIT_LOG_ALLOWED_BASE) {
+    console.warn(
+      `[SECURITY] AUDIT_LOG_PATH "${envVal}" resolves outside the allowed directory. ` +
+      `Falling back to default: ${_AUDIT_LOG_DEFAULT}`
+    );
+    return _AUDIT_LOG_DEFAULT;
+  }
+  return resolved;
+})();
+
+// Retention policy: max file size in bytes before rotation (default 10 MB)
+const AUDIT_LOG_MAX_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
+// Retention policy: max age of rotated log files in days before deletion (default 90 days)
+const AUDIT_LOG_MAX_DAYS = parseInt(process.env.AUDIT_LOG_MAX_DAYS || "90", 10);
+
+/**
+ * Enforce retention and rotation rules on the audit log file.
+ * - If the current audit log exceeds AUDIT_LOG_MAX_BYTES, it is renamed to
+ *   audit.<ISO-timestamp>.log so a fresh file is started.
+ * - Any rotated log files older than AUDIT_LOG_MAX_DAYS are deleted.
+ * This function is called at startup and after every writeAuditLog call.
+ */
+function rotateAuditLog() {
+  try {
+    const dir = path.dirname(AUDIT_LOG_PATH);
+    const base = path.basename(AUDIT_LOG_PATH, path.extname(AUDIT_LOG_PATH));
+    const ext = path.extname(AUDIT_LOG_PATH);
+
+    // Rotate if current log exceeds size limit
+    if (fs.existsSync(AUDIT_LOG_PATH)) {
+      const stat = fs.statSync(AUDIT_LOG_PATH);
+      if (stat.size >= AUDIT_LOG_MAX_BYTES) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const rotatedPath = path.join(dir, `${base}.${timestamp}${ext}`);
+        fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+      }
+    }
+
+    // Delete rotated log files older than AUDIT_LOG_MAX_DAYS
+    const cutoffMs = AUDIT_LOG_MAX_DAYS * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const entries = fs.readdirSync(dir);
+    for (const entry of entries) {
+      // Match rotated files: base.<timestamp><ext>
+      if (entry.startsWith(base + ".") && entry.endsWith(ext) && entry !== path.basename(AUDIT_LOG_PATH)) {
+        const filePath = path.join(dir, entry);
+        try {
+          const fileStat = fs.statSync(filePath);
+          if (now - fileStat.mtimeMs > cutoffMs) {
+            fs.unlinkSync(filePath);
+          }
+        } catch (_) {
+          // Ignore errors on individual rotated file cleanup
+        }
+      }
+    }
+  } catch (err) {
+    // Rotation errors must not interrupt the main flow; log to stderr only
+    process.stderr.write(`[audit-rotation-error] ${err.message}\n`);
+  }
+}
+
+// Enforce retention policy at startup
+rotateAuditLog();
 
 /**
  * Append a structured audit record to the persistent audit log file.
@@ -33,6 +107,8 @@ function writeAuditLog(record) {
   const line = JSON.stringify(record) + "\n";
   // Synchronous write so the record is flushed before the process can exit
   fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  // Enforce retention/rotation policy after every write
+  rotateAuditLog();
 }
 
 /**
@@ -121,6 +197,27 @@ function sanitizeContent(text) {
 
   // Passport numbers (generic: letter(s) followed by 6-9 digits)
   sanitized = sanitized.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, "[REDACTED_PASSPORT]");
+
+  // Singapore NRIC / FIN numbers (e.g. S1234567D, T0123456A, F1234567N, G1234567X)
+  sanitized = sanitized.replace(/\b[STFG]\d{7}[A-Z]\b/gi, "[REDACTED_NRIC_FIN]");
+
+  // Singapore Work Permit numbers (WP followed by 7 digits, or numeric-only 9-digit WP)
+  sanitized = sanitized.replace(/\bWP\d{7}\b/gi, "[REDACTED_WORK_PERMIT]");
+  sanitized = sanitized.replace(/\b(?:work\s*permit\s*(?:no\.?|number)?\s*:?\s*)\d{7,10}\b/gi, "[REDACTED_WORK_PERMIT]");
+
+  // SingPass identifiers (keyword followed by an ID-like token, or standalone SingPass ID patterns)
+  sanitized = sanitized.replace(/\bsingpass\s*(?:id|identifier|login|user(?:name)?)?\s*:?\s*[A-Z0-9._%+\-]{3,30}/gi, "[REDACTED_SINGPASS_ID]");
+
+  // CPF Account Numbers (9-digit numeric sequences associated with CPF)
+  sanitized = sanitized.replace(/\b(?:cpf\s*(?:account\s*)?(?:no\.?|number)?\s*:?\s*)\d{9}\b/gi, "[REDACTED_CPF]");
+  // Standalone 9-digit numbers that may be CPF account numbers
+  sanitized = sanitized.replace(/\bcpf\b[^\n]{0,30}\b\d{9}\b/gi, "[REDACTED_CPF]");
+
+  // Singapore phone numbers (+65 XXXX XXXX or 8/9-digit local numbers starting with 6, 8, or 9)
+  sanitized = sanitized.replace(/\b(?:\+65[\s\-]?)?[689]\d{3}[\s\-]?\d{4}\b/g, "[REDACTED_SG_PHONE]");
+
+  // Singapore postal codes (6-digit codes, optionally preceded by "Singapore" keyword)
+  sanitized = sanitized.replace(/\b(?:singapore\s+)?(?:postal\s*(?:code|no\.?)?\s*:?\s*)?(?:s\s*)?\(?(\d{6})\)?\b/gi, "[REDACTED_SG_POSTAL]");
 
   // Collapse excessive whitespace introduced by removals
   sanitized = sanitized.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n");
@@ -523,7 +620,7 @@ try {
     JSON.stringify({
       event: "embedding_end",
       provider: "HuggingFace",
-      model: "text-embedding-ada-002",
+      model: "Xenova/all-MiniLM-L6-v2",
       operation: "SupabaseVectorStore.fromDocuments",
       status: "success",
       documentCount: docsToEmbed.length,
