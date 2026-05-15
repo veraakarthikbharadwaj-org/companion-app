@@ -17,15 +17,22 @@ class ConfigManager {
     return ConfigManager.instance;
   }
 
-  public getConfig(fieldName: string, configValue: string) {
+  public getConfig(fieldName: string, configValue: string, fields?: string[]) {
     //).filter((c: any) => c.name === companionName);
+    const allowedFields = fields && fields.length > 0 ? fields : ["name", "companionFileName"];
     try {
       if (!!this.config && this.config.length !== 0) {
         const result = this.config.filter(
           (c: any) => c[fieldName] === configValue
         );
         if (result.length !== 0) {
-          return result[0];
+          const matched = result[0];
+          return allowedFields.reduce((acc: Record<string, any>, key: string) => {
+            if (Object.prototype.hasOwnProperty.call(matched, key)) {
+              acc[key] = matched[key];
+            }
+            return acc;
+          }, {});
         }
       }
     } catch (e) {

@@ -17,9 +17,7 @@ create function match_documents (
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}'
 ) returns table (
-  id bigint,
   content text,
-  metadata jsonb,
   similarity float
 )
 language plpgsql
@@ -28,9 +26,7 @@ as $$
 begin
   return query
   select
-    id,
     content,
-    metadata,
     1 - (documents.embedding <=> query_embedding) as similarity
   from documents
   where metadata @> filter
