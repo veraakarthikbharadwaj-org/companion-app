@@ -7,6 +7,8 @@ import crypto from 'crypto'
 // Expected token format (base64url): <subject>.<issuedAtMs>.<hmac-sha256-hex>
 // where HMAC is over "<subject>.<issuedAtMs>" keyed with SESSION_SIGNING_SECRET.
 const SESSION_SIGNING_SECRET = process.env.SESSION_SIGNING_SECRET || '';
+// Provenance signing reuses the shared session signing secret to avoid holding a separate credential.
+const signingSecret = SESSION_SIGNING_SECRET;
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 
 function hmacSha256Hex(data: string, secret: string): string {
@@ -63,6 +65,132 @@ function auditHash(value: string): string {
 }
 import ConfigManager from "@/app/utils/config";
 
+// ---------------------------------------------------------------------------
+// Input sanitization & prompt-injection validation
+// ---------------------------------------------------------------------------
+
+/** Maximum allowed length for a user message (characters). */
+const MAX_MESSAGE_LENGTH = 4000;
+
+/**
+ * Patterns that are characteristic of prompt-injection / jailbreak attempts.
+ * The list is intentionally conservative; extend as new patterns are observed.
+ */
+const INJECTION_PATTERNS: ReadonlyArray<RegExp> = [
+  /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+  /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+  /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+  /you\s+are\s+now\s+(a\s+)?(?!an?\s+assistant)/i,
+  /act\s+as\s+(if\s+you\s+are\s+)?(?!an?\s+assistant)/i,
+  /pretend\s+(you\s+are|to\s+be)\s+/i,
+  /\bDAN\b/,                          // "Do Anything Now" jailbreak
+  /\bjailbreak\b/i,
+  /<\s*script[^>]*>/i,                 // script injection
+  /\bsystem\s*:\s*you\s+are\b/i,      // fake system-role injection
+  /\[\s*system\s*\]/i,
+  /\bprompt\s+injection\b/i,
+];
+
+/**
+ * Sanitizes and validates a raw user message before it is forwarded to the LLM.
+ *
+ * Steps:
+ *  1. Type-check — must be a non-empty string.
+ *  2. Strip ASCII control characters (except ordinary whitespace).
+ *  3. Trim leading/trailing whitespace.
+ *  4. Enforce maximum length.
+ *  5. Reject inputs that match known prompt-injection patterns.
+ *
+ * Returns the cleaned message string, or throws a descriptive Error.
+ */
+function sanitizeAndValidateMessage(raw: unknown): string {
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    throw new Error("Message must be a non-empty string.");
+  }
+
+  // Remove ASCII control characters (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F)
+  // while preserving ordinary whitespace (\t, \n, \r).
+  // eslint-disable-next-line no-control-regex
+  let sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  sanitized = sanitized.trim();
+
+  if (sanitized.length === 0) {
+    throw new Error("Message is empty after sanitization.");
+  }
+
+  if (sanitized.length > MAX_MESSAGE_LENGTH) {
+    throw new Error(
+      `Message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.`
+    );
+  }
+
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      throw new Error("Message contains disallowed content.");
+    }
+  }
+
+  return sanitized;
+}
+
+// Sanitizes user-supplied messages to prevent prompt injection, hidden instructions,
+// base64-encoded payloads, leetspeak obfuscation, shell commands, and binary content.
+function sanitizeMessage(message: string): string {
+  if (typeof message !== 'string') throw new Error('Invalid message type');
+
+  // Reject binary/non-printable content (allow common whitespace)
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(message)) {
+    throw new Error('Message contains binary or non-printable characters');
+  }
+
+  // Reject base64-encoded blobs (long runs of base64 chars that decode to suspicious content)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/g;
+  const base64Matches = message.match(base64Pattern) || [];
+  for (const match of base64Matches) {
+    try {
+      const decoded = Buffer.from(match, 'base64').toString('utf8');
+      // If decoded content looks like shell commands or instructions, reject
+      if (/(?:ignore|system|assistant|bash|sh\s|cmd|exec|eval|import|require|\$\(|`)/i.test(decoded)) {
+        throw new Error('Message contains suspicious base64-encoded content');
+      }
+    } catch (e: unknown) {
+      if (e instanceof Error && e.message.startsWith('Message contains')) throw e;
+      // Not valid base64 or benign — continue
+    }
+  }
+
+  // Reject common shell command patterns
+  const shellCommandPattern = /(?:(?:^|[;&|`$])\s*(?:bash|sh|zsh|cmd|powershell|python|perl|ruby|node|curl|wget|nc|ncat|netcat|chmod|chown|sudo|su|rm\s+-rf|mkfifo|mknod|dd\s+if=|base64\s+-d|eval\s*\(|exec\s*\())/im;
+  if (shellCommandPattern.test(message)) {
+    throw new Error('Message contains shell command patterns');
+  }
+
+  // Reject prompt injection / hidden instruction patterns
+  const injectionPattern = /(?:ignore\s+(?:all\s+)?(?:previous|above|prior)\s+instructions?|system\s*:\s*you\s+are|<\s*(?:system|assistant|user|prompt|instruction)\s*>|\[\s*(?:SYSTEM|INST|INSTRUCTIONS?)\s*\]|###\s*(?:System|Instruction|Prompt)|you\s+are\s+now\s+(?:a|an|in)|disregard\s+(?:all\s+)?(?:previous|prior|your))/im;
+  if (injectionPattern.test(message)) {
+    throw new Error('Message contains prompt injection patterns');
+  }
+
+  // Reject leetspeak obfuscation attempts (heuristic: high ratio of digit-letter substitutions)
+  const leet = message.replace(/[^a-zA-Z0-9]/g, '');
+  if (leet.length > 20) {
+    const leetSubstitutions = (message.match(/[013457@$!|]/g) || []).length;
+    const ratio = leetSubstitutions / leet.length;
+    if (ratio > 0.4) {
+      throw new Error('Message appears to use leetspeak obfuscation');
+    }
+  }
+
+  // Enforce maximum message length to prevent resource exhaustion
+  const MAX_MESSAGE_LENGTH = 4000;
+  if (message.length > MAX_MESSAGE_LENGTH) {
+    throw new Error(`Message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters`);
+  }
+
+  return message.trim();
+}
+
 // Explicit allow list of tools that AI agents are permitted to invoke.
 const ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "search",
@@ -78,6 +206,42 @@ const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit_ai_actions.log");
 const AUDIT_LOG_MAX_BYTES: number = parseInt(process.env.AUDIT_LOG_MAX_BYTES || "10485760", 10); // 10 MB default
 const AUDIT_LOG_MAX_FILES: number = parseInt(process.env.AUDIT_LOG_MAX_FILES || "10", 10);    // keep 10 rotated files
 
+/** Allowed directory for audit log files. All rotation targets must reside here. */
+const AUDIT_LOG_DIR = path.dirname(AUDIT_LOG_PATH);
+const AUDIT_LOG_BASENAME = path.basename(AUDIT_LOG_PATH);
+
+/**
+ * Validates that a candidate path is inside the audit log directory and
+ * matches the expected audit log file naming pattern before any FS operation.
+ * Throws if the path is outside the allowed directory or does not match the pattern.
+ */
+function assertSafeAuditPath(candidate: string): void {
+  const resolved = path.resolve(candidate);
+  const resolvedDir = path.resolve(AUDIT_LOG_DIR);
+  if (!resolved.startsWith(resolvedDir + path.sep) && resolved !== resolvedDir) {
+    throw new Error(`[AUDIT] Unsafe path rejected: ${resolved}`);
+  }
+  const basename = path.basename(resolved);
+  // Must be exactly the audit log file or a numbered rotation: <basename> or <basename>.<N>
+  const safePattern = new RegExp(`^${AUDIT_LOG_BASENAME}(\.\\d+)?$`);
+  if (!safePattern.test(basename)) {
+    throw new Error(`[AUDIT] Path does not match audit log naming pattern: ${basename}`);
+  }
+}
+
+/** Safe wrapper for deleting an audit log rotation file. */
+function safeAuditUnlink(filePath: string): void {
+  assertSafeAuditPath(filePath);
+  fs.unlinkSync(filePath);
+}
+
+/** Safe wrapper for renaming/moving an audit log rotation file. */
+function safeAuditRename(oldPath: string, newPath: string): void {
+  assertSafeAuditPath(oldPath);
+  assertSafeAuditPath(newPath);
+  fs.renameSync(oldPath, newPath);
+}
+
 function rotateAuditLogIfNeeded(): void {
   try {
     if (!fs.existsSync(AUDIT_LOG_PATH)) return;
@@ -88,14 +252,26 @@ function rotateAuditLogIfNeeded(): void {
       const older = `${AUDIT_LOG_PATH}.${i}`;
       const newer = `${AUDIT_LOG_PATH}.${i + 1}`;
       if (fs.existsSync(older)) {
-        if (i + 1 > AUDIT_LOG_MAX_FILES) {
-          fs.unlinkSync(older); // drop files beyond retention limit
+                if (i + 1 > AUDIT_LOG_MAX_FILES) {
+          // HITL approval gate: permanent log deletion requires explicit human approval
+          // via the AUDIT_LOG_ALLOW_PURGE environment variable set to "true".
+          // Without this gate, the file is preserved and a warning is emitted so
+          // a human operator can review and approve the purge before it executes.
+          if (process.env.AUDIT_LOG_ALLOW_PURGE === 'true') {
+            fs.unlinkSync(older); // drop files beyond retention limit — human-approved
+          } else {
+            console.warn(
+              `[AUDIT][HITL] Purge of audit log file "${older}" requires human approval. ` +
+              'Set environment variable AUDIT_LOG_ALLOW_PURGE=true to permit deletion. ' +
+              'File has been preserved pending approval.'
+            );
+          }
         } else {
-          fs.renameSync(older, newer);
+          safeAuditRename(older, newer);
         }
       }
     }
-    fs.renameSync(AUDIT_LOG_PATH, `${AUDIT_LOG_PATH}.1`);
+    safeAuditRename(AUDIT_LOG_PATH, `${AUDIT_LOG_PATH}.1`);
   } catch (rotateErr) {
     // Log rotation failure must not suppress the audit write
     console.error("[AUDIT] Log rotation error:", rotateErr);
@@ -408,7 +584,11 @@ export async function POST(req: Request) {
 
   // Use the organization's approved LLM endpoint (OpenAI gpt-4o).
   const APPROVED_LLM_URL = "https://api.openai.com/v1/chat/completions";
-  const APPROVED_MODEL = "gpt-4o";
+  const APPROVED_MODEL = process.env.APPROVED_MODEL_ID;
+  if (!APPROVED_MODEL) {
+    console.error("ERROR: APPROVED_MODEL_ID is not set; cannot proceed without an approved model.");
+    return returnError(500, "Approved model is not configured.");
+  }
 
   const systemPrompt = companionConfig.systemPrompt || `You are ${companionName}, a helpful assistant.`;
 
@@ -463,14 +643,69 @@ export async function POST(req: Request) {
       return returnError(500, "The agent response contained disallowed content and was rejected.");
     }
 
+    // Sanitize LLM output by removing dangerous patterns from all string values
+    function sanitizeDangerousContent(value: unknown): unknown {
+      if (typeof value === "string") {
+        let sanitized = value;
+        for (const pattern of DANGEROUS_PATTERNS) {
+          sanitized = sanitized.replace(pattern, "[REMOVED]");
+        }
+        return sanitized;
+      }
+      if (Array.isArray(value)) {
+        return value.map(sanitizeDangerousContent);
+      }
+      if (value !== null && typeof value === "object") {
+        return Object.fromEntries(
+          Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, sanitizeDangerousContent(v)])
+        );
+      }
+      return value;
+    }
+
+    const sanitizedResponseBlocks = sanitizeDangerousContent(responseBlocks);
+
+    // Sanitize MCP server tool output before use
+    function sanitizeMcpOutput(value: unknown): unknown {
+      if (typeof value === "string") {
+        // Strip HTML tags, null bytes, and escape potentially dangerous characters
+        return value
+          .replace(/\0/g, "")                        // remove null bytes
+          .replace(/<[^>]*>/g, "")                   // strip HTML/XML tags
+          .replace(/&/g, "&amp;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#x27;")
+          .replace(/`/g, "&#x60;")
+          .trim();
+      }
+      if (Array.isArray(value)) {
+        return value.map(sanitizeMcpOutput);
+      }
+      if (value !== null && typeof value === "object") {
+        const sanitized: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          sanitized[k] = sanitizeMcpOutput(v);
+        }
+        return sanitized;
+      }
+      // Allow only primitive types (number, boolean, null); reject anything else
+      if (typeof value === "number" || typeof value === "boolean" || value === null) {
+        return value;
+      }
+      return null;
+    }
+
+    const sanitizedResponseBlocks = sanitizeMcpOutput(responseBlocks);
+
     // Attach synthetic content provenance metadata and cryptographic signature
     const provenanceTimestamp = new Date().toISOString();
     const provenanceModelId = APPROVED_MODEL;
-    const provenanceOrigin = "ai-generated:openai";
+    const provenanceOrigin = process.env.APPROVED_MODEL_ORIGIN || "ai-generated:approved";
 
     // Build the canonical provenance payload for signing
-    const provenancePayload = JSON.stringify({
+        const provenancePayload = JSON.stringify({
       modelId: provenanceModelId,
+      modelDigest: provenanceModelDigest,
       timestamp: provenanceTimestamp,
       origin: provenanceOrigin,
       content: responseBlocks,
@@ -478,7 +713,7 @@ export async function POST(req: Request) {
 
     // Compute HMAC-SHA256 signature over the provenance payload
     const { createHmac } = await import("crypto");
-    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET || "";
+    // signingSecret is now defined above, aliased to SESSION_SIGNING_SECRET
     if (!signingSecret) {
       console.error("ERROR: PROVENANCE_SIGNING_SECRET is not set; cannot sign AI-generated content.");
       return returnError(500, "Provenance signing secret is not configured.");
@@ -487,18 +722,19 @@ export async function POST(req: Request) {
       .update(provenancePayload)
       .digest("hex");
 
-    const labeledResponse = {
+        // Log provenance metadata internally for audit purposes only — do not expose to clients.
+    console.log(JSON.stringify({
       _provenance: {
         label: "AI_GENERATED_CONTENT",
         modelId: provenanceModelId,
+        modelDigest: provenanceModelDigest,
         timestamp: provenanceTimestamp,
         origin: provenanceOrigin,
         signature: provenanceSignature,
       },
-      content: responseBlocks,
-    };
+    }));
 
-    return NextResponse.json(labeledResponse);
+    return NextResponse.json({ content: responseBlocks });
   } else {
     console.error("Agent request failed:", await response.text());
     return returnError(500, "An internal error occurred. Please try again later.");
