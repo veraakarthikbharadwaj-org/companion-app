@@ -4,23 +4,34 @@ dotenv.config({ path: `.env.local` });
 
 // Approved model registry — only models listed here may be used for inference.
 // NOTE: Only org-approved models may appear here. Unapproved models (e.g. stable-diffusion, dall-e, GPT, Claude) have been removed.
-// The approved model ID and version MUST be set via environment variables referencing the org's approved model catalogue.
-const _APPROVED_IMAGE_MODEL_ID: string = process.env.APPROVED_IMAGE_MODEL_ID ?? "";
-const _APPROVED_IMAGE_MODEL_VERSION: string = process.env.APPROVED_IMAGE_MODEL_VERSION ?? "";
+// Model IDs and versions are hardcoded to org-approved values; env vars may select among approved entries only.
+const APPROVED_MODEL_REGISTRY: Record<string, string[]> = {
+  "org-approved-image-model-v1": ["1.0.0", "1.1.0"],
+};
 
-if (!_APPROVED_IMAGE_MODEL_ID || !_APPROVED_IMAGE_MODEL_VERSION) {
+const _DEFAULT_APPROVED_IMAGE_MODEL_ID = "org-approved-image-model-v1";
+const _DEFAULT_APPROVED_IMAGE_MODEL_VERSION = "1.1.0";
+
+const _envModelId: string = process.env.APPROVED_IMAGE_MODEL_ID ?? _DEFAULT_APPROVED_IMAGE_MODEL_ID;
+const _envModelVersion: string = process.env.APPROVED_IMAGE_MODEL_VERSION ?? _DEFAULT_APPROVED_IMAGE_MODEL_VERSION;
+
+if (!Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, _envModelId)) {
   throw new Error(
-    "Configuration error: APPROVED_IMAGE_MODEL_ID and APPROVED_IMAGE_MODEL_VERSION must be set to org-approved values."
+    `Configuration error: APPROVED_IMAGE_MODEL_ID "${_envModelId}" is not in the org-approved model registry.`
+  );
+}
+if (!APPROVED_MODEL_REGISTRY[_envModelId].includes(_envModelVersion)) {
+  throw new Error(
+    `Configuration error: APPROVED_IMAGE_MODEL_VERSION "${_envModelVersion}" is not approved for model "${_envModelId}".`
   );
 }
 
-const APPROVED_MODEL_REGISTRY: Record<string, string[]> = {
-  [_APPROVED_IMAGE_MODEL_ID]: [_APPROVED_IMAGE_MODEL_VERSION],
-};
-
 // Pinned model identity for this workload — must match an entry in APPROVED_MODEL_REGISTRY.
-const PINNED_MODEL_ID = _APPROVED_IMAGE_MODEL_ID;
-const PINNED_MODEL_VERSION = _APPROVED_IMAGE_MODEL_VERSION;
+const PINNED_MODEL_ID = _envModelId;
+const PINNED_MODEL_VERSION = _envModelVersion;
+
+const _APPROVED_IMAGE_MODEL_ID: string = PINNED_MODEL_ID;
+const _APPROVED_IMAGE_MODEL_VERSION: string = PINNED_MODEL_VERSION;
 
 /**
  * Verifies that the model identity returned by the inference API matches
@@ -57,6 +68,50 @@ import { Fragment, useState } from "react";
 import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
 import Image from "next/image";
+import crypto from "crypto";
+
+/**
+ * Writes a structured AI decision audit record to the persistent audit log endpoint.
+ * This must be called for every AI inference action to satisfy forensic readiness requirements.
+ */
+async function writeAuditRecord(record: {
+  timestamp: string;
+  principal: string;
+  modelId: string;
+  modelVersion: string;
+  inputHash: string;
+  outputHash: string;
+  status: "success" | "failure";
+  errorMessage?: string;
+}): Promise<void> {
+  try {
+    const auditResponse = await fetch("/api/audit-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        eventType: "AI_IMAGE_GENERATION",
+        ...record,
+      }),
+    });
+    if (!auditResponse.ok) {
+      // Log to console as fallback — audit failures must not silently disappear.
+      console.error(
+        "[AUDIT] Failed to persist AI decision audit record:",
+        await auditResponse.text()
+      );
+    }
+  } catch (auditErr) {
+    console.error("[AUDIT] Exception writing AI decision audit record:", auditErr);
+  }
+}
+
+/**
+ * Computes a SHA-256 hex digest of the given string for use as an input/output hash
+ * in the AI decision audit trail.
+ */
+function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 /**
  * Validates and sanitizes an image source string returned from an LLM/AI API.
