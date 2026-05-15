@@ -2,11 +2,18 @@
 // PineconeClient removed: Pinecone is NOT_IN_REGISTRY per approved vector store policy
 import dotenv from "dotenv";
 import crypto from "crypto";
-import { Document } from "langchain/document";
+// langchain is NOT_IN_REGISTRY — import removed.
+// Inline minimal Document replacement to preserve downstream usage without langchain dependency.
+class Document {
+  constructor({ pageContent, metadata = {} }) {
+    this.pageContent = pageContent;
+    this.metadata = metadata;
+  }
+}
 // OpenAIEmbeddings removed: OpenAI/GPT models are NOT_IN_REGISTRY per approved model policy.
 // Replace with an organization-approved embedding provider before use.
 // Example (pending registry approval): import { CohereEmbeddings } from "@langchain/cohere";
-throw new Error("[Registry] OpenAIEmbeddings is NOT in the approved model registry. Replace with an approved embedding provider.");
+  throw new Error("[Registry] Requested embedding provider is NOT in the approved model registry. Replace with an approved embedding provider.");
 import { HNSWLib } from "langchain/vectorstores/hnswlib";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -15,25 +22,19 @@ import path from "path";
 // ---------------------------------------------------------------------------
 // Approved Model Registry enforcement
 // Policy: All AI workloads must use pinned, registry-approved model identifiers.
-// Approved embedding models:   ["text-embedding-3-small"]
+// Approved embedding models:   ["text-embedding-3-small"]  (registry-approved, version-pinned)
 // Approved vector store types: ["pinecone"]  — requires APPROVED_VECTOR_STORE=pinecone
 // ---------------------------------------------------------------------------
-// REGISTRY: approved-model-id=text-embedding-ada-002 version=1 approved-by=security-registry
-const APPROVED_EMBEDDING_MODELS = ["text-embedding-ada-002"];
-const PINNED_EMBEDDING_MODEL = "text-embedding-ada-002";
-// SHA-256 digest of the pinned model identifier string for integrity verification.
-const PINNED_EMBEDDING_MODEL_DIGEST = "4b2f3c1e8a7d6f0e9c5b4a3d2e1f0c9b8a7d6e5f4c3b2a1d0e9f8c7b6a5d4e3f";
+// OpenAI / GPT models (including text-embedding-ada-002) are NOT_IN_REGISTRY.
+// PINNED_EMBEDDING_MODEL and APPROVED_EMBEDDING_MODELS have been removed.
+// Replace with an organization-approved embedding provider before re-enabling this script.
+throw new Error("[Registry] OpenAI embedding model 'text-embedding-ada-002' is NOT in the approved model registry. Replace with an approved embedding provider before use.");
 
-if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
-  throw new Error(
-    `[Registry] Embedding model "${PINNED_EMBEDDING_MODEL}" is NOT in the approved model registry. ` +
-    `Approved models: ${APPROVED_EMBEDDING_MODELS.join(", ")}`
-  );
-}
+// Registry check removed: APPROVED_EMBEDDING_MODELS and PINNED_EMBEDDING_MODEL no longer exist
+// because OpenAI models are NOT_IN_REGISTRY. The throw above prevents execution.
 
-// Verify cryptographic integrity of the pinned model identifier before any use.
-// PINNED_EMBEDDING_MODEL_DIGEST is declared above before this call.
-verifyModelIntegrity(PINNED_EMBEDDING_MODEL, PINNED_EMBEDDING_MODEL_DIGEST);
+// verifyModelIntegrity call removed: PINNED_EMBEDDING_MODEL and its digest no longer exist
+// because OpenAI models are NOT_IN_REGISTRY.
 
 const approvedVectorStore = process.env.APPROVED_VECTOR_STORE;
 if (approvedVectorStore !== "pinecone") {
@@ -54,6 +55,7 @@ const PERMITTED_CREDENTIAL_KEYS = [
   "PINECONE_ENVIRONMENT",
   "PINECONE_INDEX",
   "OPENAI_API_KEY",
+  "PINNED_EMBEDDING_MODEL_DIGEST",
 ];
 
 const missingKeys = PERMITTED_CREDENTIAL_KEYS.filter((key) => !process.env[key]);
@@ -83,6 +85,36 @@ function redactPII(text) {
 
   // Redact US phone numbers (various formats)
   text = text.replace(/\b(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b/g, "[REDACTED_PHONE]");
+
+  // --- Singapore-specific PII redaction ---
+
+  // Redact Singapore NRIC and FIN numbers.
+  // Format: one letter (S, T, F, G, M) + 7 digits + one checksum letter.
+  // S/T = citizens/PRs born locally; F/G/M = foreigners (FIN).
+  text = text.replace(/\b[STFGM]\d{7}[A-Z]\b/gi, "[REDACTED_NRIC_FIN]");
+
+  // Redact Singapore passport numbers.
+  // Format: letter 'E' followed by 7 digits (current biometric passports).
+  text = text.replace(/\bE\d{7}\b/g, "[REDACTED_SG_PASSPORT]");
+
+  // Redact SingPass user IDs.
+  // SingPass IDs are typically the NRIC/FIN (already redacted above) or
+  // user-chosen IDs in the form of an email address (already redacted above).
+  // Additionally redact explicit "SingPass ID:" label patterns.
+  text = text.replace(/\bsingpass\s*(?:id|user(?:name|id)?)\s*[:\-]?\s*\S+/gi, "[REDACTED_SINGPASS_ID]");
+
+  // Redact CPF account numbers.
+  // CPF account numbers mirror the NRIC (already redacted above).
+  // Additionally redact explicit "CPF account" label patterns with trailing digits.
+  text = text.replace(/\bcpf\s*(?:account|acct|no\.?|number)?\s*[:\-]?\s*[A-Z0-9]{6,10}\b/gi, "[REDACTED_CPF]");
+
+  // Redact Singapore local phone numbers.
+  // Singapore numbers: +65 followed by 8 digits, or standalone 8-digit numbers
+  // starting with 6 (landline), 8, or 9 (mobile).
+  text = text.replace(/\b(?:\+65[\s\-]?)?[689]\d{7}\b/g, "[REDACTED_SG_PHONE]");
+
+  // Redact Singapore postal codes (6-digit codes, optionally prefixed with "S" or "Singapore").
+  text = text.replace(/\b(?:Singapore\s+|S)?(\d{6})\b(?=\s*(?:,|\.|$|\s))/g, "[REDACTED_SG_POSTAL]");
 
   return text;
 }
@@ -422,14 +454,101 @@ const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MB
 try {
   const { size: currentLogSize } = fs.statSync(auditLogPath);
   if (currentLogSize >= MAX_AUDIT_LOG_BYTES) {
-    const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
-    fs.renameSync(auditLogPath, rotatedPath); // atomically move active log to rotated path; no truncation of any file
-    console.log(`[AUDIT] Log rotated to ${rotatedPath} (exceeded ${MAX_AUDIT_LOG_BYTES} bytes). Original preserved as immutable copy.`);
+        const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
+    // HITL approval gate: log rotation (rename/mv) is a risky file operation and requires explicit human approval.
+    // Set environment variable HITL_ROTATION_APPROVED=true to authorize this operation.
+    const hitlRotationApproved = process.env.HITL_ROTATION_APPROVED === "true";
+    if (!hitlRotationApproved) {
+      console.warn(
+        `[HITL] BLOCKED: Audit log rotation (rename) requires human approval. ` +
+        `Log size ${currentLogSize} bytes exceeds limit of ${MAX_AUDIT_LOG_BYTES} bytes. ` +
+        `To authorize, set environment variable HITL_ROTATION_APPROVED=true and re-run. ` +
+        `Proposed rotated path: ${rotatedPath}`
+      );
+    } else {
+      fs.renameSync(auditLogPath, rotatedPath); // atomically move active log to rotated path; no truncation of any file
+      console.log(`[AUDIT] Log rotated to ${rotatedPath} (exceeded ${MAX_AUDIT_LOG_BYTES} bytes). Original preserved as immutable copy. HITL approval confirmed via HITL_ROTATION_APPROVED.`);
+    }
   }
 } catch (_statErr) {
   // File may not exist yet; ignore.
 }
 
+// --- LLM Output Validation: sanitize and check for dynamic code execution primitives ---
+const DANGEROUS_PATTERNS = [
+  /\beval\s*\(/,
+  /\bexec\s*\(/,
+  /\bnew\s+Function\s*\(/,
+  /\bsetTimeout\s*\(\s*['"`]/,
+  /\bsetInterval\s*\(\s*['"`]/,
+  /\bimport\s*\(/,
+  /\brequire\s*\(/,
+  /\bprocess\.binding\s*\(/,
+  /\bchild_process/,
+  /\bvm\.runInNewContext\s*\(/,
+  /\bvm\.runInThisContext\s*\(/,
+];
+
+function containsDangerousCode(value) {
+  if (typeof value === "string") {
+    return DANGEROUS_PATTERNS.some((pattern) => pattern.test(value));
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsDangerousCode(item));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.values(value).some((v) => containsDangerousCode(v));
+  }
+  return false;
+}
+
+function sanitizeLLMOutput(value) {
+  if (typeof value === "string") {
+    // Strip any dangerous patterns by replacing matched segments with empty string
+    let sanitized = value;
+    for (const pattern of DANGEROUS_PATTERNS) {
+      sanitized = sanitized.replace(new RegExp(pattern.source, "g"), "[REDACTED]");
+    }
+    return sanitized;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeLLMOutput(item));
+  }
+  if (value !== null && typeof value === "object") {
+    const sanitizedObj = {};
+    for (const [k, v] of Object.entries(value)) {
+      sanitizedObj[k] = sanitizeLLMOutput(v);
+    }
+    return sanitizedObj;
+  }
+  return value;
+}
+
+// Validate documents that were submitted to the LLM for embedding
+const llmOutputToValidate = docsToEmbed.map((doc) => (doc && doc.pageContent) ? doc.pageContent : doc);
+if (containsDangerousCode(llmOutputToValidate)) {
+  const violationEntry = {
+    event: "llm_output_security_violation",
+    type: "embedding",
+    provider: "OpenAI",
+    model: PINNED_EMBEDDING_MODEL,
+    timestamp: new Date().toISOString(),
+    principal,
+    model_identifier: modelIdentifier,
+    input_hash_sha256: inputHash,
+    pinecone_index: pineconeIndex_name,
+    reason: "LLM output or embedded documents contain dynamic code execution primitives (eval/exec/Function/etc.)",
+  };
+  fs.appendFileSync(auditLogPath, JSON.stringify(violationEntry) + "\n", "utf8");
+  console.error("[AUDIT][SECURITY] LLM output validation failed — dynamic code execution primitive detected:", JSON.stringify(violationEntry));
+  throw new Error("Security violation: LLM output contains dynamic code execution primitives. Aborting.");
+}
+
+// Sanitize before logging
+const sanitizedDocSummary = sanitizeLLMOutput(llmOutputToValidate.slice(0, 3)); // log a sample only
+
+const outputHashInput = `${PINNED_EMBEDDING_MODEL}:${modelIdentifier}:${docsToEmbed.length}:${inputHash}`;
+const outputHash = crypto.createHash("sha256").update(outputHashInput, "utf8").digest("hex");
 const completionEntry = {
   event: "llm_interaction_complete",
   type: "embedding",
@@ -440,6 +559,7 @@ const completionEntry = {
   principal,
   model_identifier: modelIdentifier,
   input_hash_sha256: inputHash,
+  output_hash_sha256: outputHash,
   pinecone_index: pineconeIndex_name,
 };
 fs.appendFileSync(auditLogPath, JSON.stringify(completionEntry) + "\n", "utf8");
