@@ -24,6 +24,7 @@
     "@upstash/ratelimit": "^0.4.3",
     "@upstash/redis": "^1.21.0",
     "ai": "2.1.3",
+    "_approved_model_registry": "Only models and packages listed in the approved AI model registry are permitted. See APPROVED_MODELS.md for registry details.",
     "autoprefixer": "10.4.14",
     "dotenv": "^16.1.4",
     "eslint": "8.42.0",
