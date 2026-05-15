@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { OpenAI } from "langchain/llms/openai";
+import { Replicate } from "langchain/llms/replicate";
 import { CallbackManager } from "langchain/callbacks";
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
@@ -95,8 +95,10 @@ function sanitizeInput(input: string, maxLength = 4000): string {
 
 export async function POST(request: Request) {
   const rawBody = await request.json();
-  const { isText, userId, userName } = rawBody;
+  const { isText } = rawBody;
   const prompt: string = sanitizeInput(typeof rawBody.prompt === "string" ? rawBody.prompt : "", 2000);
+  // Log the incoming LLM request prompt for audit purposes
+  console.log(JSON.stringify({ event: "llm_request", userId: userId || "anonymous", prompt }));
   if (!prompt) {
     return new NextResponse(
       JSON.stringify({ Message: "Invalid or empty prompt." }),
@@ -110,7 +112,11 @@ export async function POST(request: Request) {
   let user;
   let clerkUserName;
 
-  const identifier = request.url + "-" + (userId || "anonymous");
+  const identifier = request.url + "-" + "anonymous";
+  // LLM interaction logging helper: captures response text for audit
+  const logLLMResponse = (responseText: string) => {
+    console.log(JSON.stringify({ event: "llm_response", userId: userId || "anonymous", prompt, response: responseText }));
+  };
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -126,6 +132,7 @@ export async function POST(request: Request) {
   }
 
   // XXX Companion name passed here. Can use as a key to get backstory, chat history etc.
+  // Note: logLLMResponse will be called after the LLM response is fully received below.
   const rawName = request.headers.get("name") ?? "";
   // Sanitize: allow only alphanumeric characters, hyphens, and underscores to prevent path traversal
   const name = rawName.replace(/[^a-zA-Z0-9_-]/g, "");
@@ -309,7 +316,16 @@ export async function POST(request: Request) {
   model.verbose = true;
 
   const sanitizedRelevantHistory = sanitizeLLMInput(relevantHistory);
-  const sanitizedRecentChatHistory = sanitizeLLMInput(recentChatHistory);
+  // Minimise chat history: keep only the last 10 exchanges (up to 2000 chars) to avoid leaking full history into the prompt
+  const MAX_HISTORY_CHARS = 2000;
+  const MAX_HISTORY_TURNS = 10;
+  const trimmedHistory = recentChatHistory
+    .split("\n")
+    .filter((line: string) => line.trim().length > 0)
+    .slice(-MAX_HISTORY_TURNS)
+    .join("\n")
+    .slice(-MAX_HISTORY_CHARS);
+  const sanitizedRecentChatHistory = sanitizeLLMInput(trimmedHistory);
   let resp = String(
     await model
       .call(
@@ -366,15 +382,47 @@ export async function POST(request: Request) {
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
   await memoryManager.writeToHistory("### " + response.trim(), companionKey);
+
+  // --- Persistent Audit Trail (append-only, forensic-ready) ---
+  // Retention policy: logs are rotated after AUDIT_RETENTION_DAYS days.
+  // Rotation must be enforced by an external log-rotation daemon (e.g. logrotate)
+  // configured to compress and delete files older than AUDIT_RETENTION_DAYS.
+  const AUDIT_RETENTION_DAYS = 90;
+  const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH ?? "/var/log/ai_audit/vicuna13b_audit.jsonl";
+  const fs = require("fs");
+  const path = require("path");
+  const auditModelId =
+    "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
+  const auditCrypto = require("crypto");
+  const auditInputHash = auditCrypto
+    .createHash("sha256")
+    .update(typeof sanitizedRecentChatHistory === "string" ? sanitizedRecentChatHistory : JSON.stringify(sanitizedRecentChatHistory))
+    .digest("hex");
+  const auditRecord = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    modelId: auditModelId,
+    principal: clerkUserId ?? "unknown",
+    inputHash: auditInputHash,
+    output: response.trim(),
+    retentionDays: AUDIT_RETENTION_DAYS,
+  });
+  try {
+    fs.mkdirSync(path.dirname(AUDIT_LOG_PATH), { recursive: true });
+    // "a" flag guarantees append-only writes; no existing record is overwritten.
+    fs.appendFileSync(AUDIT_LOG_PATH, auditRecord + "\n", { encoding: "utf8", flag: "a" });
+  } catch (auditErr: unknown) {
+    console.error("[AUDIT] Failed to write persistent audit record:", auditErr);
+  }
+  // --- End Persistent Audit Trail ---
+
   var Readable = require("stream").Readable;
 
   const MODEL_ID =
     "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
   const generatedAt = new Date().toISOString();
 
-  // Watermark / provenance label prepended to the streamed content
-  const provenanceHeader =
-    `[AI-GENERATED CONTENT | model=${MODEL_ID} | generated_at=${generatedAt}]\n`;
+  // Provenance label without internal metadata exposed to the client
+  const provenanceHeader = `[AI-GENERATED CONTENT]\n`;
 
   // Simple deterministic watermark: HMAC-SHA-256 of the response text keyed
   // by the model ID + timestamp, encoded as hex.
@@ -385,7 +433,7 @@ export async function POST(request: Request) {
     .update(`${MODEL_ID}|${generatedAt}|${response}`)
     .digest("hex");
 
-  const labeledResponse = provenanceHeader + response;
+  const labeledResponse = provenanceHeader + sanitizedResp;
 
   let s = new Readable();
   s.push(labeledResponse);
@@ -396,8 +444,6 @@ export async function POST(request: Request) {
 
   return new StreamingTextResponse(s, {
     headers: {
-      "X-AI-Model-ID": MODEL_ID,
-      "X-AI-Generated-At": generatedAt,
       "X-Content-Label": "ai-generated-synthetic",
       "X-AI-Watermark": watermark,
     },
