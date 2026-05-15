@@ -6,6 +6,33 @@ import { Tooltip } from "react-tooltip";
 
 import { getCompanions } from "./actions";
 
+const ALLOWED_IMAGE_HOSTS = ["res.cloudinary.com", "cdn.example.com", "lh3.googleusercontent.com", "avatars.githubusercontent.com"];
+
+function getSafeImageUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if ((parsed.protocol === "https:" || parsed.protocol === "http:") && ALLOWED_IMAGE_HOSTS.includes(parsed.hostname)) {
+      return url;
+    }
+  } catch {
+    // invalid URL
+  }
+  return "/placeholder-avatar.png";
+}
+
+function getSafeTelegramLink(link: string | null): string {
+  if (!link) return "#";
+  try {
+    const parsed = new URL(link);
+    if (parsed.protocol === "https:" && parsed.hostname === "t.me") {
+      return link;
+    }
+  } catch {
+    // invalid URL
+  }
+  return "#";
+}
+
 export default function Examples() {
   const [QAModalOpen, setQAModalOpen] = useState(false);
   const [CompParam, setCompParam] = useState({
@@ -73,7 +100,7 @@ export default function Examples() {
                 height={0}
                 sizes="100vw"
                 className="mx-auto h-32 w-32 flex-shrink-0 rounded-full"
-                src={example.imageUrl}
+                src={getSafeImageUrl(example.imageUrl)}
                 alt=""
               />
               <h3 className="mt-6 text-sm font-medium text-white">
@@ -83,8 +110,8 @@ export default function Examples() {
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
                   {example.title}. Running on <b>{example.llm}</b>.
-                  {example.telegramLink && (
-                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault}} href={example.telegramLink}>Chat on <b>Telegram</b></a>.</span>
+                  {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
+                    <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}
                 </dd>
               </dl>
@@ -96,7 +123,7 @@ export default function Examples() {
                       data-tip="Helpful tip goes here"
                       className="text-sm text-slate-400 inline-block"
                     >
-                      📱Text me at: <b>{example.phone}</b>
+                      📱Text me at: <b>[phone number hidden]</b>
                       &nbsp;
                       <svg
                         data-tooltip-id="help-tooltip"
@@ -128,4 +155,31 @@ export default function Examples() {
 function isPhoneNumber(input: string): boolean {
   const phoneNumberRegex = /^\+\d{1,11}$/;
   return phoneNumberRegex.test(input);
+}
+
+const ALLOWED_TELEGRAM_HOSTNAMES = ['t.me', 'telegram.me'];
+
+function isSafeTelegramUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
+      ALLOWED_TELEGRAM_HOSTNAMES.includes(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length < 4) return '****';
+  const lastFour = phone.slice(-4);
+  return `****-${lastFour}`;
+}
+
+function maskPhoneNumber(phone: string): string {
+  if (!phone || phone.length <= 4) return '****';
+  const lastFour = phone.slice(-4);
+  const masked = phone.slice(0, -4).replace(/\d/g, '*');
+  return masked + lastFour;
 }
