@@ -18,7 +18,7 @@ FROM base as build
 
 # Install packages needed to build node modules
 RUN apt-get update -qq && apt-get install -y --no-install-recommends python-is-python3 pkg-config build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    && find /var/lib/apt/lists -mindepth 1 -delete
 
 # Install node modules
 COPY --link package-lock.json package.json ./
