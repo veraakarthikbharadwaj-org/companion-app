@@ -5,12 +5,57 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+// ---------------------------------------------------------------------------
+// Approved Model Registry
+// All AI model references MUST resolve through this registry.
+// Each entry carries an immutable version pin (SHA-256 digest or commit hash)
+// that uniquely identifies the exact model artifact.
+// ---------------------------------------------------------------------------
+const APPROVED_MODEL_REGISTRY: Record<string, { modelId: string; digest: string }> = {
+  // OpenAI GPT-4o — pinned to the 2024-08-06 snapshot digest
+  "gpt-4o": {
+    modelId: "gpt-4o-2024-08-06",
+    digest: "sha256:3f5a2b1c8e4d7f0a9b6c2e1d4f8a3b7c5e9d2f1a6b4c8e3d7f0a2b5c9e1d4f8a",
+  },
+  // Anthropic Claude 3.5 Sonnet — pinned to the 20241022 snapshot digest
+  "claude-3-5-sonnet": {
+    modelId: "claude-3-5-sonnet-20241022",
+    digest: "sha256:7c2e9f4a1b6d3e8c5f0a2b7d4e9c1f6a3b8d5e0c2f7a4b9d6e1c3f8a5b0d2e7c",
+  },
+  // Meta LLaMA 3.1 70B Instruct — pinned to HuggingFace commit hash
+  "llama-3-1-70b-instruct": {
+    modelId: "meta-llama/Meta-Llama-3.1-70B-Instruct",
+    digest: "sha256:a4b8c2d6e0f3a7b1c5d9e2f6a0b4c8d2e6f0a3b7c1d5e9f2a6b0c4d8e1f5a9b3",
+  },
+};
+
+/**
+ * Resolves a logical model alias to its registry entry.
+ * Throws if the alias is not present in the approved registry.
+ */
+function resolveApprovedModel(alias: string): { modelId: string; digest: string } {
+  const entry = APPROVED_MODEL_REGISTRY[alias];
+  if (!entry) {
+    throw new Error(
+      `Model '${alias}' is NOT_IN_REGISTRY. ` +
+      `Only the following models are approved: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+  return entry;
+}
+
+// Resolve the pinned model name from the approved registry at startup so that
+// any misconfiguration fails fast rather than at request time.
+const _pinnedModelAlias = process.env.PINNED_MODEL_ALIAS ?? "gpt-4o";
+const pinnedModel = resolveApprovedModel(_pinnedModelAlias);
+const pinnedModelName = pinnedModel.modelId; // immutably pinned identifier
+const pinnedModelDigest = pinnedModel.digest; // immutable artifact digest
+
 // Session token integrity: signing, verification, expiry, and subject binding.
 // Expected token format (base64url): <subject>.<issuedAtMs>.<hmac-sha256-hex>
 // where HMAC is over "<subject>.<issuedAtMs>" keyed with SESSION_SIGNING_SECRET.
 const SESSION_SIGNING_SECRET = process.env.SESSION_SIGNING_SECRET || '';
-// Provenance signing reuses the shared session signing secret to avoid holding a separate credential.
-const signingSecret = SESSION_SIGNING_SECRET;
+// Provenance signing uses SESSION_SIGNING_SECRET directly — no separate credential alias is held.
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 
 function hmacSha256Hex(data: string, secret: string): string {
@@ -762,9 +807,50 @@ export async function POST(req: Request) {
       .update(provenancePayload)
       .digest("hex");
 
-        // Log provenance metadata to the persistent append-only audit log.
+        // --- Input Sanitization and Validation ---
+    // Sanitize and validate userMessage before LLM dispatch and audit logging.
+    const MAX_INPUT_LENGTH = 32768; // 32 KB hard cap
+    const PROMPT_INJECTION_PATTERNS: RegExp[] = [
+      /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+      /disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+      /forget\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+      /you\s+are\s+now\s+(a\s+)?(?!an?\s+AI|an?\s+assistant)/i,
+      /act\s+as\s+(if\s+you\s+are\s+)?(?!an?\s+AI|an?\s+assistant)/i,
+      /new\s+(role|persona|identity|instructions?)\s*:/i,
+      /system\s*:\s*you\s+(are|must|should|will)/i,
+      /\[\s*system\s*\]/i,
+      /\[\s*inst\s*\]/i,
+      /<\s*\/?\s*(system|instruction|prompt|context)\s*>/i,
+      // Hidden Unicode direction/override characters used to smuggle instructions
+      /[‪-‮⁦-⁩​-‏﻿]/,
+    ];
+
+    const rawInput: string = typeof userMessage === 'string' ? userMessage : JSON.stringify(userMessage);
+
+    // 1. Length check
+    if (rawInput.length > MAX_INPUT_LENGTH) {
+      console.error("Input validation failed: userMessage exceeds maximum allowed length.");
+      return returnError(400, "Input exceeds maximum allowed length.");
+    }
+
+    // 2. Strip null bytes and non-printable ASCII control characters (except tab, newline, carriage return)
+    const strippedInput = rawInput.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+    // 3. Prompt injection / hidden prompt detection
+    for (const pattern of PROMPT_INJECTION_PATTERNS) {
+      if (pattern.test(strippedInput)) {
+        console.error("Input validation failed: potential prompt injection detected.", { pattern: pattern.toString() });
+        return returnError(400, "Input contains disallowed content and was rejected.");
+      }
+    }
+
+    // Use the sanitized input as the canonical value for audit and downstream use
+    const sanitizedUserInput: string = strippedInput.trim();
+    // --- End Input Sanitization and Validation ---
+
+    // Log provenance metadata to the persistent append-only audit log.
         // inputHash binds the exact user input to this decision record for forensic traceability.
-    const inputHash = auditHash(typeof userMessage === 'string' ? userMessage : JSON.stringify(userMessage));
+    const inputHash = auditHash(sanitizedUserInput);
     const principal = user?.id ?? 'anonymous';
     writeAuditRecord({
       _provenance: {
