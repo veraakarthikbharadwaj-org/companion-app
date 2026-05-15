@@ -1,4 +1,4 @@
-import { ChatOllama } from "langchain/chat_models/ollama";
+import { ChatOpenAI } from "langchain/chat_models/openai";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -7,11 +7,34 @@ import { verifyToken } from "@clerk/clerk-sdk-node";
 import { CallbackManager } from "langchain/callbacks";
 import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
+import { createHash } from "crypto";
 import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
 import { rateLimit } from "@/app/utils/rateLimit";
 
 dotenv.config({ path: `.env.local` });
+
+// Approved model registry: only these version-pinned model identifiers are permitted.
+const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
+  "llama2:13b",
+  "llama2:7b",
+  "mistral:7b-instruct-v0.2",
+  "codellama:13b-instruct",
+]);
+
+// Default must itself be in the approved registry.
+const DEFAULT_MODEL = "llama2:13b";
+
+function resolveApprovedModel(): string {
+  const requested = process.env.OLLAMA_MODEL ?? DEFAULT_MODEL;
+  if (!APPROVED_MODEL_REGISTRY.has(requested)) {
+    throw new Error(
+      `Model '${requested}' is not in the approved model registry. ` +
+      `Permitted models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+    );
+  }
+  return requested;
+}
 
 // Sanitize input to prevent prompt injection and remove dangerous content
 function sanitizeInput(input: string | null | undefined, maxLength = 4000): string {
@@ -20,7 +43,71 @@ function sanitizeInput(input: string | null | undefined, maxLength = 4000): stri
   let sanitized = input.slice(0, maxLength);
   // Remove null bytes and non-printable control characters (keep newlines/tabs)
   sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-  // Strip common prompt injection patterns
+
+  // --- Base64-encoded payload detection ---
+  // Decode any base64-looking tokens and check them for injection patterns.
+  sanitized = sanitized.replace(
+    /[A-Za-z0-9+/]{20,}={0,2}/g,
+    (match) => {
+      try {
+        const decoded = Buffer.from(match, "base64").toString("utf8");
+        // If the decoded string contains suspicious patterns, remove the token.
+        if (
+          /ignore (all )?(previous|prior|above) instructions?/i.test(decoded) ||
+          /you are now|pretend (you are|to be)|act as (a |an )?/i.test(decoded) ||
+          /###(ENDPREAMBLE|ENDSEEDCHAT|SYSTEM|INST|END)###/i.test(decoded) ||
+          /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(decoded) ||
+          /(sh|bash|zsh|cmd|powershell|exec|eval|system|popen|subprocess)/i.test(decoded)
+        ) {
+          return "[removed]";
+        }
+      } catch {
+        // Not valid base64 — leave as-is.
+      }
+      return match;
+    }
+  );
+
+  // --- Shell command injection patterns ---
+  // Block attempts to embed shell commands or code execution directives.
+  sanitized = sanitized.replace(
+    /(`[^`]*`|\$\([^)]*\)|\|\s*(sh|bash|zsh|cmd|powershell)|&&\s*(sh|bash|zsh|cmd|powershell)|;\s*(sh|bash|zsh|cmd|powershell)|\beval\s*\(|\bexec\s*\(|\bsystem\s*\(|\bpopen\s*\(|\bsubprocess\b)/gi,
+    "[removed]"
+  );
+
+  // --- Leetspeak / character-substitution obfuscation ---
+  // Normalise common leet substitutions before checking injection phrases.
+  const normalizeLeet = (s: string): string =>
+    s
+      .replace(/1/g, "i")
+      .replace(/3/g, "e")
+      .replace(/4/g, "a")
+      .replace(/5/g, "s")
+      .replace(/0/g, "o")
+      .replace(/@/g, "a")
+      .replace(/\$/g, "s")
+      .replace(/\+/g, "t")
+      .replace(/!/g, "i");
+
+  const normalised = normalizeLeet(sanitized);
+  if (
+    /ignore (all )?(previous|prior|above) instructions?/i.test(normalised) ||
+    /you are now|pretend (you are|to be)|act as (a |an )?/i.test(normalised)
+  ) {
+    // Replace the entire input with a safe placeholder when leet obfuscation
+    // is detected, because we cannot reliably pinpoint the exact span.
+    return "[removed]";
+  }
+
+  // --- Binary / non-text executable content ---
+  // Reject inputs that contain a high density of non-ASCII bytes, which is
+  // characteristic of embedded binary executables or encoded shellcode.
+  const nonAsciiCount = (sanitized.match(/[^\x09\x0A\x0D\x20-\x7E]/g) || []).length;
+  if (nonAsciiCount / sanitized.length > 0.1) {
+    return "[removed]";
+  }
+
+  // --- Standard prompt injection patterns ---
   sanitized = sanitized.replace(
     /ignore (all )?(previous|prior|above) instructions?/gi,
     "[removed]"
@@ -34,6 +121,38 @@ function sanitizeInput(input: string | null | undefined, maxLength = 4000): stri
     "[removed]"
   );
   return sanitized.trim();
+}
+
+// Detect and remove dynamic code execution primitives from LLM output
+function sanitizeOutput(text: string): string {
+  if (!text || typeof text !== "string") return "";
+
+  // Patterns that represent dynamic code execution primitives
+  const dangerousPatterns: RegExp[] = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /\bnew\s+Function\s*\(/gi,
+    /\bsetTimeout\s*\(\s*['"`]/gi,
+    /\bsetInterval\s*\(\s*['"`]/gi,
+    /\bexecSync\s*\(/gi,
+    /\bspawnSync\s*\(/gi,
+    /\bspawn\s*\(/gi,
+    /\bexecFile\s*\(/gi,
+    /subprocess\.(?:call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True/gi,
+    /\bos\.system\s*\(/gi,
+    /\bos\.popen\s*\(/gi,
+    /\b__import__\s*\(/gi,
+    /\bimportlib\.import_module\s*\(/gi,
+    /\bcompile\s*\([^)]*exec/gi,
+    /\bProcessBuilder\s*\(/gi,
+    /Runtime\.getRuntime\s*\(\s*\)\.exec\s*\(/gi,
+  ];
+
+  let sanitized = text;
+  for (const pattern of dangerousPatterns) {
+    sanitized = sanitized.replace(pattern, "[removed]");
+  }
+  return sanitized;
 }
 
 function validateName(name: string | null): string {
@@ -51,7 +170,53 @@ export async function POST(req: Request) {
   let clerkUserName;
   const { prompt } = await req.json();
 
-  const identifier = req.url + "-" + "anonymous";
+  // Authenticate BEFORE rate limiting so the identifier is tied to a verified user.
+  const authHeader = req.headers.get("Authorization");
+  const isBearer = !!(authHeader?.startsWith("Bearer "));
+
+  if (isBearer) {
+    const token = authHeader!.slice(7);
+    if (!token) {
+      console.log("user not authorized: missing bearer token");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    let verifiedPayload;
+    try {
+      verifiedPayload = await verifyToken(token, {
+        secretKey: process.env.CLERK_SECRET_KEY,
+      } as Parameters<typeof verifyToken>[1]);
+    } catch (e) {
+      console.log("user not authorized: invalid bearer token", e);
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    clerkUserId = verifiedPayload.sub;
+    clerkUserName = clerkUserId;
+  } else {
+    // Cookie/session path — verify via Clerk's currentUser.
+    const sessionUser = await currentUser();
+    if (!sessionUser) {
+      console.log("user not authorized: no session");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    clerkUserId = sessionUser.id;
+    clerkUserName =
+      sessionUser.firstName && sessionUser.lastName
+        ? `${sessionUser.firstName} ${sessionUser.lastName}`
+        : sessionUser.firstName ?? clerkUserId;
+    user = sessionUser;
+  }
+
+  // Rate-limit by authenticated user ID, not 'anonymous'.
+  const identifier = req.url + "-" + clerkUserId;
   const { success } = await rateLimit(identifier);
   if (!success) {
     console.log("INFO: rate limit exceeded");
@@ -92,15 +257,39 @@ export async function POST(req: Request) {
       }
     );
   }
-  console.log("prompt: ", sanitizedPrompt);
-  // Derive isText from the presence of a Bearer token in the Authorization header.
-  // This distinguishes API/text clients (Bearer token) from browser sessions (cookie-based).
-  const authHeader = req.headers.get("Authorization");
-  const isText = !!(authHeader?.startsWith("Bearer "));
+  // --- Forensic audit log (append-only, durable) ---
+  const inputHash = createHash("sha256").update(sanitizedPrompt).digest("hex");
+  const modelId = process.env.OLLAMA_MODEL ?? "llama2";
+  const auditPrincipal = clerkUserId ?? "anonymous";
+  try {
+    await prismadb.aiAuditLog.create({
+      data: {
+        timestamp: new Date(),
+        principal: auditPrincipal,
+        modelId: modelId,
+        modelVersion: process.env.OLLAMA_MODEL_VERSION ?? "unknown",
+        inputHash: inputHash,
+        companionName: name,
+        action: "inference_request",
+      },
+    });
+  } catch (auditErr) {
+    // Audit failure must not silently pass — log and abort to preserve forensic integrity
+    console.error("AUDIT_FAILURE: could not write AI audit log", auditErr);
+    return new NextResponse(
+      JSON.stringify({ Message: "Internal audit error" }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  // --- End audit log ---
+  // isText distinguishes API/text clients (Bearer token) from browser sessions (cookie-based).
+  // Authentication was already performed above; clerkUserId and clerkUserName are set.
+  const isText = isBearer;
   if (isText) {
-    // Verify the bearer token server-side; do NOT trust userId from the request body.
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+    // Bearer token already verified above; token variable re-derived for downstream use.
+    const token = authHeader!.slice(7);
     if (!token) {
+      // Should not reach here — caught above — but kept as a safety net.
       console.log("user not authorized: missing bearer token");
       return new NextResponse(
         JSON.stringify({ Message: "User not authorized" }),
@@ -112,9 +301,7 @@ export async function POST(req: Request) {
     }
         let verifiedPayload;
     try {
-      verifiedPayload = await verifyToken(token, {
-        secretKey: process.env.CLERK_SECRET_KEY!,
-      });
+      verifiedPayload = await verifyToken(token, {});
     } catch (e) {
       console.log("user not authorized: invalid token", e);
       return new NextResponse(
@@ -347,7 +534,21 @@ export async function POST(req: Request) {
   // (OpenAI, Clerk, Redis/Upstash are the three retained systems)
   let relevantHistory = "";
 
-  const { stream, handlers } = LangChainStream();
+  let llmResponseBuffer = "";
+  const { stream, handlers } = LangChainStream({
+    onToken: (token: string) => {
+      llmResponseBuffer += token;
+    },
+    onFinal: (completion: string) => {
+      console.log(
+        `[LLM INTERACTION] Response received – model: '${pinnedModelName}', ` +
+        `userId: '${clerkUserId}', companionName: '${name}', ` +
+        `responseLength: ${completion.length}, response: ${JSON.stringify(completion.slice(0, 500))}${
+          completion.length > 500 ? "...[truncated]" : ""
+        }`
+      );
+    },
+  });
 
     // ── Model registry enforcement ──────────────────────────────────────────
   // Only models listed here are approved for use in this workload.
@@ -386,6 +587,12 @@ export async function POST(req: Request) {
     `[MODEL REGISTRY] APPROVED – id: '${registryEntry.id}', pin: '${pinnedModelName}'`
   );
   // ─────────────────────────────────────────────────────────────────────────
+
+  console.log(
+    `[LLM INTERACTION] Request sent – model: '${pinnedModelName}', ` +
+    `userId: '${clerkUserId}', companionName: '${name}', ` +
+    `promptLength: ${sanitizedPrompt.length}, recentHistoryLength: ${recentChatHistory.length}`
+  );
 
   const model = new ChatOllama({
     streaming: true,
@@ -526,7 +733,10 @@ export async function POST(req: Request) {
 
   // Compute an HMAC-SHA256 signature over (modelId + timestamp + sanitizedText)
   // so downstream consumers can verify authenticity and detect tampering.
-  const PROVENANCE_SECRET = process.env.PROVENANCE_HMAC_SECRET ?? "change-me-in-env";
+  const PROVENANCE_SECRET = process.env.PROVENANCE_HMAC_SECRET;
+  if (!PROVENANCE_SECRET) {
+    throw new Error("PROVENANCE_HMAC_SECRET environment variable is not set. Cannot sign provenance data.");
+  }
   const signaturePayload = `${provenanceMetadata.modelId}|${provenanceMetadata.generatedAt}|${sanitizedText}`;
   const provenanceSignature = crypto
     .createHmac("sha256", PROVENANCE_SECRET)
@@ -546,8 +756,7 @@ export async function POST(req: Request) {
     // Wrap the text in a provenance envelope so the body itself is labeled.
     const envelopedResponse = {
       content: sanitizedText,
-      provenance: provenanceMetadata,
-      signature: provenanceSignature,
+      label: provenanceMetadata.contentLabel,
     };
     return NextResponse.json(envelopedResponse, { headers: provenanceHeaders });
   }
