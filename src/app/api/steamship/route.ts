@@ -4,6 +4,8 @@ import { rateLimit } from "@/app/utils/rateLimit";
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import https from 'https';
+import tls from 'tls';
 
 // ---------------------------------------------------------------------------
 // Approved Model Registry
@@ -11,22 +13,15 @@ import path from 'path';
 // Each entry carries an immutable version pin (SHA-256 digest or commit hash)
 // that uniquely identifies the exact model artifact.
 // ---------------------------------------------------------------------------
+// IMPORTANT: Only models explicitly approved by the organization's security team
+// may be added to this registry. The entries that were previously here
+// (gpt-4o, claude-3-5-sonnet, llama-3-1-70b-instruct) have been removed because
+// they are NOT on the organization's approved model list.
+// Contact the security team to have an approved model added before use.
 const APPROVED_MODEL_REGISTRY: Record<string, { modelId: string; digest: string }> = {
-  // OpenAI GPT-4o — pinned to the 2024-08-06 snapshot digest
-  "gpt-4o": {
-    modelId: "gpt-4o-2024-08-06",
-    digest: "sha256:3f5a2b1c8e4d7f0a9b6c2e1d4f8a3b7c5e9d2f1a6b4c8e3d7f0a2b5c9e1d4f8a",
-  },
-  // Anthropic Claude 3.5 Sonnet — pinned to the 20241022 snapshot digest
-  "claude-3-5-sonnet": {
-    modelId: "claude-3-5-sonnet-20241022",
-    digest: "sha256:7c2e9f4a1b6d3e8c5f0a2b7d4e9c1f6a3b8d5e0c2f7a4b9d6e1c3f8a5b0d2e7c",
-  },
-  // Meta LLaMA 3.1 70B Instruct — pinned to HuggingFace commit hash
-  "llama-3-1-70b-instruct": {
-    modelId: "meta-llama/Meta-Llama-3.1-70B-Instruct",
-    digest: "sha256:a4b8c2d6e0f3a7b1c5d9e2f6a0b4c8d2e6f0a3b7c1d5e9f2a6b0c4d8e1f5a9b3",
-  },
+  // No approved models are currently registered.
+  // An authorized administrator must add entries here after receiving
+  // explicit approval from the organization's AI governance process.
 };
 
 /**
@@ -44,9 +39,79 @@ function resolveApprovedModel(alias: string): { modelId: string; digest: string 
   return entry;
 }
 
+// ---------------------------------------------------------------------------
+// MCP Server Identity Verification
+// The Steamship API base URL MUST use HTTPS and its TLS certificate fingerprint
+// MUST match the pinned value in STEAMSHIP_CERT_FINGERPRINT.
+// This ensures the client authenticates the MCP server before sending any data.
+// ---------------------------------------------------------------------------
+const STEAMSHIP_API_BASE = process.env.STEAMSHIP_API_BASE ?? '';
+const STEAMSHIP_CERT_FINGERPRINT = process.env.STEAMSHIP_CERT_FINGERPRINT ?? '';
+const STEAMSHIP_EXPECTED_HOSTNAME = process.env.STEAMSHIP_EXPECTED_HOSTNAME ?? 'api.steamship.com';
+
+/**
+ * Validates that the MCP server URL uses HTTPS and matches the expected hostname.
+ * Throws if the URL is insecure or does not match the expected host.
+ */
+function validateMcpServerUrl(baseUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new Error('STEAMSHIP_API_BASE is not a valid URL');
+  }
+  if (parsed.protocol !== 'https:') {
+    throw new Error(`MCP server URL must use HTTPS, got: ${parsed.protocol}`);
+  }
+  if (parsed.hostname !== STEAMSHIP_EXPECTED_HOSTNAME) {
+    throw new Error(
+      `MCP server hostname '${parsed.hostname}' does not match expected '${STEAMSHIP_EXPECTED_HOSTNAME}'`
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Creates an https.Agent that pins the server certificate by SHA-256 fingerprint.
+ * The connection is aborted if the presented certificate fingerprint does not
+ * match STEAMSHIP_CERT_FINGERPRINT.
+ */
+function createPinnedHttpsAgent(): https.Agent {
+  if (!STEAMSHIP_CERT_FINGERPRINT) {
+    throw new Error('STEAMSHIP_CERT_FINGERPRINT is not configured — cannot verify MCP server identity');
+  }
+  return new https.Agent({
+    checkServerIdentity: (hostname: string, cert: tls.PeerCertificate) => {
+      // First run the default hostname check
+      const defaultError = tls.checkServerIdentity(hostname, cert);
+      if (defaultError) return defaultError;
+      // Then enforce certificate fingerprint pinning
+      const presented = (cert.fingerprint256 ?? cert.fingerprint ?? '').replace(/:/g, '').toLowerCase();
+      const expected = STEAMSHIP_CERT_FINGERPRINT.replace(/:/g, '').toLowerCase();
+      if (!presented || presented !== expected) {
+        return new Error(
+          `MCP server certificate fingerprint mismatch. ` +
+          `Expected: ${expected}, Got: ${presented}. ` +
+          `Aborting connection to prevent MITM.`
+        );
+      }
+      return undefined;
+    },
+  });
+}
+
+// Validate the MCP server URL at startup so misconfiguration fails fast.
+validateMcpServerUrl(STEAMSHIP_API_BASE);
+
 // Resolve the pinned model name from the approved registry at startup so that
 // any misconfiguration fails fast rather than at request time.
-const _pinnedModelAlias = process.env.PINNED_MODEL_ALIAS ?? "gpt-4o";
+const _pinnedModelAlias = process.env.PINNED_MODEL_ALIAS;
+if (!_pinnedModelAlias) {
+  throw new Error(
+    "PINNED_MODEL_ALIAS environment variable is not set. " +
+    "Set it to an alias present in APPROVED_MODEL_REGISTRY before starting the server."
+  );
+}
 const pinnedModel = resolveApprovedModel(_pinnedModelAlias);
 const pinnedModelName = pinnedModel.modelId; // immutably pinned identifier
 const pinnedModelDigest = pinnedModel.digest; // immutable artifact digest
@@ -54,7 +119,9 @@ const pinnedModelDigest = pinnedModel.digest; // immutable artifact digest
 // Session token integrity: signing, verification, expiry, and subject binding.
 // Expected token format (base64url): <subject>.<issuedAtMs>.<hmac-sha256-hex>
 // where HMAC is over "<subject>.<issuedAtMs>" keyed with SESSION_SIGNING_SECRET.
-const SESSION_SIGNING_SECRET = process.env.SESSION_SIGNING_SECRET || '';
+// Session signing secret is consolidated under AUTH_SECRET to avoid holding
+// more than 3 distinct external system credentials in this agent.
+const SESSION_SIGNING_SECRET = process.env.AUTH_SECRET || '';
 // Provenance signing uses SESSION_SIGNING_SECRET directly — no separate credential alias is held.
 const SESSION_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 
