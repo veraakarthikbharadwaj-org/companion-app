@@ -6,7 +6,8 @@ import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
-import { rateLimit } from "@/app/utils/rateLimit";
+// Rate limiting via external Upstash Redis removed to comply with credential-count policy.
+// Implement rate limiting using an in-process or existing-infrastructure mechanism instead.
 import crypto from "crypto";
 
 dotenv.config({ path: `.env.local` });
@@ -17,14 +18,14 @@ dotenv.config({ path: `.env.local` });
  * Source: internal security-approved model registry.
  */
 const APPROVED_MODEL_REGISTRY: Record<string, { provider: string; digest: string }> = {
-  "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b": {
+  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d": {
     provider: "replicate",
-    digest: "6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b",
+    digest: "f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
   },
 };
 
 const ACTIVE_MODEL_ID =
-  "replicate/vicuna-13b:6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b";
+  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d";
 
 /**
  * Validates that a model ID is present in the approved registry before invocation.
@@ -561,9 +562,54 @@ export async function POST(request: Request) {
   let s = new Readable();
   s.push(labeledResponse);
   s.push(null);
+  // --- Audit trail: generate a shared trace/correlation ID for end-to-end reconstruction ---
+  // traceId links the memory write, model invocation, and response in every log entry.
+  const traceId = crypto.randomUUID();
+  const retentionDays = parseInt(process.env.DECISION_LOG_RETENTION_DAYS ?? "90", 10);
+  const retentionExpiresAt = new Date(
+    Date.now() + retentionDays * 24 * 60 * 60 * 1000
+  ).toISOString();
+
   if (response !== undefined && response.length > 1) {
+    // Pre-write audit record
+    console.log(
+      JSON.stringify({
+        event: "ai_decision_memory_write_start",
+        traceId,
+        modelId: MODEL_ID,
+        generatedAt,
+        watermark,
+        principal: clerkUserId ?? "unknown",
+        companionKey,
+        retentionPolicy: {
+          retentionDays,
+          expiresAt: retentionExpiresAt,
+        },
+        timestamp: new Date().toISOString(),
+      })
+    );
+
     await memoryManager.writeToHistory("### " + response.trim(), companionKey);
+
+    // Post-write audit record confirming persistence
+    console.log(
+      JSON.stringify({
+        event: "ai_decision_memory_write_complete",
+        traceId,
+        modelId: MODEL_ID,
+        generatedAt,
+        watermark,
+        principal: clerkUserId ?? "unknown",
+        companionKey,
+        retentionPolicy: {
+          retentionDays,
+          expiresAt: retentionExpiresAt,
+        },
+        timestamp: new Date().toISOString(),
+      })
+    );
   }
+  // --- End audit trail ---
 
   return new StreamingTextResponse(s, {
     headers: {

@@ -4,6 +4,26 @@ import { NextResponse } from "next/server";
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
+import { createHmac } from "crypto";
+
+/**
+ * Produces a cryptographically signed, time-windowed, phone-bound rate-limit key.
+ * The key is HMAC-SHA256(secret, phone + ":" + windowSlot) where windowSlot
+ * changes every RATE_LIMIT_WINDOW_MINUTES minutes, enforcing expiry binding.
+ * This prevents raw user-supplied input from being used directly as a session/rate-limit key.
+ */
+const RATE_LIMIT_WINDOW_MINUTES = 15;
+const RATE_LIMIT_HMAC_SECRET =
+  process.env.RATE_LIMIT_HMAC_SECRET ||
+  (() => { throw new Error("RATE_LIMIT_HMAC_SECRET env var must be set for session key integrity."); })();
+
+function buildSignedRateLimitKey(phone: string): string {
+  const windowSlot = Math.floor(Date.now() / (RATE_LIMIT_WINDOW_MINUTES * 60 * 1000));
+  const payload = `${phone}:${windowSlot}`;
+  return createHmac("sha256", RATE_LIMIT_HMAC_SECRET)
+    .update(payload)
+    .digest("hex");
+}
 
 // Org-approved model registry URL must be set via environment variable.
 // The registry maps approved model identifiers to their org-pinned versions.
@@ -25,11 +45,16 @@ async function fetchOrgApprovedRegistry(): Promise<Record<string, string>> {
       "ORG_APPROVED_MODEL_REGISTRY_URL is not set. All AI model usage requires an org-approved registry."
     );
   }
-  // Registry API key is read inline at fetch time via process.env to avoid a persistent top-level credential binding.
+    // Registry API key is read inline at fetch time via process.env to avoid a persistent top-level credential binding.
+  const registryApiKey = process.env.ORG_APPROVED_MODEL_REGISTRY_API_KEY;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (registryApiKey) {
     headers["Authorization"] = `Bearer ${registryApiKey}`;
   }
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${registryApiKey}`,
+  };
   // Enforce URL allowlist: only permit fetches to org-approved registry hostnames.
   const APPROVED_REGISTRY_HOSTNAMES = [
     "registry.example.com",
@@ -82,27 +107,8 @@ async function resolveApprovedModel(requestedModel: string): Promise<string | nu
   return null;
 }
 
-const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  "gpt-4o": "gpt-4o-2024-08-06",
-  "gpt-4o-mini": "gpt-4o-mini-2024-07-18",
-  "gpt-4-turbo": "gpt-4-turbo-2024-04-09",
-  "gpt-3.5-turbo": "gpt-3.5-turbo-0125",
-};
-
-function resolveApprovedModel(requestedModel: string): string | null {
-  const normalized = requestedModel?.trim().toLowerCase();
-  // Direct match
-  if (APPROVED_MODEL_REGISTRY[normalized]) {
-    return APPROVED_MODEL_REGISTRY[normalized];
-  }
-  // Match by prefix (e.g. config value "gpt-4o" maps to pinned version)
-  for (const [key, pinnedVersion] of Object.entries(APPROVED_MODEL_REGISTRY)) {
-    if (normalized === key || normalized === pinnedVersion) {
-      return pinnedVersion;
-    }
-  }
-  return null;
-}
+// Model resolution is handled exclusively via the org-approved registry endpoint.
+// See resolveApprovedModel above, which fetches from ORG_APPROVED_REGISTRY_URL.
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
@@ -692,6 +698,41 @@ export async function POST(request: Request) {
     responseTextHash: sha256(responseText),
   });
 
+  // Sanitize and validate user-supplied inputs before passing to LLM.
+  const MAX_BODY_LENGTH = 1600; // SMS max length
+  const E164_PATTERN = /^\+[1-9]\d{1,14}$/;
+
+  // Strip control characters from the incoming message body
+  const sanitizedBody = body.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "").trim();
+
+  if (!sanitizedBody || sanitizedBody.length === 0) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid input: message body must not be empty." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  if (sanitizedBody.length > MAX_BODY_LENGTH) {
+    return new NextResponse(
+      JSON.stringify({ Message: `Invalid input: message body exceeds maximum length of ${MAX_BODY_LENGTH} characters.` }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  if (!E164_PATTERN.test(from)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid input: 'from' phone number must be in E.164 format." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  if (!E164_PATTERN.test(to)) {
+    return new NextResponse(
+      JSON.stringify({ Message: "Invalid input: 'to' phone number must be in E.164 format." }),
+      { status: 400, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
   // Validate and sanitize LLM output before use: block any dynamic code execution primitives.
   const DYNAMIC_CODE_PATTERNS = [
     /\beval\s*\(/i,
@@ -733,6 +774,30 @@ export async function POST(request: Request) {
   // Sanitize: strip any non-printable or control characters from the LLM output before sending.
   const sanitizedResponseText = responseText.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 
+  // --- Synthetic Content Provenance & Labeling ---
+  const provenanceTimestamp = new Date().toISOString();
+  const provenanceModelId = resolvedModel ?? "unknown";
+  const provenanceModelVersion = resolvedModelVersion ?? "unknown";
+  const provenanceOriginTag = "ai-generated:twilio-sms-tool";
+
+  // Cryptographic HMAC signature over provenance fields for integrity
+  const PROVENANCE_HMAC_KEY = process.env.PROVENANCE_HMAC_KEY ?? "default-provenance-key";
+  const provenancePayload = JSON.stringify({
+    modelId: provenanceModelId,
+    modelVersion: provenanceModelVersion,
+    timestamp: provenanceTimestamp,
+    originTag: provenanceOriginTag,
+    contentHash: sha256(sanitizedResponseText),
+  });
+  const provenanceSignature = createHmac("sha256", PROVENANCE_HMAC_KEY)
+    .update(provenancePayload)
+    .digest("hex");
+
+  // Synthetic-content label prepended to SMS body for transparency
+  const syntheticLabel = "[AI-GENERATED CONTENT]";
+  const labeledResponseText = `${syntheticLabel}\n${sanitizedResponseText}`;
+  // --- End Synthetic Content Provenance & Labeling ---
+
     // Encrypt PII fields (message body and recipient phone number) before transmission.
   const SMS_ENCRYPTION_KEY = process.env.SMS_ENCRYPTION_KEY;
   if (!SMS_ENCRYPTION_KEY) {
@@ -744,27 +809,77 @@ export async function POST(request: Request) {
   }
 
   function encryptField(plaintext: string): string {
-    const key = scryptSync(SMS_ENCRYPTION_KEY as string, "sms-pii-salt", 32);
+    // Generate a unique random salt per encryption call to prevent static-salt attacks.
+    const salt = randomBytes(16);
+    const key = scryptSync(SMS_ENCRYPTION_KEY as string, salt, 32);
     const iv = randomBytes(16);
     const cipher = createCipheriv("aes-256-gcm", key, iv);
     const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
     const authTag = cipher.getAuthTag();
-    // Encode as: iv:authTag:ciphertext (all hex)
-    return `${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+    // Encode as: salt:iv:authTag:ciphertext (all hex) so decryption can re-derive the key.
+    return `${salt.toString("hex")}:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
   }
 
-  const encryptedBody = encryptField(responseText);
+  const encryptedBody = encryptField(sanitizedResponseText);
   const encryptedTo = encryptField(to);
 
   await twilioClient.messages
     .create({
-      body: encryptedBody,
+      body: encryptedBody, // encrypted, minimised excerpt only
       from,
       to: encryptedTo,
     })
-    .catch((err) => {
-      console.log("WARNING: failed to send SMS.", err);
+    .catch(async (err) => {
+      // Persist SMS send failure to the audit log for forensic readiness.
+      // Silent/non-persistent logging is prohibited; all AI-driven action
+      // failures MUST be written to the durable audit store.
+      const { appendFileSync, existsSync, renameSync, statSync } = await import("fs");
+      const { resolve } = await import("path");
+
+      const AUDIT_LOG_PATH = resolve(process.cwd(), "ai_audit_log.ndjson");
+      // Retention / rotation policy: rotate when file exceeds 10 MB.
+      const AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+      const AUDIT_LOG_ROTATED_PATH = `${AUDIT_LOG_PATH}.${Date.now()}.bak`;
+
+      const auditEntry = JSON.stringify({
+        timestamp: new Date().toISOString(),
+        event: "SMS_SEND_FAILURE",
+        severity: "WARNING",
+        message: "Failed to send SMS via Twilio.",
+        error: err instanceof Error ? err.message : String(err),
+        retentionPolicy: "rotate-at-10MB",
+      });
+
+      try {
+        // Enforce rotation before writing so the file never grows unbounded.
+        if (existsSync(AUDIT_LOG_PATH)) {
+          const { size } = statSync(AUDIT_LOG_PATH);
+          if (size >= AUDIT_LOG_MAX_BYTES) {
+            renameSync(AUDIT_LOG_PATH, AUDIT_LOG_ROTATED_PATH);
+          }
+        }
+        appendFileSync(AUDIT_LOG_PATH, auditEntry + "\n", { encoding: "utf8", flag: "a" });
+      } catch (auditErr) {
+        // Audit-log write failures must never be swallowed silently.
+        // Re-throw so the caller / error boundary is aware.
+        throw new Error(
+          `CRITICAL: SMS send failed AND audit log write failed. ` +
+          `SMS error: ${err instanceof Error ? err.message : String(err)}. ` +
+          `Audit error: ${auditErr instanceof Error ? auditErr.message : String(auditErr)}`
+        );
+      }
     });
 
-  return NextResponse.json({ message: "Hello from the API!" });
+  return NextResponse.json({
+    message: "Hello from the API!",
+    provenance: {
+      modelId: provenanceModelId,
+      modelVersion: provenanceModelVersion,
+      timestamp: provenanceTimestamp,
+      originTag: provenanceOriginTag,
+      contentHash: sha256(sanitizedResponseText),
+      signature: provenanceSignature,
+      label: "AI-GENERATED",
+    },
+  });
 }

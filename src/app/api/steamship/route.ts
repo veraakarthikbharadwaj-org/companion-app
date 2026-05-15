@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import { currentUser } from "@clerk/nextjs";
 import { rateLimit } from "@/app/utils/rateLimit";
-import crypto from 'crypto'
+import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 
 // Session token integrity: signing, verification, expiry, and subject binding.
 // Expected token format (base64url): <subject>.<issuedAtMs>.<hmac-sha256-hex>
@@ -62,6 +64,44 @@ function validateSessionToken(token: string, expectedSubject: string): void {
 /** HMAC-SHA256 hex digest for audit record integrity (replaces MD5). */
 function auditHash(value: string): string {
   return hmacSha256Hex(value, SESSION_SIGNING_SECRET || 'audit-fallback');
+}
+
+/**
+ * Persistent append-only audit logger.
+ *
+ * Retention policy:
+ *   - Log file: AUDIT_LOG_PATH env var, default <cwd>/logs/ai_audit.log
+ *   - Rotation:  When the file exceeds AUDIT_LOG_MAX_BYTES (default 10 MiB) it is
+ *               renamed to ai_audit.log.<ISO-timestamp> and a new file is started.
+ *   - Retention: Operators MUST configure an external log-shipper (e.g. Fluentd,
+ *               CloudWatch agent) to forward rotated files to an immutable store
+ *               and apply a minimum 90-day retention policy per compliance requirements.
+ */
+const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH
+  ? path.resolve(process.env.AUDIT_LOG_PATH)
+  : path.join(process.cwd(), 'logs', 'ai_audit.log');
+const AUDIT_LOG_MAX_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES || String(10 * 1024 * 1024), 10);
+
+function writeAuditRecord(record: Record<string, unknown>): void {
+  try {
+    const dir = path.dirname(AUDIT_LOG_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Rotate if the current log file exceeds the size threshold.
+    if (fs.existsSync(AUDIT_LOG_PATH)) {
+      const { size } = fs.statSync(AUDIT_LOG_PATH);
+      if (size >= AUDIT_LOG_MAX_BYTES) {
+        const rotated = `${AUDIT_LOG_PATH}.${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        fs.renameSync(AUDIT_LOG_PATH, rotated);
+      }
+    }
+    // Append a single JSON line (NDJSON) to the audit log.
+    fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(record) + '\n', { encoding: 'utf8', flag: 'a' });
+  } catch (err) {
+    // Fall back to stderr so the request is never blocked by a logging failure,
+    // but surface the error so operators can detect misconfiguration.
+    console.error('[AUDIT] Failed to write audit record to persistent log:', err);
+    console.error('[AUDIT] Record:', JSON.stringify(record));
+  }
 }
 import ConfigManager from "@/app/utils/config";
 
@@ -722,19 +762,43 @@ export async function POST(req: Request) {
       .update(provenancePayload)
       .digest("hex");
 
-        // Log provenance metadata internally for audit purposes only — do not expose to clients.
-    console.log(JSON.stringify({
+        // Log provenance metadata to the persistent append-only audit log.
+        // inputHash binds the exact user input to this decision record for forensic traceability.
+    const inputHash = auditHash(typeof userMessage === 'string' ? userMessage : JSON.stringify(userMessage));
+    const principal = user?.id ?? 'anonymous';
+    writeAuditRecord({
       _provenance: {
         label: "AI_GENERATED_CONTENT",
+        principal,
+        inputHash,
         modelId: provenanceModelId,
         modelDigest: provenanceModelDigest,
         timestamp: provenanceTimestamp,
         origin: provenanceOrigin,
         signature: provenanceSignature,
       },
-    }));
+    });
 
-    return NextResponse.json({ content: responseBlocks });
+    // Validate sanitized output for dynamic code execution primitives before returning
+    const FORBIDDEN_PATTERNS = [
+      /\beval\s*\(/i,
+      /\bexec\s*\(/i,
+      /\bnew\s+Function\s*\(/i,
+      /\bsetTimeout\s*\(\s*['"`]/i,
+      /\bsetInterval\s*\(\s*['"`]/i,
+      /\bimportScripts\s*\(/i,
+      /\bdocument\.write\s*\(/i,
+      /\bInlineScript\b/i,
+    ];
+    const sanitizedString = JSON.stringify(sanitizedResponseBlocks);
+    for (const pattern of FORBIDDEN_PATTERNS) {
+      if (pattern.test(sanitizedString)) {
+        console.error("LLM output rejected: forbidden dynamic code execution primitive detected.", { pattern: pattern.toString() });
+        return returnError(400, "Response contained disallowed content and was rejected.");
+      }
+    }
+
+    return NextResponse.json({ content: sanitizedResponseBlocks });
   } else {
     console.error("Agent request failed:", await response.text());
     return returnError(500, "An internal error occurred. Please try again later.");

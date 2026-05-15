@@ -26,12 +26,11 @@ const AI_CONTENT_GENERATED_AT: string = new Date().toISOString();
 
 /** Approved model registry allow-list (registry prefix → human label). */
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-    "registry.openai.com": "OpenAI Model Registry",
-    "registry.anthropic.com": "Anthropic Model Registry",
+    "registry.internal.org": "Internal Approved Model Registry",
 };
 
 /** Pinned, fully-qualified model identifier referencing the approved registry. */
-const AI_MODEL_ID: string = "registry.openai.com/gpt/gpt-4o@2024-08-06";
+const AI_MODEL_ID: string = "registry.internal.org/approved-model/v1@1.0.0";
 
 /**
  * SHA-256 digest of the model card published at the registry URL above.
@@ -39,7 +38,7 @@ const AI_MODEL_ID: string = "registry.openai.com/gpt/gpt-4o@2024-08-06";
  * Obtain the digest from the registry's published integrity manifest.
  */
 const AI_MODEL_DIGEST: string =
-    "sha256:4b9a2f1e8c3d7a6b0e5f2c9d1a8b4e7f3c6d9a2b5e8f1c4d7a0b3e6f9c2d5a8b";
+    "sha256:REPLACE_WITH_DIGEST_FROM_APPROVED_REGISTRY_INTEGRITY_MANIFEST";
 
 /** Registry source label derived from the pinned model ID. */
 const AI_MODEL_REGISTRY_LABEL: string = (() => {

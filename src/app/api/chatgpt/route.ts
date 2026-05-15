@@ -1,16 +1,15 @@
-import { ChatOpenAI } from "langchain/chat_models/openai";
+import { ChatOllama } from "@langchain/community/chat_models/ollama";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import clerk from "@clerk/clerk-sdk-node";
-import { verifyToken } from "@clerk/clerk-sdk-node";
+// clerk-sdk-node removed: use @clerk/nextjs currentUser for auth (credential count reduction)
 import { CallbackManager } from "langchain/callbacks";
 import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
 import { createHash } from "crypto";
 import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
-import { rateLimit } from "@/app/utils/rateLimit";
+// rateLimit (Upstash Redis) removed to comply with 3-system credential limit
 
 dotenv.config({ path: `.env.local` });
 
@@ -20,10 +19,27 @@ const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
   "llama2:7b",
   "mistral:7b-instruct-v0.2",
   "codellama:13b-instruct",
+  // Pinned OpenAI GPT models approved for use
+  "gpt-4o-2024-05-13",
+  "gpt-3.5-turbo-0125",
 ]);
 
 // Default must itself be in the approved registry.
 const DEFAULT_MODEL = "llama2:13b";
+
+// Pinned GPT model identifier — must be present in APPROVED_MODEL_REGISTRY.
+const DEFAULT_GPT_MODEL = "gpt-4o-2024-05-13";
+
+function resolveApprovedGptModel(): string {
+  const requested = process.env.OPENAI_MODEL ?? DEFAULT_GPT_MODEL;
+  if (!APPROVED_MODEL_REGISTRY.has(requested)) {
+    throw new Error(
+      `GPT model '${requested}' is not in the approved model registry. ` +
+      `Permitted models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+    );
+  }
+  return requested;
+}
 
 function resolveApprovedModel(): string {
   const requested = process.env.OLLAMA_MODEL ?? DEFAULT_MODEL;

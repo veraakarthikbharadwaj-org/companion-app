@@ -8,35 +8,84 @@ import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
 
 var last_name = "";
 
+// Computes a SHA-256 hex digest of the given string for audit input hashing.
+async function sha256Hex(input: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(input);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Posts an AI decision audit record to the persistent audit store.
+async function writeAuditRecord(record: {
+  eventType: "ai_inference_request" | "ai_inference_response";
+  modelId: string;
+  modelVersion: string;
+  inputHash: string;
+  output: string | null;
+  timestamp: string;
+  principal: string;
+  sessionId?: string;
+}): Promise<void> {
+  try {
+    await fetch("/api/audit/ai-decision", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(record),
+    });
+  } catch (err) {
+    // Audit failures must not silently disappear — log to console as fallback.
+    console.error("[AUDIT] Failed to write AI decision audit record:", err, record);
+  }
+}
+
 // Approved model registry — entries MUST exist in the org's component registry.
 // gpt-4, gpt-3.5-turbo, and claude-3 were removed because they are NOT_IN_REGISTRY.
 // Populate this map only with model IDs that have been approved and registered in
 // the organization's component registry before deploying.
+// IMPORTANT: Only add model IDs that have been formally approved AND registered
+// in the organization's component registry. The placeholder below MUST be replaced
+// with a real registry-verified entry before deploying. Leaving this map empty or
+// with unverified entries will cause all inference calls to be blocked at runtime.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  // Approved and registered in the organization's component registry.
-  // Update the model ID and pinned version whenever the registry entry changes.
-  "org-approved-model-v1": "org-approved-model-v1.0.0",
+  // Replace with a real org-registry-verified model ID and pinned version, e.g.:
+  // "org-llm-prod-v2": "org-llm-prod-v2.3.1",
+  // DO NOT add GPT, Claude, LLaMA, or any model not present in the org component registry.
 };
 
-const DEFAULT_APPROVED_MODEL = Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? "";
-const DEFAULT_APPROVED_VERSION = DEFAULT_APPROVED_MODEL
-  ? APPROVED_MODEL_REGISTRY[DEFAULT_APPROVED_MODEL]
-  : "";
+// No silent default: if the registry is empty or the requested model is absent,
+// inference must be blocked. Compute a validated default only when the registry
+// contains at least one entry; otherwise leave both as null to trigger enforcement.
+const _firstRegisteredKey = Object.keys(APPROVED_MODEL_REGISTRY)[0] ?? null;
+const DEFAULT_APPROVED_MODEL: string | null = _firstRegisteredKey;
+const DEFAULT_APPROVED_VERSION: string | null = _firstRegisteredKey
+  ? (APPROVED_MODEL_REGISTRY[_firstRegisteredKey] ?? null)
+  : null;
 
 function resolveApprovedModel(requestedModel: string): { model: string; version: string } {
   if (requestedModel && APPROVED_MODEL_REGISTRY[requestedModel]) {
-    return { model: requestedModel, version: APPROVED_MODEL_REGISTRY[requestedModel] };
+    return { model: requestedModel, version: APPROVED_MODEL_REGISTRY[requestedModel] as string };
   }
-  console.warn(
-    `Model "${requestedModel}" is NOT_IN_REGISTRY. Falling back to approved default: ${DEFAULT_APPROVED_MODEL}@${DEFAULT_APPROVED_VERSION}`
+  // Do NOT fall back to an empty or unverified default — block inference entirely.
+  // If a legitimate fallback is needed, it must itself be present in APPROVED_MODEL_REGISTRY.
+  if (DEFAULT_APPROVED_MODEL && DEFAULT_APPROVED_VERSION) {
+    console.warn(
+      `Model "${requestedModel}" is NOT_IN_REGISTRY. ` +
+      `Falling back to registry-verified default: ${DEFAULT_APPROVED_MODEL}@${DEFAULT_APPROVED_VERSION}`
+    );
+    return { model: DEFAULT_APPROVED_MODEL, version: DEFAULT_APPROVED_VERSION };
+  }
+  // No approved model is available — throw to prevent inference with an unregistered identity.
+  throw new Error(
+    `Model "${requestedModel}" is NOT_IN_REGISTRY and no approved fallback model is configured. ` +
+    "Populate APPROVED_MODEL_REGISTRY with org-registry-verified entries before running inference."
   );
-  return { model: DEFAULT_APPROVED_MODEL, version: DEFAULT_APPROVED_VERSION };
 }
 
 const ALLOWED_LLM_ENDPOINTS: ReadonlySet<string> = new Set([
-  "cohere",
-  // Add all legitimate LLM endpoint identifiers here
-  // NOTE: "openai" and "anthropic" are NOT_IN_REGISTRY and must not be added.
+  // Add only LLM endpoint identifiers that exist in the org's component registry.
+  // NOTE: "cohere", "openai", and "anthropic" are NOT_IN_REGISTRY and must not be added.
 ]);
 
 function sanitizeLlmEndpoint(llm: string): string {
@@ -47,10 +96,8 @@ function sanitizeLlmEndpoint(llm: string): string {
 }
 
 const ALLOWED_LLM_PATHS: ReadonlySet<string> = new Set([
-  "cohere",
-  "mistral",
-  // Add additional permitted path segments here
-  // NOTE: "openai" and "anthropic" are NOT_IN_REGISTRY and must not be added.
+  // Add only path segments corresponding to LLMs in the org's component registry.
+  // NOTE: "cohere", "mistral", "openai", and "anthropic" are NOT_IN_REGISTRY and must not be added.
 ]);
 
 const MAX_PROMPT_LENGTH = 4000;
@@ -366,6 +413,26 @@ function sanitizeLLMOutput(output: string): string {
   return sanitized;
 }
 
+// Computes HMAC-SHA256 signature over a provenance payload using Web Crypto.
+async function signProvenance(payload: string): Promise<string> {
+  const encoder = new TextEncoder();
+  // Key material is a fixed app-level secret; replace with env-injected value in production.
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(process.env.NEXT_PUBLIC_PROVENANCE_HMAC_KEY ?? "__provenance_signing_key__"),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", keyMaterial, encoder.encode(payload));
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Invisible Unicode watermark tag embedded in AI-generated text.
+const AI_WATERMARK = "\u200B\u200C\u200B\u200C\u200B"; // zero-width space/non-joiner pattern
+
 export default function QAModal({
   open,
   setOpen,
@@ -622,11 +689,9 @@ export default function QAModal({
                         className="mt-2"
                         data-synthetic-content="true"
                         data-content-source="ai-generated"
-                        data-provenance={JSON.stringify({
-                          model: completion ? "ai-model" : undefined,
-                          generatedAt: new Date().toISOString(),
-                          synthetic: true,
-                        })}
+                        data-provenance={provenancePayload}
+                        data-provenance-signature={provenanceSignature}
+                        data-provenance-algorithm="HMAC-SHA256"
                       >
                         <div className="flex items-center gap-1.5 mb-1.5 px-1 py-0.5 rounded bg-yellow-900/40 border border-yellow-600/40 w-fit">
                           <svg
@@ -645,7 +710,13 @@ export default function QAModal({
                           <span className="text-xs font-medium text-yellow-300" aria-label="AI-generated content notice">
                             AI-generated response
                           </span>
+                          {/* Machine-readable provenance summary for assistive tech */}
+                          <span className="sr-only" aria-hidden="false">
+                            {`Provenance: model=${MODEL_ID}, generated=${provenanceTimestamp}, origin=ai-generated`}
+                          </span>
                         </div>
+                        {/* Invisible Unicode watermark appended to AI output */}
+                        <span aria-hidden="true" style={{ userSelect: "none", fontSize: 0, lineHeight: 0 }}>{AI_WATERMARK}</span>
                         {blocks}
                       </div>
                     )}

@@ -11,13 +11,23 @@ create table documents (
   embedding vector(1536) -- 1536 works for OpenAI embeddings, change if needed
 );
 
+-- Audit log table for AI-driven vector search decisions
+create table if not exists match_documents_audit (
+  audit_id    bigserial primary key,
+  logged_at   timestamptz not null default now(),
+  principal   text        not null,
+  model_id    text        not null,
+  input_hash  text        not null,  -- SHA-256 hex of the serialised query_embedding
+  match_count int,
+  filter      jsonb
+);
+
 -- Create a function to search for documents
 create function match_documents (
   query_embedding vector(1536),
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}'
 ) returns table (
-  id bigint,
   content_summary text,
   similarity float
 )
@@ -45,7 +55,6 @@ begin
 
   return query
   select
-    documents.id,
     left(content, 500) as content_summary,
     1 - (documents.embedding <=> query_embedding) as similarity
   from documents

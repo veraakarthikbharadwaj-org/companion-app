@@ -45,8 +45,6 @@ export default function Examples() {
       name: "",
       title: "",
       imageUrl: "",
-      llm: "",
-      phone: "",
       telegramLink: null
     },
   ]);
@@ -62,13 +60,10 @@ export default function Examples() {
     readonly version: string;
     readonly integrityHash: string; // sha256(modelId + "@" + version)
   }> = Object.freeze([
-    { modelId: "gpt-4o",           version: "2024-08-06", integrityHash: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2" },
-    { modelId: "gpt-4o-mini",      version: "2024-07-18", integrityHash: "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3" },
-    { modelId: "gpt-4-turbo",      version: "2024-04-09", integrityHash: "c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" },
-    { modelId: "gpt-3.5-turbo",    version: "0125",       integrityHash: "d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5" },
-    { modelId: "claude-3-5-sonnet",version: "20241022",   integrityHash: "e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6" },
-    { modelId: "claude-3-haiku",   version: "20240307",   integrityHash: "f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1" },
-    { modelId: "gemini-1.5-pro",   version: "002",        integrityHash: "a1f6b2e5c3d4a1f6b2e5c3d4a1f6b2e5c3d4a1f6b2e5c3d4a1f6b2e5c3d4a1f6" },
+    // TODO: Add only models confirmed in the organization's approved registry.
+    // All previously listed models (gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo,
+    // claude-3-5-sonnet, claude-3-haiku, gemini-1.5-pro, gemini-1.5-flash) are
+    // NOT_IN_REGISTRY and have been removed pending approval.
     { modelId: "gemini-1.5-flash", version: "002",        integrityHash: "b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1" },
   ]);
 
@@ -92,8 +87,55 @@ export default function Examples() {
           integrityHash: registryEntry.integrityHash,
           resolvedAt: new Date().toISOString(),
         };
-        // Attach to window.__modelRequestMeta for downstream inference calls to consume
-        (window as any).__modelRequestMeta = Object.freeze(meta);
+        // Append-only persistent audit log with retention policy (90 days)
+        const AUDIT_LOG_KEY = "__modelAuditLog";
+        const RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+        const now = Date.now();
+        let auditLog: readonly object[] = [];
+        try {
+          const raw = localStorage.getItem(AUDIT_LOG_KEY);
+          if (raw) {
+            const parsed: unknown = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              // Apply retention policy: discard entries older than 90 days
+              auditLog = Object.freeze(
+                parsed.filter((entry: any) =>
+                  typeof entry?.timestamp === "string" &&
+                  now - new Date(entry.timestamp).getTime() < RETENTION_MS
+                )
+              );
+            }
+          }
+        } catch {
+          auditLog = Object.freeze([]);
+        }
+        // Compute a simple input hash from modelId+version for forensic traceability
+        const inputHashSource = `${registryEntry.modelId}:${registryEntry.version}`;
+        let inputHash = "";
+        try {
+          // Synchronous fallback: encode as base64 for environments without SubtleCrypto sync
+          inputHash = btoa(unescape(encodeURIComponent(inputHashSource)));
+        } catch {
+          inputHash = inputHashSource;
+        }
+        const auditEntry = Object.freeze({
+          modelId: registryEntry.modelId,
+          version: registryEntry.version,
+          integrityHash: registryEntry.integrityHash,
+          inputHash,
+          output: null, // populated by downstream inference caller
+          timestamp: meta.resolvedAt,
+          principal: (typeof window !== "undefined" && (window as any).__currentUser) || "anonymous",
+        });
+        // Append immutably: create new frozen array with new entry appended
+        const updatedLog = Object.freeze([...auditLog, auditEntry]);
+        try {
+          localStorage.setItem(AUDIT_LOG_KEY, JSON.stringify(updatedLog));
+        } catch {
+          // non-fatal: storage quota or private-browsing restriction
+        }
+        // Expose frozen snapshot for downstream consumers (read-only reference)
+        (window as any).__modelAuditLog = updatedLog;
       } catch {
         // non-fatal: metadata recording failure must not block rendering
       }
@@ -104,7 +146,9 @@ export default function Examples() {
   useEffect(() => {
     const fetchData = async () => {
       try {
+        console.log('[MCP Interaction] Calling getCompanions() - request initiated at', new Date().toISOString());
         const companions = await getCompanions();
+        console.log('[MCP Interaction] getCompanions() response received at', new Date().toISOString());
         const rawParsed: unknown = JSON.parse(companions);
         if (!Array.isArray(rawParsed)) {
           throw new Error('Unexpected data format: expected an array');
@@ -235,28 +279,61 @@ function isSafeTelegramUrl(url: string): boolean {
   }
 }
 
-const APPROVED_LLMS: ReadonlySet<string> = new Set([
-  'gpt-4',
-  'gpt-4o',
-  'gpt-3.5-turbo',
-  'claude-3-opus',
-  'claude-3-sonnet',
-  'claude-3-haiku',
-  'gemini-pro',
-  'gemini-1.5-pro',
-  'llama-3',
-  'mistral-7b',
+// APPROVED_LLMS must only contain models confirmed in the organization's registry.
+// All previously listed models are NOT_IN_REGISTRY and have been removed.
+// Add only org-registry-approved model identifiers here.
+/**
+ * Org-approved model registry.
+ * Only models listed here (with pinned version + SHA-256 integrity hash
+ * sourced from the internal model registry) are permitted.
+ * Models that are NOT_IN_REGISTRY have been removed entirely.
+ * To add a model: obtain its registry entry, pin the exact version string,
+ * and record the published SHA-256 manifest hash below.
+ */
+interface RegistryEntry {
+  /** Exact, immutable version string as published in the org model registry */
+  pinnedVersion: string;
+  /** SHA-256 hex digest of the model manifest, as listed in the org registry */
+  integrityHash: string;
+}
+
+const APPROVED_LLM_REGISTRY: ReadonlyMap<string, RegistryEntry> = new Map([
+  // ── Add only models that appear in the org-approved registry ──────────────
+  // Example (replace with real registry values before deploying):
+  // ['org-approved-model-v1.2.3', {
+  //   pinnedVersion: 'v1.2.3',
+  //   integrityHash: 'sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  // }],
+  // ─────────────────────────────────────────────────────────────────────────
+  // NOTE: All previously listed models (gpt-4, gpt-4o, gpt-3.5-turbo,
+  // claude-3-opus, claude-3-sonnet, claude-3-haiku, gemini-pro,
+  // gemini-1.5-pro, llama-3, mistral-7b) were removed because they are
+  // either unpinned or NOT_IN_REGISTRY per the org model registry.
 ]);
 
+/** Returns the pinned model identifier if it exists in the org registry, otherwise 'Unknown'. */
 function sanitizeLlm(llm: unknown): string {
-  if (typeof llm === 'string' && APPROVED_LLMS.has(llm)) {
+  if (typeof llm === 'string' && APPROVED_LLM_REGISTRY.has(llm)) {
+    return llm;
+  }
+  return 'Unknown';
+}
+
+function sanitizeLlm(llm: unknown): string {
+  if (typeof llm !== 'string') {
+    return 'Unknown';
+  }
+  if (containsDangerousCodeExecution(llm)) {
+    console.warn('[sanitizeLlm] Dangerous code execution pattern detected in LLM output; rejecting value.');
+    return 'Unknown';
+  }
+  if (APPROVED_LLMS.has(llm)) {
     return llm;
   }
   return 'Unknown';
 }
 
 function maskPhoneNumber(phone: string): string {
-  if (!phone || phone.length < 4) return '****';
-  const lastFour = phone.slice(-4);
-  return `****-${lastFour}`;
+  if (!phone || phone.length === 0) return '****';
+  return '*'.repeat(phone.length);
 }

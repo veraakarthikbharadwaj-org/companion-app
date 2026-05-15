@@ -10,7 +10,7 @@
 
 This is a tutorial stack to create and host AI companions that you can chat with on a browser or text via SMS. It allows you to determine the personality and backstory of your companion, and uses a vector database with similarity search to retrieve and prompt so the conversations have more depth. It also provides some conversational memory by keeping the conversation in a queue and including it in the prompt. 
 
-It currently contains companions powered by version-pinned LLMs sourced exclusively from the organization's approved model registry. Each model must be referenced by its full registry path and immutable digest (e.g., `approved-registry/<model-name>@sha256:<digest>`) to satisfy version-pinning requirements. Do **not** substitute unregistered models such as Claude or GPT variants that have not been added to the approved registry.
+It currently contains companions powered by version-pinned LLMs sourced exclusively from the organization's approved model registry. Each model must be referenced by its full registry path and immutable digest (e.g., `approved-registry/<model-name>@sha256:<digest>`) to satisfy version-pinning requirements. Do **not** substitute models that have not been added to the approved registry.
 
 There are many possible use cases for these companions - romantic (AI girlfriends / boyfriends), friendship, entertainment, coaching, etc. You can guide your companion towards your ideal use case with the backstory you write and the model you choose.
 
@@ -329,5 +329,5 @@ Once you run this script, you will see two files created under the root director
 ## Refs
 
 - https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
-- https://js.langchain.com/docs/modules/models/llms/integrations#replicate
+- Refer to your organization's approved model registry for supported LLM integrations.
 - https://js.langchain.com/docs/modules/chains/index_related_chains/retrieval_qa

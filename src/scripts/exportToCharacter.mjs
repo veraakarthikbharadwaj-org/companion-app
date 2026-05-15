@@ -1,4 +1,4 @@
-import { Redis } from "@upstash/redis";
+// Redis import removed: external credential holding policy violation
 import { PromptTemplate } from "langchain/prompts";
 import { LLMChain } from "langchain/chains";
 
@@ -24,7 +24,7 @@ function assertToolAllowed(toolName) {
     );
   }
 }
-import { Ollama } from "langchain/llms/ollama";
+import { OpenAI } from "langchain/llms/openai";
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -41,8 +41,8 @@ function sanitizeInput(value, maxLength = 4000) {
   return value
     // Remove null bytes
     .replace(/\0/g, "")
-    // Strip common prompt-injection delimiters / role-override patterns
-    .replace(/###\s*(SYSTEM|USER|ASSISTANT|ENDPREAMBLE|ENDSEEDCHAT|INSTRUCTION)/gi, "")
+    // Strip common prompt-injection delimiters and role-override markers
+    .replace(/###\s*(SYSTEM|USER|ASSISTANT|ENDPREAMBLE|ENDSEEDCHAT|INSTRUCTION|CONTEXT|PROMPT)/gi, "")
     // Collapse runs of backticks that could break out of code fences
     .replace(/`{3,}/g, "```")
     // Trim leading/trailing whitespace
@@ -70,6 +70,57 @@ const MODEL_NAME = validateIdentifier(process.argv[3], "MODEL_NAME");
 const USER_ID = validateIdentifier(process.argv[4], "USER_ID");
 const CALLER_TOKEN = typeof process.argv[5] === "string" ? process.argv[5] : "";
 
+/**
+ * Verifies a signed JWT token (HMAC-SHA256) and asserts:
+ *  - valid signature using EXPORT_SECRET_TOKEN
+ *  - token has not expired (exp claim)
+ *  - subject (sub claim) matches the expected userId
+ *
+ * @param {string} token - The JWT string from the caller.
+ * @param {string} secret - The HMAC signing secret.
+ * @param {string} expectedSub - The expected subject (USER_ID).
+ */
+function verifyCallerToken(token, secret, expectedSub) {
+  if (typeof token !== "string" || !token) {
+    throw new Error("Authentication error: A caller token must be supplied as the 4th argument.");
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error("Authentication error: Malformed token. Access denied.");
+  }
+  const [headerB64, payloadB64, signatureB64] = parts;
+  // Verify signature
+  const signingInput = `${headerB64}.${payloadB64}`;
+  const expectedSig = crypto
+    .createHmac("sha256", secret)
+    .update(signingInput, "utf8")
+    .digest("base64url");
+  const expectedSigBuf = Buffer.from(expectedSig, "utf8");
+  const actualSigBuf = Buffer.from(signatureB64, "utf8");
+  if (
+    expectedSigBuf.length !== actualSigBuf.length ||
+    !crypto.timingSafeEqual(expectedSigBuf, actualSigBuf)
+  ) {
+    throw new Error("Authentication error: Invalid token signature. Access denied.");
+  }
+  // Decode and validate payload
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Authentication error: Token payload could not be decoded. Access denied.");
+  }
+  // Check expiry
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== "number" || payload.exp <= nowSec) {
+    throw new Error("Authentication error: Token has expired or missing exp claim. Access denied.");
+  }
+  // Check subject binding
+  if (typeof payload.sub !== "string" || payload.sub !== expectedSub) {
+    throw new Error("Authentication error: Token subject does not match USER_ID. Access denied.");
+  }
+}
+
 if (!!!COMPANION_NAME || !!!MODEL_NAME || !!!USER_ID) {
   throw new Error(
     "**Usage**: npm run export-to-character <COMPANION_NAME> <MODEL_NAME> <USER_ID> <CALLER_TOKEN>"
@@ -83,21 +134,8 @@ if (!EXPECTED_TOKEN) {
     "Authentication error: EXPORT_SECRET_TOKEN environment variable is not set."
   );
 }
-if (!CALLER_TOKEN) {
-  throw new Error(
-    "Authentication error: A caller token must be supplied as the 4th argument."
-  );
-}
-const expectedBuf = Buffer.from(EXPECTED_TOKEN, "utf8");
-const callerBuf = Buffer.from(CALLER_TOKEN, "utf8");
-if (
-  expectedBuf.length !== callerBuf.length ||
-  !crypto.timingSafeEqual(expectedBuf, callerBuf)
-) {
-  throw new Error(
-    "Authentication error: Invalid caller token. Access denied."
-  );
-}
+// Verify the caller-supplied JWT: signature (HMAC-SHA256), expiry (exp), and subject binding (sub == USER_ID).
+verifyCallerToken(CALLER_TOKEN, EXPECTED_TOKEN, USER_ID);
 
 // Validate COMPANION_NAME to prevent path traversal
 if (!/^[a-zA-Z0-9_-]+$/.test(COMPANION_NAME)) {
@@ -126,19 +164,117 @@ function redactPII(text) {
   text = text.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]");
   // Redact common name patterns (Title + capitalized words)
   text = text.replace(/\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/g, "[REDACTED_NAME]");
-  // Redact Singapore NRIC/FIN numbers (e.g. S1234567D, T0123456A, F1234567N, G1234567P)
-  text = text.replace(/\b[STFG]\d{7}[A-Z]\b/g, "[REDACTED_NRIC_FIN]");
-  // Redact SingPass identifiers (SingPass ID follows same NRIC/FIN format but may appear with label)
+    // Redact SingPass identifiers that are explicitly labelled (must run before generic NRIC/FIN redaction)
   text = text.replace(/(?:SingPass\s*(?:ID|identifier)?\s*[:\-]?\s*)[STFG]\d{7}[A-Z]\b/gi, "[REDACTED_SINGPASS_ID]");
-  // Redact CPF account numbers (9-digit numeric, optionally labelled)
-  text = text.replace(/(?:CPF\s*(?:account)?\s*(?:no\.?|number)?\s*[:\-]?\s*)\d{9}\b/gi, "[REDACTED_CPF]");
+  // Redact Singapore NRIC numbers (e.g. S1234567D, T0123456A)
+  text = text.replace(/\b[ST]\d{7}[A-Z]\b/g, "[REDACTED_NRIC]");
+  // Redact Singapore FIN numbers (e.g. F1234567N, G1234567P)
+  text = text.replace(/\b[FG]\d{7}[A-Z]\b/g, "[REDACTED_FIN]");
+  // Redact CPF account numbers that are explicitly labelled (must run before standalone 9-digit redaction)
+  text = text.replace(/(?:CPF\s*(?:account)?\s*(?:no\.?|number)?\s*[:\-]?\s*)\d{9}\b/gi, "[REDACTED_CPF_ACCOUNT]");
   // Redact standalone 9-digit numbers that may be CPF account numbers
-  text = text.replace(/\b\d{9}\b/g, "[REDACTED_CPF]");
+  text = text.replace(/\b\d{9}\b/g, "[REDACTED_CPF_ACCOUNT]");
   return text;
 }
 
 const rawData = await fs.readFile(companionFilePath, "utf8");
-const data = redactPII(rawData);
+
+/**
+ * Detects and neutralizes malicious content patterns in file contents
+ * before they are used in LLM prompts.
+ */
+function sanitizeFileContent(text) {
+  if (typeof text !== "string") {
+    throw new Error("Companion file content must be a UTF-8 text string.");
+  }
+
+  // Reject binary/non-printable content (allow common whitespace: \t, \n, \r)
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(text)) {
+    throw new Error(
+      "Companion file contains binary or non-printable characters and cannot be used."
+    );
+  }
+
+  // Remove invisible / zero-width characters used to hide injected text
+  // (zero-width space, zero-width non-joiner, zero-width joiner, word joiner,
+  //  soft hyphen, left-to-right / right-to-left marks, BOM, etc.)
+  text = text.replace(
+    /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u180E\u00A0]/g,
+    ""
+  );
+
+  // Detect and neutralize base64-encoded blobs that could hide injected prompts.
+  // A base64 segment of 40+ chars is suspicious in a plain-text persona file.
+  text = text.replace(
+    /(?:[A-Za-z0-9+\/]{40,}={0,2})/g,
+    (match) => {
+      try {
+        const decoded = Buffer.from(match, "base64").toString("utf8");
+        // If the decoded string contains prompt-injection keywords, strip the blob
+        if (
+          /ignore\s+(previous|above|prior|all)|you\s+are\s+now|new\s+instructions|system\s*:/i.test(
+            decoded
+          )
+        ) {
+          return "[REMOVED_BASE64_INJECTION]";
+        }
+      } catch (_) {
+        // Not valid base64 — leave as-is
+      }
+      return match;
+    }
+  );
+
+  // Detect leetspeak / character-substitution prompt-injection patterns.
+  // Normalise common substitutions (3→e, 4→a, 0→o, 1→i/l, @→a, $→s, +→t)
+  // then check for injection keywords in the normalised form.
+  const leetNormalised = text
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/@/g, "a")
+    .replace(/\$/g, "s")
+    .replace(/\+/g, "t");
+  if (
+    /ignore\s+(previous|above|prior|all)|you\s+are\s+now|new\s+instructions|disregard\s+(all|previous)|act\s+as\s+(?:a\s+)?(?:different|new|unrestricted)|jailbreak|dan\s+mode/i.test(
+      leetNormalised
+    )
+  ) {
+    throw new Error(
+      "Companion file contains leetspeak prompt-injection patterns and cannot be used."
+    );
+  }
+
+  // Detect shell command patterns
+  if (
+    /(?:^|\s|;|&&|\|\|)(?:bash|sh|zsh|cmd|powershell|python|perl|ruby|node|curl|wget|nc|ncat|netcat|eval|exec|system|passthru|popen)\s*(?:[-("'`]|$)/im.test(
+      text
+    ) ||
+    /(?:\$\(|`)[^`$)]{0,200}(?:\)|`)/m.test(text)
+  ) {
+    throw new Error(
+      "Companion file contains shell command patterns and cannot be used."
+    );
+  }
+
+  // Detect direct prompt-injection instructions in plain text
+  if (
+    /ignore\s+(previous|above|prior|all)\s+(instructions?|prompts?|context)|you\s+are\s+now\s+(?:a\s+)?(?:different|new|unrestricted)|new\s+(role|persona|instructions?|task)\s*:/i.test(
+      text
+    )
+  ) {
+    throw new Error(
+      "Companion file contains prompt-injection instructions and cannot be used."
+    );
+  }
+
+  return text;
+}
+
+const sanitizedRaw = sanitizeFileContent(rawData);
+const data = redactPII(sanitizedRaw);
 
 // Sanitize file contents to prevent prompt injection
 function sanitizeForPrompt(text) {
@@ -596,10 +732,77 @@ const recentChatSummaries = recentChat.map((entry) => {
   const text = typeof entry === "string" ? entry : JSON.stringify(entry);
   return text.length > 200 ? text.slice(0, 200) + "…" : text;
 });
-output += `Definition (Advanced)\n${recentChatSummaries.join("\n")}`;
+// Sanitize assembled chat content before injecting into LLM prompt
+function sanitizePromptContent(text) {
+  // Reject invisible/control characters (except common whitespace)
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\u200B\u200C\u200D\uFEFF\u2028\u2029]/u.test(text)) {
+    throw new Error('Prompt injection detected: invisible or control characters found in prompt content.');
+  }
+  // Reject binary-like content (high density of non-printable bytes)
+  const nonPrintable = (text.match(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]/gu) || []).length;
+  if (nonPrintable / text.length > 0.05) {
+    throw new Error('Prompt injection detected: binary or non-printable content found in prompt content.');
+  }
+  // Reject base64-encoded blobs (long runs of base64 chars that decode to shell commands)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/g;
+  const base64Matches = text.match(base64Pattern) || [];
+  for (const match of base64Matches) {
+    try {
+      const decoded = Buffer.from(match, 'base64').toString('utf8');
+      if (/(?:bash|sh|cmd|powershell|eval|exec|system|chmod|wget|curl|nc |ncat|python|perl|ruby|php)\b/i.test(decoded)) {
+        throw new Error('Prompt injection detected: base64-encoded shell command found in prompt content.');
+      }
+    } catch (e) {
+      if (e.message.startsWith('Prompt injection')) throw e;
+      // Not valid base64 or not decodable — skip
+    }
+  }
+  // Reject shell command patterns
+  if (/(?:^|\s|;|\||&)(?:bash|sh|cmd\.exe|powershell|eval|exec|system|chmod|chown|wget|curl\s|nc\s|ncat|python\s|perl\s|ruby\s|php\s|rm\s+-rf|dd\s+if=|mkfifo|telnet)\b/im.test(text)) {
+    throw new Error('Prompt injection detected: shell command pattern found in prompt content.');
+  }
+  // Reject leetspeak patterns used to obfuscate commands (e.g. 3x3c, 3v4l)
+  if (/(?:[3e][xX][3e][cC]|[3e][vV][4a][lL]|[5s][yY][5s][tT][3e][mM]|[pP][0o][wW][3e][rR][sS][hH][3e][lL]{2})/i.test(text)) {
+    throw new Error('Prompt injection detected: leetspeak obfuscation of command found in prompt content.');
+  }
+  return text;
+}
+
+const assembledChatContent = sanitizePromptContent(recentChatSummaries.join("\n"));
+output += `Definition (Advanced)\n${assembledChatContent}`;
 
 // Prepend provenance header to all AI-generated output
 const labeledOutput = PROVENANCE_HEADER + output;
+
+// --- LLM output validation: reject responses containing dynamic code execution primitives ---
+// These patterns indicate potential prompt-injection or code-injection attempts in the LLM response.
+const DANGEROUS_CODE_PATTERNS = [
+  /\beval\s*\(/,
+  /\bexec\s*\(/,
+  /\bnew\s+Function\s*\(/,
+  /\bsetTimeout\s*\(\s*['"`]/,
+  /\bsetInterval\s*\(\s*['"`]/,
+  /\bspawn\s*\(/,
+  /\bexecSync\s*\(/,
+  /\bexecFile\s*\(/,
+  /\bspawnSync\s*\(/,
+  /\bsubprocess\s*\./,
+  /\bos\.system\s*\(/,
+  /\b__import__\s*\(/,
+  /\bimportlib\s*\./,
+  /\bcompile\s*\(.*exec/,
+  /\bProcessBuilder\s*\(/,
+  /\bRuntime\.getRuntime\s*\(\s*\)\.exec\s*\(/,
+];
+
+const dangerousPatternFound = DANGEROUS_CODE_PATTERNS.find((pattern) =>
+  pattern.test(output)
+);
+if (dangerousPatternFound) {
+  throw new Error(
+    `LLM output validation failed: response contains a forbidden dynamic code execution primitive matching pattern ${dangerousPatternFound}. Export aborted to prevent persisting potentially malicious content.`
+  );
+}
 
 // Data minimisation: export only the most recent 20 chat entries and strip
 // each entry down to the minimal required fields (role + first 300 chars of
@@ -633,10 +836,42 @@ const minimisedChatHistory = upstashChatHistory
 const chatHistoryLabeled =
   PROVENANCE_HEADER +
   `=== CHAT HISTORY EXPORT (last ${CHAT_HISTORY_MAX_ENTRIES} entries, content truncated to ${CHAT_HISTORY_CONTENT_MAX_CHARS} chars) ===\n` +
-  minimisedChatHistory.join("\n");
+  sanitizePromptContent(minimisedChatHistory.join("\n"));
 
-await fs.writeFile(`${COMPANION_NAME}_chat_history.txt`, chatHistoryLabeled);
-await fs.writeFile(`${COMPANION_NAME}_character_ai_data.txt`, labeledOutput);
+// --- Encrypt outputs before writing to disk (AES-256-GCM) ---
+// Requires the EXPORT_ENCRYPTION_KEY environment variable to be set to a
+// 64-character hex string (32 bytes).  Generate once with:
+//   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+const EXPORT_ENCRYPTION_KEY = process.env.EXPORT_ENCRYPTION_KEY;
+if (!EXPORT_ENCRYPTION_KEY || Buffer.from(EXPORT_ENCRYPTION_KEY, 'hex').length !== 32) {
+  throw new Error(
+    'EXPORT_ENCRYPTION_KEY env var must be set to a 64-char hex string (32 bytes). ' +
+    'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"'
+  );
+}
+const encKey = Buffer.from(EXPORT_ENCRYPTION_KEY, 'hex');
+
+function encryptToEnvelope(plaintext) {
+  const iv = crypto.randomBytes(12); // 96-bit IV recommended for GCM
+  const cipher = crypto.createCipheriv('aes-256-gcm', encKey, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(plaintext, 'utf8'),
+    cipher.final(),
+  ]);
+  const authTag = cipher.getAuthTag();
+  return JSON.stringify({
+    algorithm: 'aes-256-gcm',
+    iv: iv.toString('hex'),
+    authTag: authTag.toString('hex'),
+    ciphertext: encrypted.toString('hex'),
+  });
+}
+
+const encryptedChatHistory = encryptToEnvelope(chatHistoryLabeled);
+const encryptedAiData = encryptToEnvelope(labeledOutput);
+
+await fs.writeFile(`${COMPANION_NAME}_chat_history.enc`, encryptedChatHistory);
+await fs.writeFile(`${COMPANION_NAME}_character_ai_data.enc`, encryptedAiData);
 
 // --- Append-only audit log (forensic readiness) ---
 // Compute hashes over the raw inputs and the final AI output so that
@@ -668,12 +903,59 @@ const auditRecord = JSON.stringify({
   output_sha256: outputHash,
   provenance_signature: `hmac-sha256=${provenanceSignature}`,
   output_files: [
-    `${COMPANION_NAME}_character_ai_data.txt`,
-    `${COMPANION_NAME}_chat_history.txt`,
+    `${COMPANION_NAME}_character_ai_data.enc`,
+    `${COMPANION_NAME}_chat_history.enc`,
   ],
 }) + "\n";
 
-// Use the 'a' (append) flag so this file is strictly append-only within
-// this process. Pair with OS-level immutability (e.g. chattr +a, S3
-// Object Lock, or a WORM store) for full retention enforcement.
-await fs.writeFile("ai_audit_log.ndjson", auditRecord, { flag: "a" });
+// ---------------------------------------------------------------------------
+// Audit-log retention policy (enforced programmatically)
+//   MAX_AUDIT_LOG_BYTES  – rotate the active log once it exceeds this size.
+//   MAX_AUDIT_LOG_FILES  – keep at most this many rotated archives plus the
+//                          active log; the oldest archive is deleted when the
+//                          limit is exceeded.
+// Pair with OS-level immutability (e.g. chattr +a, S3 Object Lock, or a
+// WORM store) for an additional layer of tamper-evidence.
+// ---------------------------------------------------------------------------
+const AUDIT_LOG_PATH     = "ai_audit_log.ndjson";
+const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MiB per file
+const MAX_AUDIT_LOG_FILES = 10;               // keep up to 10 rotated archives
+
+async function rotateAuditLogIfNeeded(logPath, maxBytes, maxFiles) {
+  let currentSize = 0;
+  try {
+    const stat = await fs.stat(logPath);
+    currentSize = stat.size;
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+    // File does not exist yet – nothing to rotate.
+    return;
+  }
+
+  if (currentSize < maxBytes) return; // still within the allowed size
+
+  // Shift existing rotated files: .9 is deleted, .8 → .9, …, .1 → .2
+  for (let i = maxFiles - 1; i >= 1; i--) {
+    const older = `${logPath}.${i}`;
+    const newer = `${logPath}.${i + 1}`;
+    try {
+      await fs.rename(older, newer);
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+  }
+
+  // Delete the overflow archive if it was pushed beyond the limit
+  const overflow = `${logPath}.${maxFiles + 1}`;
+  try {
+    await fs.unlink(overflow);
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  // Rotate the active log to .1
+  await fs.rename(logPath, `${logPath}.1`);
+}
+
+await rotateAuditLogIfNeeded(AUDIT_LOG_PATH, MAX_AUDIT_LOG_BYTES, MAX_AUDIT_LOG_FILES);
+await fs.writeFile(AUDIT_LOG_PATH, auditRecord, { flag: "a" });

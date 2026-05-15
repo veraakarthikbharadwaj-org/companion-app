@@ -4,13 +4,23 @@ dotenv.config({ path: `.env.local` });
 
 // Approved model registry — only models listed here may be used for inference.
 // NOTE: Only org-approved models may appear here. Unapproved models (e.g. stable-diffusion, dall-e, GPT, Claude) have been removed.
+// The approved model ID and version MUST be set via environment variables referencing the org's approved model catalogue.
+const _APPROVED_IMAGE_MODEL_ID: string = process.env.APPROVED_IMAGE_MODEL_ID ?? "";
+const _APPROVED_IMAGE_MODEL_VERSION: string = process.env.APPROVED_IMAGE_MODEL_VERSION ?? "";
+
+if (!_APPROVED_IMAGE_MODEL_ID || !_APPROVED_IMAGE_MODEL_VERSION) {
+  throw new Error(
+    "Configuration error: APPROVED_IMAGE_MODEL_ID and APPROVED_IMAGE_MODEL_VERSION must be set to org-approved values."
+  );
+}
+
 const APPROVED_MODEL_REGISTRY: Record<string, string[]> = {
-  "org-approved-image-model": ["v1"],
+  [_APPROVED_IMAGE_MODEL_ID]: [_APPROVED_IMAGE_MODEL_VERSION],
 };
 
 // Pinned model identity for this workload — must match an entry in APPROVED_MODEL_REGISTRY.
-const PINNED_MODEL_ID = "org-approved-image-model";
-const PINNED_MODEL_VERSION = "v1";
+const PINNED_MODEL_ID = _APPROVED_IMAGE_MODEL_ID;
+const PINNED_MODEL_VERSION = _APPROVED_IMAGE_MODEL_VERSION;
 
 /**
  * Verifies that the model identity returned by the inference API matches
@@ -57,6 +67,67 @@ import Image from "next/image";
  * Retrieves the current authenticated principal identifier.
  * Returns 'anonymous' when no session is available.
  */
+/**
+ * Sanitizes and validates a user-supplied prompt before sending it to the AI inference API.
+ * - Enforces a maximum length to prevent abuse.
+ * - Strips null bytes and ASCII control characters.
+ * - Rejects prompts containing prompt-injection patterns or script-like content.
+ * Returns the sanitized string, or throws if the input is invalid.
+ */
+function sanitizePrompt(prompt: unknown): string {
+  if (typeof prompt !== "string") {
+    throw new Error("Prompt validation failed: input must be a string.");
+  }
+
+  const MAX_PROMPT_LENGTH = 1000;
+  if (prompt.length === 0) {
+    throw new Error("Prompt validation failed: prompt must not be empty.");
+  }
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    throw new Error(
+      `Prompt validation failed: prompt exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.`
+    );
+  }
+
+  // Strip null bytes and ASCII control characters (except tab, newline, carriage return)
+  // eslint-disable-next-line no-control-regex
+  let sanitized = prompt.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Reject prompts containing known prompt-injection or script-injection patterns
+  const dangerousPromptPatterns = [
+    /javascript\s*:/i,
+    /<\s*script[\s>]/i,
+    /\beval\s*\(/i,
+    /\bFunction\s*\(/i,
+    // Prompt injection: attempts to override system instructions
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions?/i,
+    /you\s+are\s+now\s+/i,
+    /act\s+as\s+(a\s+)?(?:different|new|another|unrestricted)/i,
+    /\bDAN\b/,
+    /jailbreak/i,
+  ];
+
+  for (const pattern of dangerousPromptPatterns) {
+    if (pattern.test(sanitized)) {
+      throw new Error(
+        "Prompt validation failed: prompt contains disallowed content."
+      );
+    }
+  }
+
+  // Trim leading/trailing whitespace
+  sanitized = sanitized.trim();
+
+  if (sanitized.length === 0) {
+    throw new Error(
+      "Prompt validation failed: prompt is empty after sanitization."
+    );
+  }
+
+  return sanitized;
+}
+
 function getCurrentPrincipal(): string {
   try {
     // Attempt to read principal from session cookie or meta tag set by the server
@@ -69,6 +140,93 @@ function getCurrentPrincipal(): string {
     // Ignore errors in principal resolution
   }
   return "anonymous";
+}
+
+/**
+ * Validates a user-supplied prompt for malicious patterns before sending to the AI agent.
+ * Throws an error if the prompt contains hidden instructions, base64-encoded payloads,
+ * shell commands, leetspeak obfuscation, or other injection patterns.
+ */
+function validatePromptInput(prompt: string): void {
+  if (typeof prompt !== "string") {
+    throw new Error("Prompt must be a string.");
+  }
+
+  const trimmed = prompt.trim();
+
+  if (trimmed.length === 0) {
+    throw new Error("Prompt must not be empty.");
+  }
+
+  if (trimmed.length > 1000) {
+    throw new Error("Prompt exceeds maximum allowed length of 1000 characters.");
+  }
+
+  // Detect base64-encoded content (long base64 strings that may hide payloads)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/;
+  if (base64Pattern.test(trimmed)) {
+    throw new Error("Prompt contains potentially encoded content and cannot be processed.");
+  }
+
+  // Detect shell command patterns
+  const shellCommandPatterns = [
+    /\b(bash|sh|zsh|cmd|powershell|exec|system|popen|subprocess)\b/i,
+    /[|;&`$(){}\[\]<>]/, // shell metacharacters
+    /\.\.\//, // path traversal
+    /\bsudo\b/i,
+    /\brm\s+-/i,
+    /\bcurl\b/i,
+    /\bwget\b/i,
+    /\bnc\b.*\d{2,5}/i, // netcat with port
+  ];
+  for (const pattern of shellCommandPatterns) {
+    if (pattern.test(trimmed)) {
+      throw new Error("Prompt contains shell command patterns and cannot be processed.");
+    }
+  }
+
+  // Detect hidden/injected prompt instructions
+  const promptInjectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above|earlier)/i,
+    /you\s+are\s+now/i,
+    /act\s+as\s+(a\s+)?(?!an?\s+image)/i, // "act as" except "act as an image"
+    /new\s+instructions?\s*:/i,
+    /system\s*:\s*you/i,
+    /\[INST\]/i,
+    /<\|.*?\|>/,  // special token delimiters
+    /###\s*(instruction|system|human|assistant)/i,
+    /jailbreak/i,
+    /do\s+anything\s+now/i,
+    /dan\s+mode/i,
+  ];
+  for (const pattern of promptInjectionPatterns) {
+    if (pattern.test(trimmed)) {
+      throw new Error("Prompt contains instruction injection patterns and cannot be processed.");
+    }
+  }
+
+  // Detect leetspeak obfuscation (excessive digit substitution for letters)
+  const leetspeakPattern = /(?:[a-z]*[013456789][a-z]*){4,}/i;
+  if (leetspeakPattern.test(trimmed.replace(/\s+/g, ""))) {
+    throw new Error("Prompt contains obfuscated text patterns and cannot be processed.");
+  }
+
+  // Detect JavaScript/code execution primitives
+  const codeExecutionPatterns = [
+    /javascript\s*:/i,
+    /\beval\s*\(/i,
+    /\bFunction\s*\(/i,
+    /\bsetTimeout\s*\(/i,
+    /\bsetInterval\s*\(/i,
+    /<script[\s>]/i,
+    /on\w+\s*=/i, // inline event handlers
+  ];
+  for (const pattern of codeExecutionPatterns) {
+    if (pattern.test(trimmed)) {
+      throw new Error("Prompt contains code execution patterns and cannot be processed.");
+    }
+  }
 }
 
 function sanitizeImageSrc(src: unknown): string | null {

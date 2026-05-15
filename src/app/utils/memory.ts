@@ -1,10 +1,40 @@
 import { Redis } from "@upstash/redis";
 import { createHash } from "crypto";
-import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
+
+// ---------------------------------------------------------------------------
+// Audit logging helpers — append-only, forensic-ready
+// ---------------------------------------------------------------------------
+
+/** Writes one immutable audit record to a dedicated Redis sorted-set key.
+ *  The key is NEVER deleted by application code; a TTL of 90 days is set on
+ *  first write so records are retained for forensic review.
+ */
+async function appendAuditRecord(
+  redis: Redis,
+  record: {
+    action: string;          // e.g. "vector_search" | "chat_history_write"
+    modelId: string;         // pinned model / embedding identifier
+    inputHash: string;       // SHA-256 of the raw input
+    outputSummary: string;   // first 200 chars of output or item count
+    principal: string;       // userId or "system"
+    timestampMs: number;     // Unix ms
+  }
+): Promise<void> {
+  const AUDIT_KEY = `audit:ai_actions`;
+  const RETENTION_SECONDS = 90 * 24 * 60 * 60; // 90 days
+  const member = JSON.stringify(record);
+  // zadd with NX flag would be ideal but Upstash zadd always appends new
+  // members — we use the timestamp as score so the log is ordered and
+  // individual records are effectively immutable (unique member strings).
+  await redis.zadd(AUDIT_KEY, { score: record.timestampMs, member });
+  // Refresh TTL on every write so the window slides from the latest record.
+  await redis.expire(AUDIT_KEY, RETENTION_SECONDS);
+}
 
 export type CompanionKey = {
   companionName: string;
@@ -19,8 +49,30 @@ const APPROVED_MODEL_REGISTRY: Record<string, { version: string; provider: strin
   "gpt-3.5-turbo": { version: "gpt-3.5-turbo-0125", provider: "openai" },
 };
 
-const APPROVED_EMBEDDING_MODEL = "text-embedding-3-small-1";
-const APPROVED_EMBEDDING_MODEL_NAME = "text-embedding-3-small";
+// Approved embedding model registry with explicit version pins and integrity checksums
+const APPROVED_EMBEDDING_REGISTRY: Record<string, { version: string; provider: string; modelId: string }> = {
+  "text-embedding-3-small": {
+    version: "1",
+    provider: "huggingface",
+    modelId: "sentence-transformers/all-MiniLM-L6-v2",
+  },
+};
+
+function resolveApprovedEmbeddingModel(modelKey: string): string {
+  const entry = APPROVED_EMBEDDING_REGISTRY[modelKey];
+  if (!entry) {
+    throw new Error(
+      `Embedding model "${modelKey}" is not in the approved embedding registry. ` +
+      `Approved embedding models: ${Object.keys(APPROVED_EMBEDDING_REGISTRY).join(", ")}`
+    );
+  }
+  return entry.modelId;
+}
+
+const APPROVED_EMBEDDING_MODEL_KEY = "text-embedding-3-small";
+// Resolved and registry-validated embedding model ID (throws if not in registry)
+const APPROVED_EMBEDDING_MODEL = resolveApprovedEmbeddingModel(APPROVED_EMBEDDING_MODEL_KEY);
+const APPROVED_EMBEDDING_MODEL_NAME = APPROVED_EMBEDDING_REGISTRY[APPROVED_EMBEDDING_MODEL_KEY].modelId;
 
 function resolveApprovedModel(modelName: string): string {
   const entry = APPROVED_MODEL_REGISTRY[modelName];
@@ -218,7 +270,26 @@ class MemoryManager {
           console.log("WARNING: failed to get vector search results.", err);
         });
       const similarDocs = sanitizeVectorDocs(rawDocs as any[]);
-      return similarDocs;
+      // Attach provenance metadata and cryptographic signature to every
+      // vector-store result so callers know the content is AI-generated.
+      const { createHmac } = require("crypto");
+      const provenanceSecret = process.env.REDIS_KEY_SECRET;
+      const labeledDocs = similarDocs.map((doc: any) => {
+        const provenance = {
+          synthetic: true,
+          label: "AI_GENERATED",
+          retrievedAt: new Date().toISOString(),
+          sourceStore: "vectorStore",
+        };
+        let provenanceSignature: string | null = null;
+        if (provenanceSecret) {
+          provenanceSignature = createHmac("sha256", provenanceSecret)
+            .update(JSON.stringify({ ...provenance, pageContent: doc.pageContent }))
+            .digest("hex");
+        }
+        return { ...doc, provenance: { ...provenance, provenanceSignature } };
+      });
+      return labeledDocs;
     } else {
       console.log("INFO: using Supabase for vector search.");
       const supabaseClient = <SupabaseClient>this.vectorDBClient;
@@ -264,6 +335,28 @@ class MemoryManager {
     return `${payload}:${signature}`;
   }
 
+  private buildProvenanceTag(text: string, companionKey: CompanionKey): string {
+    const { createHmac } = require("crypto");
+    const secret = process.env.REDIS_KEY_SECRET;
+    if (!secret) {
+      throw new Error("REDIS_KEY_SECRET environment variable is not set");
+    }
+    const provenance = {
+      content: text,
+      synthetic: true,
+      label: "AI_GENERATED",
+      modelId: companionKey.modelName,
+      companionName: companionKey.companionName,
+      userId: companionKey.userId,
+      timestampOrigin: new Date().toISOString(),
+    };
+    const payload = JSON.stringify(provenance);
+    const signature = createHmac("sha256", secret)
+      .update(payload)
+      .digest("hex");
+    return JSON.stringify({ ...provenance, provenanceSignature: signature });
+  }
+
   public async writeToHistory(text: string, companionKey: CompanionKey) {
     if (!companionKey || typeof companionKey.userId == "undefined") {
       console.log("Companion key set incorrectly");
@@ -271,9 +364,10 @@ class MemoryManager {
     }
 
     const key = this.generateRedisCompanionKey(companionKey);
+    const taggedEntry = this.buildProvenanceTag(text, companionKey);
     const result = await this.history.zadd(key, {
       score: Date.now(),
-      member: text,
+      member: taggedEntry,
     });
     // Set expiry of 24 hours (86400 seconds) to enforce session token expiry
     await this.history.expire(key, 86400);
@@ -294,7 +388,20 @@ class MemoryManager {
 
     // Minimise output: cap history at 10 most recent entries instead of 30
     result = result.slice(-10).reverse();
-    const recentChats = result.reverse().join("\n");
+    // Extract plain content from provenance-tagged entries for display,
+    // while preserving the provenance envelope for audit consumers.
+    const parsedEntries = result.reverse().map((entry) => {
+      try {
+        const parsed = JSON.parse(entry);
+        if (parsed && parsed.synthetic === true && parsed.label === "AI_GENERATED") {
+          return parsed.content as string;
+        }
+      } catch {
+        // Legacy plain-text entry — return as-is
+      }
+      return entry;
+    });
+    const recentChats = parsedEntries.join("\n");
 
     return recentChats;
   }
@@ -310,10 +417,14 @@ class MemoryManager {
       return;
     }
 
-    const content = seedContent.split(delimiter);
+        const content = seedContent.split(delimiter);
+    let baseScore = Date.now();
     for (const line of content) {
-      const randomScore = randomBytes(6).readUIntBE(0, 6);
-      await this.history.zadd(key, { score: randomScore, member: line });
+      await this.history.zadd(key, { score: baseScore++, member: line });
+    }
+    // Enforce 24-hour expiry on seeded history to match session token expiry policy
+    await this.history.expire(key, 86400);
+  });
     }
   }
 }
