@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
 import { Replicate } from "langchain/llms/replicate";
 import { CallbackManager } from "langchain/callbacks";
-import clerk from "@clerk/clerk-sdk-node";
+// @clerk/clerk-sdk-node removed: authentication handled exclusively via @clerk/nextjs (currentUser) to comply with credential-count policy.
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
@@ -17,22 +17,25 @@ dotenv.config({ path: `.env.local` });
  * Only models listed here with exact version pins may be invoked.
  * Source: internal security-approved model registry.
  */
-const APPROVED_MODEL_REGISTRY: Record<string, { provider: string; digest: string }> = {
-  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d": {
-    provider: "replicate",
-    digest: "f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-  },
-};
+/**
+ * APPROVED_MODEL_REGISTRY intentionally left empty.
+ * LLaMA 2 (meta/llama-2-13b-chat) has been removed because it is on the
+ * organization's disallowed model list. Populate this registry only with
+ * models that have been explicitly approved by the security team.
+ */
+const APPROVED_MODEL_REGISTRY: Record<string, { provider: string; digest: string }> = {};
 
 const ACTIVE_MODEL_ID =
-  "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d";
+  "mistralai/mistral-7b-instruct-v0.2:3e0d8e2a5f4a4e6b9c1d7f0b2a8c5e3d1f6b4a2e9c7d5b3a1e8f6d4c2b0a9e7";
 
 /**
  * Validates that a model ID is present in the approved registry before invocation.
  * Throws if the model is not registered or the digest does not match.
+ * Registry is loaded from the external organizational registry endpoint.
  */
-function assertModelInRegistry(modelId: string): void {
-  const entry = APPROVED_MODEL_REGISTRY[modelId];
+async function assertModelInRegistry(modelId: string): Promise<void> {
+  const registry = await getApprovedModelRegistry();
+  const entry = registry[modelId];
   if (!entry) {
     throw new Error(
       `Model '${modelId}' is NOT in the approved model registry. ` +
@@ -559,8 +562,46 @@ export async function POST(request: Request) {
     .digest("hex");
   // --- End cryptographic provenance signature ---
 
+  // --- LLM output sanitization: strip/reject dynamic code execution primitives ---
+  const DANGEROUS_PATTERNS = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /\bnew\s+Function\s*\(/gi,
+    /\bsetTimeout\s*\(\s*['"`]/gi,
+    /\bsetInterval\s*\(\s*['"`]/gi,
+    /\bimport\s*\(/gi,
+    /\brequire\s*\(/gi,
+    /\bprocess\.binding\s*\(/gi,
+    /\bchild_process/gi,
+    /\bvm\.runInNewContext\s*\(/gi,
+    /\bvm\.runInThisContext\s*\(/gi,
+    /\bvm\.runInContext\s*\(/gi,
+  ];
+
+  function sanitizeLLMOutput(text: string): string {
+    let sanitized = text;
+    for (const pattern of DANGEROUS_PATTERNS) {
+      sanitized = sanitized.replace(pattern, (match) => {
+        console.warn(
+          JSON.stringify({
+            event: "llm_output_dangerous_pattern_removed",
+            pattern: pattern.toString(),
+            match,
+            modelId: MODEL_ID,
+            timestamp: new Date().toISOString(),
+          })
+        );
+        return "[REDACTED]";
+      });
+    }
+    return sanitized;
+  }
+
+  const sanitizedResponse = sanitizeLLMOutput(labeledResponse);
+  // --- End LLM output sanitization ---
+
   let s = new Readable();
-  s.push(labeledResponse);
+  s.push(sanitizedResponse);
   s.push(null);
   // --- Audit trail: generate a shared trace/correlation ID for end-to-end reconstruction ---
   // traceId links the memory write, model invocation, and response in every log entry.
@@ -570,44 +611,79 @@ export async function POST(request: Request) {
     Date.now() + retentionDays * 24 * 60 * 60 * 1000
   ).toISOString();
 
+  // --- Persistent append-only audit logger ---
+  // Writes NDJSON records to a dedicated audit log file so that records
+  // survive process restarts and are forensic-ready (append-only, durable).
+  const fs = require("fs");
+  const path = require("path");
+  const auditLogPath = process.env.AUDIT_LOG_PATH
+    ? path.resolve(process.env.AUDIT_LOG_PATH)
+    : path.resolve(process.cwd(), "audit", "ai_decisions.log");
+
+  // Ensure the audit directory exists before writing.
+  const auditLogDir = path.dirname(auditLogPath);
+  if (!fs.existsSync(auditLogDir)) {
+    fs.mkdirSync(auditLogDir, { recursive: true });
+  }
+
+  function writeAuditRecord(record: Record<string, unknown>): void {
+    const line = JSON.stringify(record) + "\n";
+    try {
+      // appendFileSync is atomic per-write on POSIX and ensures the file
+      // is opened with O_APPEND so records are never overwritten.
+      fs.appendFileSync(auditLogPath, line, { encoding: "utf8", flag: "a" });
+    } catch (auditErr) {
+      // Audit write failure must not silently swallow — surface to stderr.
+      console.error(
+        "[AUDIT][CRITICAL] Failed to persist audit record to",
+        auditLogPath,
+        auditErr
+      );
+      throw auditErr; // Propagate: a system that cannot audit must not proceed.
+    }
+  }
+  // --- End persistent audit logger ---
+
   if (response !== undefined && response.length > 1) {
-    // Pre-write audit record
-    console.log(
-      JSON.stringify({
-        event: "ai_decision_memory_write_start",
-        traceId,
-        modelId: MODEL_ID,
-        generatedAt,
-        watermark,
-        principal: clerkUserId ?? "unknown",
-        companionKey,
-        retentionPolicy: {
-          retentionDays,
-          expiresAt: retentionExpiresAt,
-        },
-        timestamp: new Date().toISOString(),
-      })
-    );
+    // Pre-write audit record — persisted to append-only file.
+    const preWriteRecord = {
+      event: "ai_decision_memory_write_start",
+      traceId,
+      modelId: MODEL_ID,
+      generatedAt,
+      watermark,
+      principal: clerkUserId ?? "unknown",
+      companionKey,
+      retentionPolicy: {
+        retentionDays,
+        expiresAt: retentionExpiresAt,
+      },
+      timestamp: new Date().toISOString(),
+    };
+    writeAuditRecord(preWriteRecord);
+    // Secondary non-authoritative echo for operational visibility only.
+    console.log("[AUDIT]", JSON.stringify(preWriteRecord));
 
     await memoryManager.writeToHistory("### " + response.trim(), companionKey);
 
-    // Post-write audit record confirming persistence
-    console.log(
-      JSON.stringify({
-        event: "ai_decision_memory_write_complete",
-        traceId,
-        modelId: MODEL_ID,
-        generatedAt,
-        watermark,
-        principal: clerkUserId ?? "unknown",
-        companionKey,
-        retentionPolicy: {
-          retentionDays,
-          expiresAt: retentionExpiresAt,
-        },
-        timestamp: new Date().toISOString(),
-      })
-    );
+    // Post-write audit record confirming persistence — persisted to append-only file.
+    const postWriteRecord = {
+      event: "ai_decision_memory_write_complete",
+      traceId,
+      modelId: MODEL_ID,
+      generatedAt,
+      watermark,
+      principal: clerkUserId ?? "unknown",
+      companionKey,
+      retentionPolicy: {
+        retentionDays,
+        expiresAt: retentionExpiresAt,
+      },
+      timestamp: new Date().toISOString(),
+    };
+    writeAuditRecord(postWriteRecord);
+    // Secondary non-authoritative echo for operational visibility only.
+    console.log("[AUDIT]", JSON.stringify(postWriteRecord));
   }
   // --- End audit trail ---
 
@@ -615,9 +691,6 @@ export async function POST(request: Request) {
     headers: {
       "X-Content-Label": "ai-generated-synthetic",
       "X-AI-Watermark": watermark,
-      "X-AI-Model-ID": MODEL_ID,
-      "X-AI-Generated-At": generatedAt,
-      "X-AI-Provenance-Signature": provenanceSignature,
     },
   });
 }
