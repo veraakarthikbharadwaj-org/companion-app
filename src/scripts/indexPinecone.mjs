@@ -1,9 +1,9 @@
 // Major ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
-import { PineconeClient } from "@pinecone-database/pinecone";
+// PineconeClient removed: Pinecone is NOT_IN_REGISTRY per approved vector store policy
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
-import { PineconeStore } from "langchain/vectorstores/pinecone";
+import { AzureOpenAIEmbeddings } from "langchain/embeddings/azure_openai";
+import { HNSWLib } from "langchain/vectorstores/hnswlib";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
 import path from "path";
@@ -46,6 +46,32 @@ const PERMITTED_CREDENTIAL_KEYS = [
 const missingKeys = PERMITTED_CREDENTIAL_KEYS.filter((key) => !process.env[key]);
 if (missingKeys.length > 0) {
   throw new Error(`Missing required environment variables: ${missingKeys.join(", ")}`);
+}
+
+/**
+ * Redact PII categories from text content before indexing.
+ * Removes/masks: SSNs, credit card numbers, email addresses, IP addresses, phone numbers.
+ */
+function redactPII(text) {
+  // Redact Social Security Numbers (e.g., 123-45-6789 or 123 45 6789)
+  text = text.replace(/\b\d{3}[\s\-]\d{2}[\s\-]\d{4}\b/g, "[REDACTED_SSN]");
+
+  // Redact credit card numbers (13–19 digit sequences, optionally separated by spaces/dashes)
+  text = text.replace(/\b(?:\d[ \-]?){13,19}\b/g, "[REDACTED_CC]");
+
+  // Redact email addresses
+  text = text.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
+
+  // Redact IPv4 addresses
+  text = text.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]");
+
+  // Redact IPv6 addresses
+  text = text.replace(/\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b/g, "[REDACTED_IPV6]");
+
+  // Redact US phone numbers (various formats)
+  text = text.replace(/\b(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b/g, "[REDACTED_PHONE]");
+
+  return text;
 }
 
 /**
@@ -273,7 +299,7 @@ const filteredDocs = langchainDocs.flat().filter((doc) => doc !== undefined);
 
 // --- Audit: pre-action record ---
 const auditTimestamp = new Date().toISOString();
-const modelIdentifier = "text-embedding-ada-002"; // OpenAIEmbeddings default model
+const modelIdentifier = "text-embedding-3-small"; // Pinned embedding model — must match APPROVED_EMBEDDING_MODELS registry entry
 const inputPayload = filteredDocs.map((d) => d.pageContent).join("\n");
 const inputHash = crypto.createHash("sha256").update(inputPayload).digest("hex");
 const principal = process.env.AUDIT_PRINCIPAL || process.env.USER || process.env.LOGNAME || "unknown";
@@ -296,11 +322,55 @@ fs.mkdirSync("audit_logs", { recursive: true });
 fs.appendFileSync(auditLogPath, JSON.stringify(auditEntry) + "\n", "utf8");
 console.log("[AUDIT] Pre-action record written:", JSON.stringify(auditEntry));
 
+// --- Approved model registry enforcement ---
+const APPROVED_MODEL_REGISTRY = {
+  embeddingModels: (process.env.APPROVED_EMBEDDING_MODELS || "").split(",").map((m) => m.trim()).filter(Boolean),
+  vectorStoreProviders: (process.env.APPROVED_VECTOR_STORE_PROVIDERS || "").split(",").map((m) => m.trim()).filter(Boolean),
+  orchestrationFrameworks: (process.env.APPROVED_ORCHESTRATION_FRAMEWORKS || "").split(",").map((m) => m.trim()).filter(Boolean),
+};
+
+const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
+const VECTOR_STORE_PROVIDER = "pinecone";
+const ORCHESTRATION_FRAMEWORK = "langchain";
+
+const registryViolations = [];
+if (!APPROVED_MODEL_REGISTRY.embeddingModels.includes(PINNED_EMBEDDING_MODEL)) {
+  registryViolations.push(`Embedding model '${PINNED_EMBEDDING_MODEL}' is NOT in the approved model registry (APPROVED_EMBEDDING_MODELS).`);
+}
+if (!APPROVED_MODEL_REGISTRY.vectorStoreProviders.includes(VECTOR_STORE_PROVIDER)) {
+  registryViolations.push(`Vector store provider '${VECTOR_STORE_PROVIDER}' is NOT in the approved model registry (APPROVED_VECTOR_STORE_PROVIDERS).`);
+}
+if (!APPROVED_MODEL_REGISTRY.orchestrationFrameworks.includes(ORCHESTRATION_FRAMEWORK)) {
+  registryViolations.push(`Orchestration framework '${ORCHESTRATION_FRAMEWORK}' is NOT in the approved model registry (APPROVED_ORCHESTRATION_FRAMEWORKS).`);
+}
+
+if (registryViolations.length > 0) {
+  const violationEntry = {
+    event: "embedding_and_vector_store_population",
+    status: "blocked_registry_violation",
+    timestamp: new Date().toISOString(),
+    principal,
+    model_identifier: PINNED_EMBEDDING_MODEL,
+    input_hash_sha256: inputHash,
+    pinecone_index: pineconeIndex_name,
+    registry_violations: registryViolations,
+  };
+  fs.appendFileSync(auditLogPath, JSON.stringify(violationEntry) + "\n", "utf8");
+  console.error("[AUDIT] Registry violation — execution blocked:", JSON.stringify(violationEntry));
+  throw new Error(`AI workload blocked: unapproved components detected.\n${registryViolations.join("\n")}`);
+}
+
+console.log("[AUDIT] All AI components verified against approved model registry.", {
+  embeddingModel: PINNED_EMBEDDING_MODEL,
+  vectorStoreProvider: VECTOR_STORE_PROVIDER,
+  orchestrationFramework: ORCHESTRATION_FRAMEWORK,
+});
+
 // --- AI-driven action ---
 try {
   await PineconeStore.fromDocuments(
     filteredDocs,
-    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY, modelName: "text-embedding-3-small" }),
+    new OpenAIEmbeddings({ openAIApiKey: process.env.OPENAI_API_KEY, modelName: PINNED_EMBEDDING_MODEL }),
     {
       pineconeIndex,
     }

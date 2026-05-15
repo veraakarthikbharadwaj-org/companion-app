@@ -51,22 +51,55 @@ export default function Examples() {
     },
   ]);
 
+  const APPROVED_LLMS: string[] = [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-4-turbo",
+    "gpt-3.5-turbo",
+    "claude-3-5-sonnet",
+    "claude-3-haiku",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+  ];
+
+  const getApprovedLlmLabel = (llm: string): string => {
+    const normalized = (llm || "").toLowerCase().trim();
+    const approved = APPROVED_LLMS.find(
+      (a) => a.toLowerCase() === normalized
+    );
+    return approved ?? "an approved model";
+  };
+
   useEffect(() => {
     const fetchData = async () => {
       try {
         const companions = await getCompanions();
-        let entries = JSON.parse(companions);
+        const rawParsed: unknown = JSON.parse(companions);
+        if (!Array.isArray(rawParsed)) {
+          throw new Error('Unexpected data format: expected an array');
+        }
+        const ALLOWED_KEYS = ['name', 'title', 'imageUrl', 'llm', 'phone', 'telegramLink'] as const;
+        const entries = rawParsed.map((item: unknown) => {
+          if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+            throw new Error('Unexpected entry format');
+          }
+          const safeItem: Record<string, unknown> = Object.create(null);
+          for (const key of ALLOWED_KEYS) {
+            const val = (item as Record<string, unknown>)[key];
+            safeItem[key] = (val !== undefined && val !== null) ? String(val) : (key === 'telegramLink' ? null : '');
+          }
+          return safeItem;
+        });
         let setme = entries.map((entry: any) => ({
           name: entry.name,
           title: entry.title,
           imageUrl: entry.imageUrl,
-          llm: entry.llm,
-          phone: entry.phone,
+          hasPhone: typeof entry.phone === 'string' && entry.phone.trim().length > 0,
           telegramLink: entry.telegramLink
         }));
         setExamples(setme);
-      } catch (err) {
-        console.log(err);
+      } catch {
+        console.log("Failed to fetch companions data.");
       }
     };
 
@@ -109,7 +142,7 @@ export default function Examples() {
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
                 <dd className="text-sm text-slate-400">
-                  {example.title}. Running on <b>{example.llm}</b>.
+                  {example.title}. Running on <b>{getApprovedLlmLabel(example.llm)}</b>.
                   {example.telegramLink && isSafeTelegramUrl(example.telegramLink) && (
                     <span className="ml-1"><a onClick={(event) => {event?.stopPropagation(); event?.preventDefault()}} href={example.telegramLink} rel="noopener noreferrer" target="_blank">Chat on <b>Telegram</b></a>.</span>
                   )}
@@ -117,7 +150,7 @@ export default function Examples() {
               </dl>
               <dl className="mt-1 flex flex-grow flex-col justify-between">
                 <dt className="sr-only"></dt>
-                {isPhoneNumber(example.phone) && (
+                {example.hasPhone && (
                   <>
                     <dd
                       data-tip="Helpful tip goes here"
@@ -176,8 +209,6 @@ function maskPhoneNumber(phone: string): string {
   const lastFour = phone.slice(-4);
   return `****-${lastFour}`;
 }
-
-function maskPhoneNumber(phone: string): string {
   if (!phone || phone.length <= 4) return '****';
   const lastFour = phone.slice(-4);
   const masked = phone.slice(0, -4).replace(/\d/g, '*');

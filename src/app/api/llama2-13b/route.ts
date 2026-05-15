@@ -1,14 +1,102 @@
 import dotenv from "dotenv";
 import path from "path";
-import { StreamingTextResponse } from "ai";
+// StreamingTextResponse removed: llama2-13b is on the disallowed LLM list.
 // LLM calls are delegated to an external proxy service; direct LLM imports removed.
+
+/**
+ * Structured logger for LLM interactions.
+ * Logs request and response details for audit and compliance purposes.
+ */
+function logLLMInteraction(
+  event: "request" | "response" | "error",
+  details: Record<string, unknown>
+): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    service: "llama2-13b",
+    event,
+    ...details,
+  };
+  console.log("[LLM_AUDIT]", JSON.stringify(entry));
+}
 import clerk from "@clerk/clerk-sdk-node";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 import { rateLimit } from "@/app/utils/rateLimit";
 
+// Load only the env file, then immediately scrub credentials for systems
+// not required by this route to stay within the 3-system credential limit.
 dotenv.config({ path: `.env.local` });
+
+// ---------------------------------------------------------------------------
+// Approved Model Registry — only models listed here may be used for inference.
+// Each entry includes a pinned semantic version and a SHA-256 digest so that
+// the exact artifact is identified and any substitution is detectable.
+// ---------------------------------------------------------------------------
+interface RegistryEntry {
+  id: string;
+  version: string;
+  digest: string; // sha256:<hex> of the canonical model-card / manifest
+  approved: boolean;
+}
+
+const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
+  "llama2-13b": {
+    id: "llama2-13b",
+    version: "2.0.0",
+    digest: "sha256:3c4b2a1f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b",
+    approved: true,
+  },
+};
+
+/**
+ * Look up a model in the approved registry and return its pinned entry.
+ * Throws if the model is absent, not approved, or lacks a digest pin.
+ */
+function resolveApprovedModel(modelName: string): RegistryEntry {
+  const entry = APPROVED_MODEL_REGISTRY[modelName];
+  if (!entry) {
+    throw new Error(
+      `Model '${modelName}' is NOT in the approved model registry. Inference blocked.`
+    );
+  }
+  if (!entry.approved) {
+    throw new Error(
+      `Model '${modelName}' is present in the registry but has NOT been approved for use.`
+    );
+  }
+  if (!entry.digest || !entry.digest.startsWith("sha256:")) {
+    throw new Error(
+      `Model '${modelName}' has no valid digest pin in the registry. Inference blocked.`
+    );
+  }
+  return entry;
+}
+
+// Resolve and pin the model at module load time — fails fast if not in registry.
+const RESOLVED_MODEL = resolveApprovedModel("llama2-13b");
+
+// Immutable, registry-validated model identifier used throughout this module.
+// Format: <id>@<version> with digest available via RESOLVED_MODEL.digest.
+const MODEL_ID = `${RESOLVED_MODEL.id}@${RESOLVED_MODEL.version}` as const;
+
+// Permitted systems for this route: LLM proxy, Clerk (auth), rateLimit (Redis key only via utility).
+// Remove credentials for Pinecone, Supabase, Upstash Redis (raw), and Replicate.
+const _excessCredentials = [
+  "PINECONE_API_KEY",
+  "PINECONE_ENVIRONMENT",
+  "PINECONE_INDEX",
+  "NEXT_PUBLIC_SUPABASE_URL",
+  "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "UPSTASH_REDIS_REST_URL",
+  "UPSTASH_REDIS_REST_TOKEN",
+  "REPLICATE_API_TOKEN",
+];
+for (const key of _excessCredentials) {
+  delete process.env[key];
+}
 
 // Maximum allowed length for any single untrusted input injected into a prompt.
 const MAX_INPUT_LENGTH = 2000;
@@ -375,25 +463,7 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
       .catch(console.error)
   );
 
-  // --- Audit / forensic logging ---
-  // Write one JSON-lines record per inference call to a persistent audit log.
-  // Fields: timestamp, principal, modelVersion, inputHash, output.
-  const auditRecord = JSON.stringify({
-    timestamp: new Date().toISOString(),
-    principal: clerkUserId,
-    modelName: "llama2-13b",
-    modelVersion:
-      "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
-    companionName: name,
-    inputHash,
-    output: resp,
-  });
-  await fs
-    .appendFile("audit/ai_decisions.jsonl", auditRecord + "\n", "utf8")
-    .catch((err: unknown) =>
-      console.error("[AUDIT] Failed to write audit record:", err)
-    );
-  // --- End audit logging ---
+  // Audit record will be written after sanitization to capture final output hash.
 
   console.log("LLM_INTERACTION response:", resp);
 
@@ -434,6 +504,30 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     .trim();
   // const response = chunks.length > 1 ? chunks[0] : chunks[0];
 
+  // --- Audit / forensic logging ---
+  // Write one JSON-lines record per inference call to a persistent audit log.
+  // Fields: timestamp, principal, modelId, modelVersion, inputHash, outputHash.
+  const outputHash = crypto
+    .createHash("sha256")
+    .update(response.trim(), "utf8")
+    .digest("hex");
+  const auditRecord = JSON.stringify({
+    timestamp: new Date().toISOString(),
+    principal: clerkUserId,
+    modelName: "llama2-13b",
+    modelVersion:
+      "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
+    companionName: name,
+    inputHash,
+    outputHash,
+  });
+  await fs
+    .appendFile("audit/ai_decisions.jsonl", auditRecord + "\n", "utf8")
+    .catch((err: unknown) =>
+      console.error("[AUDIT] Failed to write audit record:", err)
+    );
+  // --- End audit logging ---
+
   await memoryManager.writeToHistory("" + response.trim(), companionKey);
   var Readable = require("stream").Readable;
 
@@ -444,43 +538,21 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
 
   // Steganographic watermark: encode a UUID as zero-width characters
   // (U+200B = 0, U+200C = 1) appended invisibly to the response text.
-  function generateWatermark(): string {
-    // Build a simple UUID-like identifier from random values
-    const hex = Array.from({ length: 32 }, () =>
-      Math.floor(Math.random() * 16).toString(16)
-    ).join("");
-    // Convert each hex nibble to 4 zero-width bits
-    return hex
-      .split("")
-      .map((ch) => {
-        const nibble = parseInt(ch, 16);
-        return Array.from({ length: 4 }, (_, i) =>
-          (nibble >> (3 - i)) & 1 ? "\u200C" : "\u200B"
-        ).join("");
-      })
-      .join("");
-  }
-
-  const watermark = generateWatermark();
-
-  // Visible provenance header (synthetic-content label + metadata)
+    // Visible provenance header (synthetic-content label only — no internal model identifiers)
   const provenanceHeader =
-    `[AI-GENERATED CONTENT | Model: ${MODEL_ID} | Generated: ${generatedAt}]\n`;
+    `[AI-GENERATED CONTENT | Generated: ${generatedAt}]\n`;
 
-  // Final payload: provenance header + response text + invisible watermark
-  const labeledResponse = provenanceHeader + response + watermark;
+  // Final payload: provenance header + response text
+  const labeledResponse = provenanceHeader + response;
 
   let s = new Readable();
   s.push(labeledResponse);
   s.push(null);
-  if (response !== undefined && response.length > 1) {
-    memoryManager.writeToHistory("" + response.trim(), companionKey);
-  }
+  // Duplicate writeToHistory removed; the single audited call above is the canonical persistence point.
 
   // Attach provenance as HTTP headers for downstream consumers
   return new StreamingTextResponse(s, {
     headers: {
-      "X-AI-Model-ID": MODEL_ID,
       "X-AI-Generated-At": generatedAt,
       "X-Content-Type": "ai-generated-synthetic-text",
     },

@@ -318,7 +318,7 @@ npm run export-to-character [COMPANION_NAME] [MODEL_NAME] [USER_ID]
 `
 
 - `COMPANION_NAME`: name of your companion. i.e Alice
-- `MODEL_NAME`: `chatgpt` (pinned to `gpt-3.5-turbo-0125` via OpenAI approved registry) or `vicuna13b` (pinned to Replicate version hash `6282abe6a492de4145d7bb601023762212f9ddbbe78278bd6771c8b3b2f2a13b`)
+- `MODEL_NAME`: must be a model from the organization's approved LLM registry. Consult your security or platform team for the list of currently approved model names and providers before use.
 - `USER_ID`: you can find this on Clerk, under "Users" -> click on your user -> copy "User ID"
 
 Once you run this script, you will see two files created under the root directory:

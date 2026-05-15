@@ -17,16 +17,36 @@ create function match_documents (
   match_count int DEFAULT null,
   filter jsonb DEFAULT '{}'
 ) returns table (
-  content text,
+  id bigint,
+  content_summary text,
   similarity float
 )
 language plpgsql
 as $$
 #variable_conflict use_column
 begin
+  -- Validate query_embedding
+  if query_embedding is null then
+    raise exception 'query_embedding must not be null';
+  end if;
+
+  -- Validate match_count
+  if match_count is not null and (match_count < 1 or match_count > 1000) then
+    raise exception 'match_count must be between 1 and 1000, got %', match_count;
+  end if;
+
+  -- Validate filter: must be a JSON object (not array, null, or scalar)
+  if filter is null then
+    filter := '{}'::jsonb;
+  end if;
+  if jsonb_typeof(filter) <> 'object' then
+    raise exception 'filter must be a JSON object, got %', jsonb_typeof(filter);
+  end if;
+
   return query
   select
-    content,
+    documents.id,
+    left(content, 500) as content_summary,
     1 - (documents.embedding <=> query_embedding) as similarity
   from documents
   where metadata @> filter

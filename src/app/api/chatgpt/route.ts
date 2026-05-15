@@ -1,4 +1,4 @@
-import { OpenAI } from "langchain/llms/openai";
+import { ChatOllama } from "langchain/chat_models/ollama";
 import dotenv from "dotenv";
 import { LLMChain } from "langchain/chains";
 import { StreamingTextResponse, LangChainStream } from "ai";
@@ -93,9 +93,12 @@ export async function POST(req: Request) {
     );
   }
   console.log("prompt: ", sanitizedPrompt);
+  // Derive isText from the presence of a Bearer token in the Authorization header.
+  // This distinguishes API/text clients (Bearer token) from browser sessions (cookie-based).
+  const authHeader = req.headers.get("Authorization");
+  const isText = !!(authHeader?.startsWith("Bearer "));
   if (isText) {
     // Verify the bearer token server-side; do NOT trust userId from the request body.
-    const authHeader = req.headers.get("Authorization");
     const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
     if (!token) {
       console.log("user not authorized: missing bearer token");
@@ -107,12 +110,101 @@ export async function POST(req: Request) {
         }
       );
     }
-    let verifiedPayload;
+        let verifiedPayload;
     try {
       verifiedPayload = await verifyToken(token, {
         secretKey: process.env.CLERK_SECRET_KEY!,
       });
     } catch (e) {
+      console.log("user not authorized: invalid token", e);
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    // Explicitly enforce expiry and not-before claims.
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (typeof verifiedPayload.exp === "number" && nowSec >= verifiedPayload.exp) {
+      console.log("user not authorized: token expired");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    if (typeof verifiedPayload.nbf === "number" && nowSec < verifiedPayload.nbf) {
+      console.log("user not authorized: token not yet valid");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    clerkUserId = verifiedPayload.sub;
+    // Fetch the user record to get the display name
+    const verifiedUser = await clerk.users.getUser(clerkUserId);
+    clerkUserName = verifiedUser?.firstName ?? verifiedUser?.lastName ?? "";
+  } else {
+    // Non-text path: require and verify a Bearer token — never trust unverified session state.
+    const elseAuthHeader = req.headers.get("Authorization");
+    const elseToken = elseAuthHeader?.startsWith("Bearer ") ? elseAuthHeader.slice(7) : null;
+    if (!elseToken) {
+      console.log("user not authorized: missing bearer token (non-text path)");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    let elseVerifiedPayload;
+    try {
+      elseVerifiedPayload = await verifyToken(elseToken, {
+        secretKey: process.env.CLERK_SECRET_KEY!,
+      });
+    } catch (e) {
+      console.log("user not authorized: invalid token (non-text path)", e);
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    const elseNowSec = Math.floor(Date.now() / 1000);
+    if (typeof elseVerifiedPayload.exp === "number" && elseNowSec >= elseVerifiedPayload.exp) {
+      console.log("user not authorized: token expired (non-text path)");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    if (typeof elseVerifiedPayload.nbf === "number" && elseNowSec < elseVerifiedPayload.nbf) {
+      console.log("user not authorized: token not yet valid (non-text path)");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    clerkUserId = elseVerifiedPayload.sub;
+    const elseVerifiedUser = await clerk.users.getUser(clerkUserId);
+    clerkUserName = elseVerifiedUser?.firstName ?? userName;
+  } catch (e) {
       console.log("user not authorized: invalid token", e);
       return new NextResponse(
         JSON.stringify({ Message: "User not authorized" }),
@@ -128,8 +220,18 @@ export async function POST(req: Request) {
     clerkUserName = verifiedUser?.firstName ?? userName;
   } else {
     user = await currentUser();
-    clerkUserId = user?.id;
-    clerkUserName = user?.firstName;
+    if (!user) {
+      console.log("user not authorized: no authenticated session");
+      return new NextResponse(
+        JSON.stringify({ Message: "User not authorized" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    clerkUserId = user.id;
+    clerkUserName = user.firstName;
   }
 
   if (!clerkUserId || !!!(await clerk.users.getUser(clerkUserId))) {
@@ -285,10 +387,10 @@ export async function POST(req: Request) {
   );
   // ─────────────────────────────────────────────────────────────────────────
 
-  const model = new OpenAI({
+  const model = new ChatOllama({
     streaming: true,
     modelName: pinnedModelName, // pinned immutable snapshot, not a mutable tag
-    openAIApiKey: process.env.OPENAI_API_KEY,
+    baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
     callbackManager: CallbackManager.fromHandlers(handlers),
   });
   model.verbose = true;
@@ -342,22 +444,43 @@ export async function POST(req: Request) {
     .catch(console.error);
 
   // Durable audit record — append a JSON line to audit.log for forensic readiness
+  // Minimised: no full output text, no companion name, no raw userId, no inputHash exposed
+  const principalHash = crypto.createHash("sha256").update(clerkUserId ?? "").digest("hex");
   const auditRecord = JSON.stringify({
     timestamp: inferenceTimestamp,
-    principal: clerkUserId,
+    principalHash,
     modelIdentifier,
-    companionName: name,
-    inputHash,
-    output: result?.text ?? null,
     success: result != null,
   });
-  await appendFile("audit.log", auditRecord + "\n").catch((err) =>
-    console.error("AUDIT WRITE FAILED:", err)
-  );
+  // Audit write is mandatory — any failure halts the request so no AI action
+  // goes unlogged (forensic readiness requirement).
+  try {
+    // Rotate audit.log when it exceeds 50 MB to enforce a retention boundary.
+    const AUDIT_LOG_PATH = "audit.log";
+    const MAX_AUDIT_BYTES = 50 * 1024 * 1024; // 50 MB
+    try {
+      const { size } = await import("fs/promises").then((fs) =>
+        fs.stat(AUDIT_LOG_PATH).catch(() => ({ size: 0 }))
+      );
+      if (size >= MAX_AUDIT_BYTES) {
+        const rotatedName = `audit.${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+        await import("fs/promises").then((fs) =>
+          fs.rename(AUDIT_LOG_PATH, rotatedName)
+        );
+      }
+    } catch (_rotateErr) {
+      // Rotation failure is non-fatal but must be surfaced to operators.
+      console.error("AUDIT ROTATION ERROR — manual intervention required:", _rotateErr);
+    }
 
-  console.log("[LLM OUTPUT] Full response from LLM:", result);
+    await appendFile(AUDIT_LOG_PATH, auditRecord + "\n");
+  } catch (auditErr) {
+    // Alert operators and halt — do NOT silently swallow audit failures.
+    console.error("CRITICAL: AUDIT WRITE FAILED — halting request to preserve forensic integrity:", auditErr);
+    throw new Error("Audit logging failure: AI action cannot proceed without a durable audit record.");
+  }
 
-  console.log("result", result);
+  // LLM output logging suppressed to enforce output data minimisation
   // Validate and sanitize LLM output for dynamic code execution primitives
   const sanitizeLLMOutput = (text: string): string => {
     const dangerousPatterns = [
@@ -392,8 +515,47 @@ export async function POST(req: Request) {
     companionKey
   );
   console.log("chatHistoryRecord", chatHistoryRecord);
+  // --- Synthetic Content Provenance & Labeling ---
+  // Build a provenance envelope that identifies this response as AI-generated.
+  const provenanceMetadata = {
+    modelId: modelIdentifier,
+    generatedAt: inferenceTimestamp,
+    originTag: "ai-generated",
+    contentLabel: "SYNTHETIC_AI_CONTENT",
+  };
+
+  // Compute an HMAC-SHA256 signature over (modelId + timestamp + sanitizedText)
+  // so downstream consumers can verify authenticity and detect tampering.
+  const PROVENANCE_SECRET = process.env.PROVENANCE_HMAC_SECRET ?? "change-me-in-env";
+  const signaturePayload = `${provenanceMetadata.modelId}|${provenanceMetadata.generatedAt}|${sanitizedText}`;
+  const provenanceSignature = crypto
+    .createHmac("sha256", PROVENANCE_SECRET)
+    .update(signaturePayload)
+    .digest("hex");
+
+  // Common provenance headers applied to every response path.
+  const provenanceHeaders: Record<string, string> = {
+    "X-Content-Label": provenanceMetadata.contentLabel,
+    "X-AI-Origin-Tag": provenanceMetadata.originTag,
+    "X-AI-Model-Id": provenanceMetadata.modelId,
+    "X-AI-Generated-At": provenanceMetadata.generatedAt,
+    "X-AI-Provenance-Signature": provenanceSignature,
+  };
+
   if (isText) {
-    return NextResponse.json(sanitizedText);
+    // Wrap the text in a provenance envelope so the body itself is labeled.
+    const envelopedResponse = {
+      content: sanitizedText,
+      provenance: provenanceMetadata,
+      signature: provenanceSignature,
+    };
+    return NextResponse.json(envelopedResponse, { headers: provenanceHeaders });
   }
-  return new StreamingTextResponse(stream);
+
+  // Streaming path: attach provenance headers to the StreamingTextResponse.
+  const streamingResponse = new StreamingTextResponse(stream);
+  Object.entries(provenanceHeaders).forEach(([key, value]) => {
+    streamingResponse.headers.set(key, value);
+  });
+  return streamingResponse;
 }

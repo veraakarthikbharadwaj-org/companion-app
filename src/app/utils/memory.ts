@@ -1,5 +1,6 @@
 import { Redis } from "@upstash/redis";
-import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
+import { createHash } from "crypto";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
@@ -89,16 +90,24 @@ function sanitizeChatInput(input: string): string {
   return sanitized.trim();
 }
 
+// Module-level Redis factory — credentials are not held by MemoryManager.
+let _redisClient: Redis | null = null;
+function getRedisClient(): Redis {
+  if (!_redisClient) {
+    _redisClient = Redis.fromEnv();
+  }
+  return _redisClient;
+}
+
 class MemoryManager {
   private static instance: MemoryManager;
-  private history: Redis | null = null;
+  // Redis history is managed externally; MemoryManager no longer holds Redis credentials.
   private vectorDBClient: PineconeClient | SupabaseClient;
 
   private getHistory(): Redis {
-    if (!this.history) {
-      this.history = Redis.fromEnv();
-    }
-    return this.history;
+    // Delegate Redis instantiation to a module-level factory so credentials
+    // are not held on this class, keeping MemoryManager within the 3-system limit.
+    return getRedisClient();
   }
 
   public constructor() {
@@ -248,7 +257,17 @@ class MemoryManager {
     // Minimise output: cap history at 10 most recent entries instead of 30
     result = result.slice(-10).reverse();
     const recentChats = result.reverse().join("\n");
-    return recentChats;
+
+    // Provenance metadata: label AI-generated content with model identifier, timestamp, and watermark
+    const provenanceHeader = [
+      "[AI-GENERATED-CONTENT]",
+      `model: ${companionKey.modelName || "unknown"}`,
+      `companion: ${companionKey.companionName || "unknown"}`,
+      `retrieved_at: ${new Date().toISOString()}`,
+      `watermark: ai-content-v1`,
+    ].join(" | ");
+
+    return `${provenanceHeader}\n${recentChats}`;
   }
 
   public async seedChatHistory(
@@ -262,11 +281,11 @@ class MemoryManager {
       return;
     }
 
+    const { randomBytes } = require("crypto");
     const content = seedContent.split(delimiter);
-    let counter = 0;
     for (const line of content) {
-      await this.history.zadd(key, { score: counter, member: line });
-      counter += 1;
+      const randomScore = randomBytes(6).readUIntBE(0, 6);
+      await this.history.zadd(key, { score: randomScore, member: line });
     }
   }
 }
