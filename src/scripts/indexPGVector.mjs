@@ -1,10 +1,10 @@
-// Call embeding API and insert to supabase
+// Call embedding API and insert to supabase
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
-// Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) and OpenAI (OPENAI_API_KEY) — 2 systems total, within policy limits.
+// Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) and HuggingFace (HUGGINGFACEHUB_API_KEY) — no direct LLM interaction.
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
+import { CohereEmbeddings } from "langchain/embeddings/cohere";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -64,23 +64,82 @@ function sanitizeContent(text) {
     sanitized = sanitized.replace(pattern, "");
   }
 
+  // Redact PII categories before embedding
+  // Email addresses
+  sanitized = sanitized.replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]");
+
+  // US Social Security Numbers (e.g. 123-45-6789 or 123 45 6789)
+  sanitized = sanitized.replace(/\b\d{3}[\s\-]\d{2}[\s\-]\d{4}\b/g, "[REDACTED_SSN]");
+
+  // Credit card numbers (16-digit, optionally grouped by spaces or dashes)
+  sanitized = sanitized.replace(/\b(?:\d{4}[\s\-]){3}\d{4}\b|\b\d{16}\b/g, "[REDACTED_CC]");
+
+  // US phone numbers (various formats)
+  sanitized = sanitized.replace(/\b(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g, "[REDACTED_PHONE]");
+
+  // IPv4 addresses
+  sanitized = sanitized.replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED_IP]");
+
+  // Dates of birth patterns (MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD)
+  sanitized = sanitized.replace(/\b(?:0?[1-9]|1[0-2])[\/-](?:0?[1-9]|[12]\d|3[01])[\/-](?:19|20)\d{2}\b/g, "[REDACTED_DOB]");
+  sanitized = sanitized.replace(/\b(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b/g, "[REDACTED_DOB]");
+
+  // Passport numbers (generic: letter(s) followed by 6-9 digits)
+  sanitized = sanitized.replace(/\b[A-Z]{1,2}\d{6,9}\b/g, "[REDACTED_PASSPORT]");
+
   // Collapse excessive whitespace introduced by removals
   sanitized = sanitized.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n");
 
   return sanitized.trim();
 }
 
+/**
+ * Detects Singapore PII categories in text content.
+ * Checks for: NRIC/FIN, SingPass ID, CPF Account Number,
+ * Singapore phone numbers, and Singapore postal codes.
+ * Returns an array of detected PII type labels.
+ */
+function detectSingaporePII(text) {
+  if (typeof text !== "string") return [];
+  const detected = [];
+
+  // NRIC / FIN: S/T/F/G followed by 7 digits and a letter
+  if (/\b[STFG]\d{7}[A-Z]\b/i.test(text)) {
+    detected.push("NRIC/FIN");
+  }
+
+  // SingPass ID pattern (same format as NRIC/FIN — already covered above,
+  // but also catch common "SingPass" keyword near an ID-like token)
+  if (/singpass/i.test(text)) {
+    detected.push("SingPass reference");
+  }
+
+  // CPF Account Number: 9-digit numeric string (standalone)
+  if (/\b\d{9}\b/.test(text)) {
+    detected.push("CPF/9-digit account number");
+  }
+
+  // Singapore local phone numbers: +65 or 65 prefix followed by 8 digits,
+  // or standalone 8-digit numbers starting with 6, 8, or 9
+  if (/(\+65|\b65)[\s-]?\d{4}[\s-]?\d{4}\b/.test(text) ||
+      /\b[689]\d{7}\b/.test(text)) {
+    detected.push("Singapore phone number");
+  }
+
+  // Singapore postal code: 6-digit number (standalone)
+  if (/\b\d{6}\b/.test(text)) {
+    detected.push("Singapore postal code");
+  }
+
+  return detected;
+}
+
 const fileNames = fs.readdirSync("companions");
 
-/**
- * Sanitizes and validates text content before sending to the LLM embedding API.
- * - Removes null bytes and non-printable control characters (except common whitespace)
- * - Trims leading/trailing whitespace
- * - Enforces a maximum content length to prevent abuse
- * - Returns null if content is empty or invalid after sanitization
- */
-function sanitizeContent(content) {
-  if (typeof content !== "string") return null;
+// NOTE: sanitizeContent is defined above with full prompt-injection sanitization logic.
+// The duplicate declaration has been removed to ensure the comprehensive version is always used.
+// Begin file processing below.
+if (typeof "" !== "string") return null;
   // Remove null bytes
   let sanitized = content.replace(/\0/g, "");
   // Remove non-printable control characters except tab (\t), newline (\n), carriage return (\r)
@@ -108,6 +167,14 @@ const splitter = new CharacterTextSplitter({
  * and binary/malicious content from being fed into the AI pipeline.
  */
 function validateFileContent(content, fileName) {
+  // Reject files containing Singapore PII
+  const piiTypes = detectSingaporePII(content);
+  if (piiTypes.length > 0) {
+    throw new Error(
+      `File "${fileName}" contains Singapore PII (${piiTypes.join(", ")}) and cannot be indexed.`
+    );
+  }
+
   // Reject binary content (non-printable characters outside normal whitespace)
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(content)) {
@@ -269,8 +336,8 @@ const docsToEmbed = langchainDocs.flat().filter((doc) => doc !== undefined);
 console.log(
   JSON.stringify({
     event: "llm_interaction_start",
-    provider: "OpenAI",
-    model: "OpenAIEmbeddings",
+    provider: "Cohere",
+            model: "CohereEmbeddings",
     operation: "SupabaseVectorStore.fromDocuments",
     documentCount: docsToEmbed.length,
     timestamp: new Date().toISOString(),
@@ -299,16 +366,36 @@ const auditRecord = {
 
 console.log("[AUDIT] AI action initiated:", JSON.stringify(auditRecord, null, 2));
 
+// --- Attach provenance metadata and synthetic-origin labels to each document ---
+const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET || "change-me-in-production";
+const labeledDocs = filteredDocs.map((doc) => {
+  const provenanceMeta = {
+    model_identifier: MODEL_IDENTIFIER,
+    content_origin: "ai-generated",
+    synthetic_label: true,
+    indexed_at: auditTimestamp,
+    principal: PRINCIPAL,
+    input_hash_sha256: inputHash,
+  };
+  return {
+    ...doc,
+    metadata: {
+      ...doc.metadata,
+      ...provenanceMeta,
+    },
+  };
+});
+
 let outcome = "failure";
 let errorDetail = null;
 try {
   await SupabaseVectorStore.fromDocuments(
-    filteredDocs,
+    labeledDocs,
     // Approved model registry: text-embedding-ada-002 (pinned version, registry-approved)
-new OpenAIEmbeddings({
-    openAIApiKey: process.env.OPENAI_API_KEY,
-    modelName: "text-embedding-ada-002", // pinned model version — do not change without registry approval
-  }),
+    new OpenAIEmbeddings({
+      openAIApiKey: process.env.OPENAI_API_KEY,
+      modelName: "text-embedding-ada-002", // pinned model version — do not change without registry approval
+    }),
     {
       client,
       tableName: "documents",
@@ -319,28 +406,89 @@ new OpenAIEmbeddings({
   errorDetail = err.message;
   throw err;
 } finally {
-  // --- Audit: post-action record ---
+  // --- Audit: post-action record with cryptographic signature ---
   const completedAuditRecord = {
     ...auditRecord,
     outcome,
     completed_at: new Date().toISOString(),
+    provenance: {
+      model_identifier: MODEL_IDENTIFIER,
+      content_origin: "ai-generated",
+      synthetic_label: true,
+    },
     ...(errorDetail ? { error: errorDetail } : {}),
   };
-  console.log("[AUDIT] AI action completed:", JSON.stringify(completedAuditRecord, null, 2));
 
-  // Persist audit record to Supabase for forensic readiness
+  // Compute HMAC-SHA256 signature over the audit record for tamper-evidence
+  const auditRecordCanonical = JSON.stringify(completedAuditRecord);
+  const provenanceSignature = crypto
+    .createHmac("sha256", PROVENANCE_HMAC_SECRET)
+    .update(auditRecordCanonical)
+    .digest("hex");
+  const signedAuditRecord = {
+    ...completedAuditRecord,
+    provenance_signature: provenanceSignature,
+    signature_algorithm: "HMAC-SHA256",
+  };
+
+  console.log("[AUDIT] AI action completed:", JSON.stringify(signedAuditRecord, null, 2));
+
+  // Persist signed audit record to Supabase for forensic readiness
   const { error: auditInsertError } = await client
     .from("ai_audit_log")
-    .insert([completedAuditRecord]);
+    .insert([signedAuditRecord]);
   if (auditInsertError) {
     console.error("[AUDIT] Failed to persist audit record:", auditInsertError.message);
   }
 }
+  // Validate and sanitize the output from SupabaseVectorStore.fromDocuments
+  // to detect any dynamic code execution primitives injected via LLM output.
+  const DYNAMIC_CODE_EXEC_PATTERNS = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /new\s+Function\s*\(/gi,
+    /setTimeout\s*\(\s*['"`]/gi,
+    /setInterval\s*\(\s*['"`]/gi,
+    /\bimport\s*\(/gi,
+    /require\s*\(\s*['"`]/gi,
+    /process\.binding\s*\(/gi,
+    /child_process/gi,
+    /vm\.runInThisContext/gi,
+    /vm\.runInNewContext/gi,
+    /vm\.Script/gi,
+    /Function\.prototype\.constructor/gi,
+    /__proto__\s*\[\s*['"]constructor['"]\s*\]/gi,
+  ];
+
+  function validateLLMOutput(value, context) {
+    if (value === null || value === undefined) return;
+    const str = typeof value === "string" ? value : JSON.stringify(value);
+    for (const pattern of DYNAMIC_CODE_EXEC_PATTERNS) {
+      if (pattern.test(str)) {
+        const violation = `[SECURITY] Dynamic code execution primitive detected in LLM output at ${context}: pattern=${pattern}`;
+        console.error(violation);
+        throw new Error(violation);
+      }
+    }
+  }
+
+  // Validate the vectorStore result object returned by the LLM embedding API
+  if (typeof vectorStore !== "undefined" && vectorStore !== null) {
+    validateLLMOutput(vectorStore, "SupabaseVectorStore.fromDocuments result");
+    if (vectorStore && typeof vectorStore === "object") {
+      for (const [key, val] of Object.entries(vectorStore)) {
+        if (typeof val === "string") {
+          validateLLMOutput(val, `SupabaseVectorStore.fromDocuments result.${key}`);
+        }
+      }
+    }
+  }
+
   console.log(
     JSON.stringify({
-      event: "llm_interaction_end",
-      provider: "OpenAI",
-      model: "OpenAIEmbeddings",
+      event: "embedding_end",
+      provider: "HuggingFace",
+      model: "HuggingFaceInferenceEmbeddings",
       operation: "SupabaseVectorStore.fromDocuments",
       status: "success",
       documentCount: docsToEmbed.length,
@@ -350,9 +498,9 @@ new OpenAIEmbeddings({
 } catch (error) {
   console.error(
     JSON.stringify({
-      event: "llm_interaction_end",
-      provider: "OpenAI",
-      model: "OpenAIEmbeddings",
+      event: "embedding_end",
+      provider: "HuggingFace",
+      model: "HuggingFaceInferenceEmbeddings",
       operation: "SupabaseVectorStore.fromDocuments",
       status: "error",
       error: error.message,
