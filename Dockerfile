@@ -17,21 +17,20 @@ ENV NODE_ENV=production
 FROM base as build
 
 # Install packages needed to build node modules
-RUN apt-get update -qq && \
-    apt-get install -y python-is-python3 pkg-config build-essential 
+RUN ["/bin/sh", "-c", "apt-get update -qq && apt-get install -y --no-install-recommends python-is-python3 pkg-config build-essential && rm -rf /var/lib/apt/lists/*"]
 
 # Install node modules
 COPY --link package-lock.json package.json ./
-RUN npm ci --include=dev
+RUN ["npm", "ci", "--include=dev"]
 
 # Copy application code
 COPY --link . .
 
 # Build application
-RUN npm run build
+RUN ["npm", "run", "build"]
 
 # Remove development dependencies
-RUN npm prune --omit=dev
+RUN ["npm", "prune", "--omit=dev"]
 
 
 # Final stage for app image
@@ -42,4 +41,4 @@ COPY --from=build /app /app
 
 # Start the server by default, this can be overwritten at runtime
 EXPOSE 3000
-CMD [ "npm", "run", "start" ]
+CMD ["npm", "run", "start"]
