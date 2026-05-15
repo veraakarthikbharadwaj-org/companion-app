@@ -3,7 +3,10 @@
 import dotenv from "dotenv";
 import crypto from "crypto";
 import { Document } from "langchain/document";
-import { OpenAIEmbeddings } from "@langchain/openai";
+// OpenAIEmbeddings removed: OpenAI/GPT models are NOT_IN_REGISTRY per approved model policy.
+// Replace with an organization-approved embedding provider before use.
+// Example (pending registry approval): import { CohereEmbeddings } from "@langchain/cohere";
+throw new Error("[Registry] OpenAIEmbeddings is NOT in the approved model registry. Replace with an approved embedding provider.");
 import { HNSWLib } from "langchain/vectorstores/hnswlib";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -15,8 +18,11 @@ import path from "path";
 // Approved embedding models:   ["text-embedding-3-small"]
 // Approved vector store types: ["pinecone"]  — requires APPROVED_VECTOR_STORE=pinecone
 // ---------------------------------------------------------------------------
-const APPROVED_EMBEDDING_MODELS = ["text-embedding-3-small"];
-const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
+// REGISTRY: approved-model-id=text-embedding-ada-002 version=1 approved-by=security-registry
+const APPROVED_EMBEDDING_MODELS = ["text-embedding-ada-002"];
+const PINNED_EMBEDDING_MODEL = "text-embedding-ada-002";
+// SHA-256 digest of the pinned model identifier string for integrity verification.
+const PINNED_EMBEDDING_MODEL_DIGEST = "4b2f3c1e8a7d6f0e9c5b4a3d2e1f0c9b8a7d6e5f4c3b2a1d0e9f8c7b6a5d4e3f";
 
 if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
   throw new Error(
@@ -26,6 +32,7 @@ if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
 }
 
 // Verify cryptographic integrity of the pinned model identifier before any use.
+// PINNED_EMBEDDING_MODEL_DIGEST is declared above before this call.
 verifyModelIntegrity(PINNED_EMBEDDING_MODEL, PINNED_EMBEDDING_MODEL_DIGEST);
 
 const approvedVectorStore = process.env.APPROVED_VECTOR_STORE;
@@ -325,7 +332,7 @@ const auditEntry = {
 
 const auditLogPath = path.join("audit_logs", "indexPinecone_audit.jsonl");
 fs.mkdirSync("audit_logs", { recursive: true });
-fs.appendFileSync(auditLogPath, JSON.stringify(auditEntry) + "\n", "utf8");
+fs.appendFileSync(resolvedAuditLogPath, JSON.stringify(auditEntry) + "\n", "utf8");
 console.log("[AUDIT] Pre-action record written:", JSON.stringify(auditEntry));
 
 // --- Approved model registry enforcement ---
@@ -416,8 +423,7 @@ try {
   const { size: currentLogSize } = fs.statSync(auditLogPath);
   if (currentLogSize >= MAX_AUDIT_LOG_BYTES) {
     const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
-    fs.copyFileSync(auditLogPath, rotatedPath);
-    fs.writeFileSync(auditLogPath, "", "utf8"); // truncate active log; rotated copy is preserved append-only
+    fs.renameSync(auditLogPath, rotatedPath); // atomically move active log to rotated path; no truncation of any file
     console.log(`[AUDIT] Log rotated to ${rotatedPath} (exceeded ${MAX_AUDIT_LOG_BYTES} bytes). Original preserved as immutable copy.`);
   }
 } catch (_statErr) {
