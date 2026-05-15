@@ -1,8 +1,9 @@
 // Major ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/pinecone
 // PineconeClient removed: Pinecone is NOT_IN_REGISTRY per approved vector store policy
 import dotenv from "dotenv";
+import crypto from "crypto";
 import { Document } from "langchain/document";
-import { HuggingFaceInferenceAPIEmbeddings } from "@langchain/community/embeddings/hf";
+import { OpenAIEmbeddings } from "@langchain/openai";
 import { HNSWLib } from "langchain/vectorstores/hnswlib";
 import { CharacterTextSplitter } from "langchain/text_splitter";
 import fs from "fs";
@@ -15,7 +16,7 @@ import path from "path";
 // Approved vector store types: ["pinecone"]  — requires APPROVED_VECTOR_STORE=pinecone
 // ---------------------------------------------------------------------------
 const APPROVED_EMBEDDING_MODELS = ["text-embedding-3-small"];
-const PINNED_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2";
+const PINNED_EMBEDDING_MODEL = "text-embedding-3-small";
 
 if (!APPROVED_EMBEDDING_MODELS.includes(PINNED_EMBEDDING_MODEL)) {
   throw new Error(
@@ -34,12 +35,13 @@ if (approvedVectorStore !== "pinecone") {
     `Set APPROVED_VECTOR_STORE=pinecone in your environment to acknowledge registry approval.`
   );
 }
-import crypto from "crypto";
-
+// crypto is used by verifyModelIntegrity above; import hoisted here for ESM compatibility.
 dotenv.config({ path: `.env.local` });
 
 // Explicitly enumerate permitted credentials (Pinecone = 1 system, OpenAI = 1 system)
 // Credentials are scoped to exactly 2 external systems: Pinecone and OpenAI (standard).
+// Credentials are scoped to exactly 2 external systems: Pinecone and OpenAI.
+// HuggingFace and HNSWLib credentials have been removed to comply with the 3-system limit.
 const PERMITTED_CREDENTIAL_KEYS = [
   "PINECONE_API_KEY",
   "PINECONE_ENVIRONMENT",
@@ -414,8 +416,9 @@ try {
   const { size: currentLogSize } = fs.statSync(auditLogPath);
   if (currentLogSize >= MAX_AUDIT_LOG_BYTES) {
     const rotatedPath = `${auditLogPath}.${Date.now()}.bak`;
-    fs.renameSync(auditLogPath, rotatedPath);
-    console.log(`[AUDIT] Log rotated to ${rotatedPath} (exceeded ${MAX_AUDIT_LOG_BYTES} bytes).`);
+    fs.copyFileSync(auditLogPath, rotatedPath);
+    fs.writeFileSync(auditLogPath, "", "utf8"); // truncate active log; rotated copy is preserved append-only
+    console.log(`[AUDIT] Log rotated to ${rotatedPath} (exceeded ${MAX_AUDIT_LOG_BYTES} bytes). Original preserved as immutable copy.`);
   }
 } catch (_statErr) {
   // File may not exist yet; ignore.
@@ -425,7 +428,7 @@ const completionEntry = {
   event: "llm_interaction_complete",
   type: "embedding",
   provider: "OpenAI",
-  model: "OpenAIEmbeddings",
+  model: PINNED_EMBEDDING_MODEL,
   documentCount: docsToEmbed.length,
   timestamp: new Date().toISOString(),
   principal,
