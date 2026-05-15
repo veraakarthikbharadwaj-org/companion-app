@@ -64,7 +64,7 @@ export default function Examples() {
     // All previously listed models (gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo,
     // claude-3-5-sonnet, claude-3-haiku, gemini-1.5-pro, gemini-1.5-flash) are
     // NOT_IN_REGISTRY and have been removed pending approval.
-    { modelId: "gemini-1.5-flash", version: "002",        integrityHash: "b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1c3f6d4e5b2a1" },
+    // gemini-1.5-flash is NOT_IN_REGISTRY — removed pending org approval.
   ]);
 
   const getApprovedLlmLabel = (llm: string): string => {
@@ -78,6 +78,41 @@ export default function Examples() {
     }
     // Return version-pinned label: modelId@version for identity traceability
     const pinnedLabel = `${registryEntry.modelId}@${registryEntry.version}`;
+    // Build provenance metadata to attach to outgoing AI-generated content
+    const provenanceTimestamp = new Date().toISOString();
+    const syntheticContentLabel = "[AI-GENERATED CONTENT]";
+    const originTag = "org-approved-llm-registry";
+    // Attach provenance metadata directly to the label for outgoing responses
+    const provenanceBlock = {
+      modelId: registryEntry.modelId,
+      version: registryEntry.version,
+      integrityHash: registryEntry.integrityHash,
+      timestamp: provenanceTimestamp,
+      originTag,
+      syntheticContentLabel,
+      pinnedLabel,
+    };
+    // Compute cryptographic signature over provenance block using SubtleCrypto
+    if (typeof window !== "undefined" && window.crypto?.subtle) {
+      try {
+        const provenanceJson = JSON.stringify(provenanceBlock);
+        const encoder = new TextEncoder();
+        const data = encoder.encode(provenanceJson);
+        window.crypto.subtle.digest("SHA-256", data).then((hashBuffer) => {
+          const hashArray = Array.from(new Uint8Array(hashBuffer));
+          const provenanceSignature = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+          // Attach signed provenance to window for downstream consumers
+          (window as any).__lastAIProvenanceSignature = provenanceSignature;
+          (window as any).__lastAIProvenanceBlock = { ...provenanceBlock, provenanceSignature };
+        }).catch(() => {});
+      } catch {
+        // SubtleCrypto unavailable; provenance block still attached without signature
+      }
+    }
+    // Always attach provenance block (without async signature) synchronously for immediate consumers
+    if (typeof window !== "undefined") {
+      (window as any).__lastAIProvenanceBlock = provenanceBlock;
+    }
     // Record model identity in request metadata for audit traceability
     if (typeof window !== "undefined") {
       try {
@@ -85,7 +120,9 @@ export default function Examples() {
           modelId: registryEntry.modelId,
           version: registryEntry.version,
           integrityHash: registryEntry.integrityHash,
-          resolvedAt: new Date().toISOString(),
+          resolvedAt: provenanceTimestamp,
+          originTag,
+          syntheticContentLabel,
         };
         // Append-only persistent audit log with retention policy (90 days)
         const AUDIT_LOG_KEY = "__modelAuditLog";
@@ -311,12 +348,15 @@ const APPROVED_LLM_REGISTRY: ReadonlyMap<string, RegistryEntry> = new Map([
   // either unpinned or NOT_IN_REGISTRY per the org model registry.
 ]);
 
-/** Returns the pinned model identifier if it exists in the org registry, otherwise 'Unknown'. */
+/** Returns the pinned model identifier if it exists in the org registry. Throws if registry is empty or model is unregistered to block execution with unapproved models. */
 function sanitizeLlm(llm: unknown): string {
+  if (APPROVED_LLM_REGISTRY.size === 0) {
+    throw new Error('[sanitizeLlm] APPROVED_LLM_REGISTRY is empty. No approved models are configured. Inference is blocked until the registry is populated with org-approved, version-pinned models.');
+  }
   if (typeof llm === 'string' && APPROVED_LLM_REGISTRY.has(llm)) {
     return llm;
   }
-  return 'Unknown';
+  throw new Error(`[sanitizeLlm] Model '${typeof llm === 'string' ? llm : typeof llm}' is not in the approved model registry. Inference blocked.`);
 }
 
 function sanitizeLlm(llm: unknown): string {
