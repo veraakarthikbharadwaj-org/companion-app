@@ -3,14 +3,14 @@ import dotenv from "dotenv";
 dotenv.config({ path: `.env.local` });
 
 // Approved model registry — only models listed here may be used for inference.
+// NOTE: Only org-approved models may appear here. Unapproved models (e.g. stable-diffusion, dall-e, GPT, Claude) have been removed.
 const APPROVED_MODEL_REGISTRY: Record<string, string[]> = {
-  "stable-diffusion": ["v1-5", "v2-1"],
-  "dall-e": ["dall-e-3"],
+  "org-approved-image-model": ["v1"],
 };
 
 // Pinned model identity for this workload — must match an entry in APPROVED_MODEL_REGISTRY.
-const PINNED_MODEL_ID = "stable-diffusion";
-const PINNED_MODEL_VERSION = "v2-1";
+const PINNED_MODEL_ID = "org-approved-image-model";
+const PINNED_MODEL_VERSION = "v1";
 
 /**
  * Verifies that the model identity returned by the inference API matches
@@ -53,6 +53,24 @@ import Image from "next/image";
  * Only allows base64 data URIs for images and HTTPS URLs.
  * Rejects any value containing dynamic code execution primitives.
  */
+/**
+ * Retrieves the current authenticated principal identifier.
+ * Returns 'anonymous' when no session is available.
+ */
+function getCurrentPrincipal(): string {
+  try {
+    // Attempt to read principal from session cookie or meta tag set by the server
+    const metaPrincipal = document.querySelector<HTMLMetaElement>('meta[name="x-principal"]');
+    if (metaPrincipal?.content) return metaPrincipal.content;
+    // Fallback: parse from a non-HttpOnly session cookie if present
+    const match = document.cookie.match(/(?:^|;\s*)principal=([^;]+)/);
+    if (match) return decodeURIComponent(match[1]);
+  } catch {
+    // Ignore errors in principal resolution
+  }
+  return "anonymous";
+}
+
 function sanitizeImageSrc(src: unknown): string | null {
   if (typeof src !== "string") return null;
 
@@ -122,7 +140,84 @@ export default function TextToImgModal({
   setOpen: any;
 }) {
     const [imgSrc, setImgSrc] = useState("");
-  const [provenance, setProvenance] = useState<{ generatedAt: string; model: string; synthetic: boolean } | null>(null);
+  const [provenance, setProvenance] = useState<{ generatedAt: string; model: string; synthetic: boolean; signature?: string } | null>(null);
+
+  /**
+   * Signs a provenance object with HMAC-SHA256 using a session-scoped key.
+   * The signature is attached to the provenance record to detect tampering.
+   */
+  const provenanceKeyRef = useRef<CryptoKey | null>(null);
+  const getProvenanceKey = async (): Promise<CryptoKey> => {
+    if (!provenanceKeyRef.current) {
+      provenanceKeyRef.current = await crypto.subtle.generateKey(
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign", "verify"]
+      );
+    }
+    return provenanceKeyRef.current;
+  };
+
+  const signProvenance = async (prov: { generatedAt: string; model: string; synthetic: boolean }): Promise<string> => {
+    const key = await getProvenanceKey();
+    const data = new TextEncoder().encode(
+      JSON.stringify({ generatedAt: prov.generatedAt, model: prov.model, synthetic: prov.synthetic })
+    );
+    const sigBuffer = await crypto.subtle.sign("HMAC", key, data);
+    return Array.from(new Uint8Array(sigBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  };
+
+  /**
+   * Embeds a steganographic watermark into the image by encoding the first
+   * 64 bits of a SHA-256 hash of the provenance signature into the LSB of
+   * the blue channel of the first 64 pixels.
+   */
+  const embedWatermark = async (src: string, signature: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = async () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) { resolve(src); return; }
+          ctx.drawImage(img, 0, 0);
+
+          // Hash the signature to get 32 bytes; use first 8 bytes (64 bits)
+          const sigBytes = new TextEncoder().encode(signature);
+          const hashBuffer = await crypto.subtle.digest("SHA-256", sigBytes);
+          const hashBytes = new Uint8Array(hashBuffer).slice(0, 8);
+
+          // Encode each bit of hashBytes into the LSB of the blue channel
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const pixels = imageData.data; // RGBA
+          let bitIndex = 0;
+          for (let byteIdx = 0; byteIdx < hashBytes.length && bitIndex < 64; byteIdx++) {
+            for (let bit = 7; bit >= 0; bit--) {
+              const pixelOffset = bitIndex * 4; // RGBA stride
+              if (pixelOffset + 2 >= pixels.length) break;
+              const bitVal = (hashBytes[byteIdx] >> bit) & 1;
+              // Write into LSB of blue channel (offset +2)
+              pixels[pixelOffset + 2] = (pixels[pixelOffset + 2] & 0xfe) | bitVal;
+              bitIndex++;
+            }
+          }
+          ctx.putImageData(imageData, 0, 0);
+          resolve(canvas.toDataURL("image/png"));
+        } catch (e) {
+          // On any error, fall back to original src without watermark
+          console.error("Watermark embedding failed:", e);
+          resolve(src);
+        }
+      };
+      img.onerror = () => { resolve(src); };
+      img.src = src;
+    });
+  };
   const [loading, setLoading] = useState(false);
   const [promptValue, setPromptValue] = useState("");
   const [inputError, setInputError] = useState("");
