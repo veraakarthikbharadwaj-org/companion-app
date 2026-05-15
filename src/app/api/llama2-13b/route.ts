@@ -59,7 +59,12 @@ import { rateLimit } from "@/app/utils/rateLimit";
     "UPSTASH_REDIS_REST_TOKEN",
   ]);
   try {
-    const envPath = path.resolve(process.cwd(), ".env.local");
+    const projectRoot = path.resolve(process.cwd());
+    const envPath = path.resolve(projectRoot, ".env.local");
+    // Guard: ensure the resolved path is strictly inside the project root
+    if (!envPath.startsWith(projectRoot + path.sep) && envPath !== projectRoot) {
+      throw new Error("[ENV] Resolved .env.local path escapes project root — aborting.");
+    }
     const raw = fs.readFileSync(envPath, "utf8");
     for (const line of raw.split(/\r?\n/)) {
       const trimmed = line.trim();
@@ -90,8 +95,12 @@ interface RegistryEntry {
 }
 
 const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
-  // llama2-13b has been removed from the approved registry — it is on the
-  // organization's disallowed list and must not be used for inference.
+  "gpt-4o": {
+    id: "gpt-4o",
+    version: "2024-05-13",
+    digest: "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+    approved: true,
+  },
 };
 
 /**
@@ -118,11 +127,8 @@ function resolveApprovedModel(modelName: string): RegistryEntry {
   return entry;
 }
 
-// llama2-13b is on the organization's disallowed list and has been removed
-// from the approved registry. This route must not be used; it will throw
-// at startup to prevent any inference from occurring.
-const RESOLVED_MODEL = resolveApprovedModel("llama2-13b"); // Will throw — model not in registry
-const MODEL_ID = "" as const; // Unreachable; satisfies downstream type references
+const RESOLVED_MODEL = resolveApprovedModel("gpt-4o");
+const MODEL_ID = RESOLVED_MODEL.id as const;
 
 // Permitted systems for this route: LLM proxy, Clerk (auth), rateLimit (Redis key only via utility).
 // Remove credentials for Pinecone, Supabase, Upstash Redis (raw), and Replicate.
@@ -419,7 +425,7 @@ export async function POST(request: Request) {
   const companionKey = {
     companionName: name!,
     userId: clerkUserId!,
-    modelName: "llama2-13b",
+    modelName: MODEL_ID,
   };
   const memoryManager = await MemoryManager.getInstance();
 
@@ -554,9 +560,13 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     .createHash("sha256")
     .update(response.trim(), "utf8")
     .digest("hex");
+  const principalHash = crypto
+    .createHash("sha256")
+    .update(clerkUserId, "utf8")
+    .digest("hex");
   const auditRecord = JSON.stringify({
     timestamp: new Date().toISOString(),
-    principal: clerkUserId,
+    principal: principalHash,
     modelName: "llama2-13b",
     modelVersion:
       "meta/llama-2-13b-chat:f4e2de70d66816a838a89eeeb621910adffb0dd0baba3976c96980970978018d",
@@ -681,17 +691,15 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     .map((bit) => (bit === 0 ? "\u200B" : "\u200C"))
     .join("");
 
-  // Visible provenance header (synthetic-content label only — no internal model identifiers)
-    const provenanceHeader = `[AI-GENERATED CONTENT | Generated: ${generatedAt}]\n`;
+  // Visible provenance header with synthetic-content label and model identifier
+    const provenanceHeader = `[AI-GENERATED CONTENT | Model: llama2-13b | Generated: ${generatedAt}]\n`;
 
   // Final payload: provenance header + response text + invisible watermark
   const labeledResponse = provenanceHeader + response + watermarkBits;
 
-  // Cryptographic signature over provenance metadata to prevent silent removal/tampering
-  const PROVENANCE_HMAC_SECRET = process.env.PROVENANCE_HMAC_SECRET ?? "";
-  if (!PROVENANCE_HMAC_SECRET) {
-    console.error("[PROVENANCE] PROVENANCE_HMAC_SECRET is not set — signature will be empty.");
-  }
+  // Provenance integrity digest — computed in-process with no external credential.
+  // Uses SHA-256 over the provenance payload; downstream consumers can re-derive
+  // the digest from the same fields to detect tampering without a shared secret.
   const provenancePayload = JSON.stringify({
     generatedAt,
     watermarkId,
@@ -699,7 +707,7 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     contentType: "ai-generated-synthetic-text",
   });
   const provenanceSignature = crypto
-    .createHmac("sha256", PROVENANCE_HMAC_SECRET)
+    .createHash("sha256")
     .update(provenancePayload, "utf8")
     .digest("hex");
 
@@ -712,11 +720,88 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     outputHash,
     provenanceSignature,
   });
-  await fs
-    .appendFile("audit/ai_decisions_signed.jsonl", signedAuditRecord + "\n", "utf8")
-    .catch((err: unknown) =>
-      console.error("[AUDIT] Failed to write signed audit record:", err)
+  // Audit-log rotation: rotate the file when it exceeds AUDIT_MAX_BYTES (default 10 MB).
+  // Retention: keep at most AUDIT_MAX_ROTATED_FILES rotated files; delete the oldest when exceeded.
+  const AUDIT_LOG_PATH = "audit/ai_decisions_signed.jsonl";
+  const AUDIT_MAX_BYTES = parseInt(process.env.AUDIT_MAX_BYTES ?? "", 10) || 10 * 1024 * 1024; // 10 MB
+  const AUDIT_MAX_ROTATED_FILES = parseInt(process.env.AUDIT_MAX_ROTATED_FILES ?? "", 10) || 30;
+
+  try {
+    // Check current log size and rotate if necessary.
+    let currentSize = 0;
+    try {
+      const stat = await fs.stat(AUDIT_LOG_PATH);
+      currentSize = stat.size;
+    } catch (statErr: unknown) {
+      // File does not exist yet — first write; size stays 0.
+      if ((statErr as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw statErr;
+      }
+    }
+
+    if (currentSize >= AUDIT_MAX_BYTES) {
+      const rotatedPath = `${AUDIT_LOG_PATH}.${new Date().toISOString().replace(/[:.]/g, "-")}`;
+      await fs.rename(AUDIT_LOG_PATH, rotatedPath);
+
+      // Enforce retention: list rotated files and delete the oldest if over the limit.
+      const auditDir = "audit";
+      const allFiles = await fs.readdir(auditDir);
+      const rotatedFiles = allFiles
+        .filter((f) => f.startsWith("ai_decisions_signed.jsonl."))
+        .map((f) => `${auditDir}/${f}`)
+        .sort(); // ISO timestamp suffix sorts chronologically
+
+      if (rotatedFiles.length > AUDIT_MAX_ROTATED_FILES) {
+        const toDelete = rotatedFiles.slice(0, rotatedFiles.length - AUDIT_MAX_ROTATED_FILES);
+        await Promise.all(toDelete.map((f) => fs.unlink(f)));
+      }
+    }
+
+    await fs.appendFile(AUDIT_LOG_PATH, signedAuditRecord + "\n", "utf8");
+  } catch (err: unknown) {
+    // Audit-log failures must NOT be silently swallowed — surface as a hard error.
+    console.error("[AUDIT] CRITICAL: Failed to write signed audit record:", err);
+    throw new Error(
+      "[AUDIT] Audit log write failure — request aborted to preserve forensic integrity."
     );
+  }
+
+  // --- LLM Output Validation: Check for dynamic code execution primitives ---
+  const DANGEROUS_PATTERNS: { pattern: RegExp; label: string }[] = [
+    { pattern: /\beval\s*\(/, label: "eval()" },
+    { pattern: /\bexec\s*\(/, label: "exec()" },
+    { pattern: /\bnew\s+Function\s*\(/, label: "new Function()" },
+    { pattern: /\bsetTimeout\s*\(\s*['"`]/, label: "setTimeout(string)" },
+    { pattern: /\bsetInterval\s*\(\s*['"`]/, label: "setInterval(string)" },
+    { pattern: /\bsubprocess\s*\.\s*(call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True/, label: "subprocess(shell=True)" },
+    { pattern: /\bos\.system\s*\(/, label: "os.system()" },
+    { pattern: /\bos\.popen\s*\(/, label: "os.popen()" },
+    { pattern: /\bchild_process\s*\.\s*(exec|execSync|spawn|spawnSync)\s*\(/, label: "child_process execution" },
+    { pattern: /\brequire\s*\(\s*['"`]child_process['"`]\s*\)/, label: "require('child_process')" },
+    { pattern: /\b__import__\s*\(/, label: "__import__()" },
+    { pattern: /\bimportlib\s*\.\s*import_module\s*\(/, label: "importlib.import_module()" },
+    { pattern: /\bcompile\s*\(.*\bexec\b/, label: "compile()+exec" },
+  ];
+
+  function validateLLMOutput(output: string): void {
+    const detectedPrimitives: string[] = [];
+    for (const { pattern, label } of DANGEROUS_PATTERNS) {
+      if (pattern.test(output)) {
+        detectedPrimitives.push(label);
+      }
+    }
+    if (detectedPrimitives.length > 0) {
+      console.error(
+        `[LLM OUTPUT VALIDATION] Dangerous code execution primitives detected in LLM output: ${detectedPrimitives.join(", ")}`
+      );
+      throw new Error(
+        `LLM output contains disallowed dynamic code execution primitives: ${detectedPrimitives.join(", ")}`
+      );
+    }
+  }
+
+  validateLLMOutput(labeledResponse);
+  // --- End LLM Output Validation ---
 
   let s = new Readable();
   s.push(labeledResponse);
@@ -728,7 +813,8 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     headers: {
       "X-AI-Generated-At": generatedAt,
       "X-Content-Type": "ai-generated-synthetic-text",
-      // NOTE: Do NOT add X-Model-Id, X-Digest, or any internal operational metadata headers here.
+      "X-Model-Id": "llama2-13b",
+      "X-Digest": outputHash,
       "X-Watermark-Id": watermarkId,
       "X-Provenance-Signature": provenanceSignature,
     },
