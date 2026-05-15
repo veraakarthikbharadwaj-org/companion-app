@@ -1,19 +1,69 @@
 import { NextResponse } from "next/server";
 import twilio from "twilio";
 import clerk from "@clerk/clerk-sdk-node";
+// Clerk is used below to authenticate the end user by phone number before AI agent access.
 import dotenv from "dotenv";
 import ConfigManager from "@/app/utils/config";
 import { rateLimit } from "@/app/utils/rateLimit";
 
-// Approved model registry: maps approved model identifiers to their pinned versions.
-// Only models listed here may be used for inference.
-const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  "gpt-4o": "gpt-4o-2024-05-13",
-  "gpt-4-turbo": "gpt-4-turbo-2024-04-09",
-  "gpt-3.5-turbo": "gpt-3.5-turbo-0125",
-  "claude-3-opus": "claude-3-opus-20240229",
-  "claude-3-sonnet": "claude-3-sonnet-20240229",
-};
+// Org-approved model registry URL must be set via environment variable.
+// The registry maps approved model identifiers to their org-pinned versions.
+// Only models present in the org-approved registry may be used for inference.
+const ORG_APPROVED_REGISTRY_URL = process.env.ORG_APPROVED_MODEL_REGISTRY_URL;
+
+// Cache for the org-approved registry (populated at first use).
+let _orgRegistryCache: Record<string, string> | null = null;
+let _orgRegistryCacheExpiry = 0;
+const ORG_REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function fetchOrgApprovedRegistry(): Promise<Record<string, string>> {
+  const now = Date.now();
+  if (_orgRegistryCache && now < _orgRegistryCacheExpiry) {
+    return _orgRegistryCache;
+  }
+  if (!ORG_APPROVED_REGISTRY_URL) {
+    throw new Error(
+      "ORG_APPROVED_MODEL_REGISTRY_URL is not set. All AI model usage requires an org-approved registry."
+    );
+  }
+  const registryApiKey = process.env.ORG_APPROVED_MODEL_REGISTRY_API_KEY;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (registryApiKey) {
+    headers["Authorization"] = `Bearer ${registryApiKey}`;
+  }
+  const resp = await fetch(ORG_APPROVED_REGISTRY_URL, { headers, cache: "no-store" });
+  if (!resp.ok) {
+    throw new Error(
+      `Failed to fetch org-approved model registry: HTTP ${resp.status} from ${ORG_APPROVED_REGISTRY_URL}`
+    );
+  }
+  const data = await resp.json();
+  if (typeof data !== "object" || data === null || Array.isArray(data)) {
+    throw new Error("Org-approved model registry response is not a valid key-value map.");
+  }
+  _orgRegistryCache = data as Record<string, string>;
+  _orgRegistryCacheExpiry = now + ORG_REGISTRY_CACHE_TTL_MS;
+  return _orgRegistryCache;
+}
+
+async function resolveApprovedModel(requestedModel: string): Promise<string | null> {
+  const normalized = requestedModel?.trim().toLowerCase();
+  const registry = await fetchOrgApprovedRegistry();
+  // Direct match against org-approved registry
+  if (registry[normalized]) {
+    return registry[normalized];
+  }
+  // Match by pinned version value
+  for (const [key, pinnedVersion] of Object.entries(registry)) {
+    if (normalized === key || normalized === pinnedVersion) {
+      return pinnedVersion;
+    }
+  }
+  // Model not found in org-approved registry — deny
+  return null;
+}
+
+const APPROVED_MODEL_REGISTRY: Record<string, string> = {};
 
 function resolveApprovedModel(requestedModel: string): string | null {
   const normalized = requestedModel?.trim().toLowerCase();
@@ -35,9 +85,62 @@ import path from "path";
 import { randomUUID } from "crypto";
 
 const AUDIT_LOG_PATH = path.resolve(process.cwd(), "audit", "ai_decisions.ndjson");
+// Maximum size (bytes) before the active log file is rotated (10 MiB).
+const MAX_AUDIT_FILE_BYTES = 10 * 1024 * 1024;
+// Retention policy label stamped on every record so external aggregators
+// (e.g. Splunk, CloudWatch, Datadog) can enforce the correct retention window.
+const AUDIT_RETENTION_POLICY = "retain-90d";
 
 function sha256(data: string): string {
   return crypto.createHash("sha256").update(data, "utf8").digest("hex");
+}
+
+/**
+ * Rotate the audit log if it has grown beyond MAX_AUDIT_FILE_BYTES.
+ * The active file is renamed to ai_decisions.<ISO-timestamp>.ndjson so that
+ * rotated files are retained and can be ingested by a log aggregator.
+ */
+function rotateAuditLogIfNeeded(): void {
+  try {
+    if (fs.existsSync(AUDIT_LOG_PATH)) {
+      const { size } = fs.statSync(AUDIT_LOG_PATH);
+      if (size >= MAX_AUDIT_FILE_BYTES) {
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const rotated = path.join(
+          path.dirname(AUDIT_LOG_PATH),
+          `ai_decisions.${ts}.ndjson`
+        );
+        fs.renameSync(AUDIT_LOG_PATH, rotated);
+      }
+    }
+  } catch (rotateErr) {
+    process.stderr.write("AUDIT_ROTATE_FAILURE: " + String(rotateErr) + "\n");
+  }
+}
+
+/**
+ * Recursively sanitize audit record values to prevent log injection.
+ * Strips newlines, carriage returns, and other ASCII control characters
+ * from all string values so a crafted input cannot inject fake log lines.
+ */
+function sanitizeAuditValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    // Remove all ASCII control characters (0x00-0x1F, 0x7F) including CR/LF
+    return value.replace(/[\x00-\x1F\x7F]/g, "");
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeAuditValue);
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        // Sanitize keys as well
+        k.replace(/[\x00-\x1F\x7F]/g, ""),
+        sanitizeAuditValue(v),
+      ])
+    );
+  }
+  return value;
 }
 
 function writeAuditRecord(record: Record<string, unknown>): void {
@@ -46,18 +149,57 @@ function writeAuditRecord(record: Record<string, unknown>): void {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(record) + "\n", { encoding: "utf8", flag: "a" });
+    // Sanitize all string values before serialisation to prevent log injection
+    const sanitized = sanitizeAuditValue(record) as Record<string, unknown>;
+    fs.appendFileSync(AUDIT_LOG_PATH, JSON.stringify(sanitized) + "\n", { encoding: "utf8", flag: "a" });
   } catch (err) {
     // Fallback: emit to stderr so the record is at least captured by log aggregators
     process.stderr.write("AUDIT_WRITE_FAILURE: " + JSON.stringify(record) + "\n");
   }
+};
+  const line = JSON.stringify(enriched) + "\n";
+  // Always emit to stdout as structured JSON so external log aggregators /
+  // SIEM pipelines receive every record regardless of local-file availability.
+  process.stdout.write(line);
+  try {
+    const dir = path.dirname(AUDIT_LOG_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    rotateAuditLogIfNeeded();
+    fs.appendFileSync(AUDIT_LOG_PATH, line, { encoding: "utf8", flag: "a" });
+  } catch (err) {
+    // Fallback already handled by stdout emit above; record the write failure.
+    process.stderr.write("AUDIT_WRITE_FAILURE: " + JSON.stringify(enriched) + "\n");
+  }
 }
 
 dotenv.config({ path: `.env.local` });
+
+/**
+ * Authenticates the end user via Clerk by matching their phone number.
+ * Returns the Clerk user if found, or null if no authenticated user exists.
+ */
+async function authenticateUserByPhone(phoneNumber: string): Promise<Record<string, unknown> | null> {
+  if (!phoneNumber) return null;
+  try {
+    // Normalize to E.164 format for lookup
+    const normalized = phoneNumber.trim();
+    const users = await clerk.users.getUserList({ phoneNumber: [normalized] });
+    if (users && users.length > 0) {
+      return users[0] as unknown as Record<string, unknown>;
+    }
+    return null;
+  } catch (err) {
+    process.stderr.write("CLERK_AUTH_ERROR: " + String(err) + "\n");
+    return null;
+  }
+}
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const internalApiSecret = process.env.INTERNAL_API_SECRET;
-const internalApiSecret = process.env.INTERNAL_API_SECRET;
+// INTERNAL_API_SECRET removed: internal API calls must be delegated to a
+// dedicated internal service module to avoid holding >3 external credentials
+// in a single route. See src/app/services/internalApiService.ts.
 
 function sanitizePrompt(input: string): { safe: boolean; reason?: string } {
   if (!input || typeof input !== "string") {
@@ -129,7 +271,8 @@ export async function POST(request: Request) {
   // Read the raw body for Twilio signature validation
   const rawBody = await request.text();
 
-  // Validate Twilio webhook signature to reject unauthenticated callers
+  // --- Step 1: Validate Twilio webhook signature (authenticates Twilio platform) ---
+  // Note: This only authenticates Twilio, NOT the end user. Clerk user auth follows below. to reject unauthenticated callers
   const twilioSignature = request.headers.get("x-twilio-signature") || "";
   const requestUrl = request.url;
   const params: Record<string, string> = {};
@@ -415,9 +558,55 @@ export async function POST(request: Request) {
     );
   }
 
-  const to = queryMap["From"];
+  // --- Synthetic Content Provenance, Labeling, and Watermarking ---
+  // 1. Build provenance metadata
+  const provenanceTimestamp = new Date().toISOString();
+  const provenanceModel = companionModel; // model identifier captured earlier
+
+  // 2. Prepend a synthetic-origin disclosure label
+  const syntheticLabel = "[AI-GENERATED MESSAGE]";
+
+  // 3. Compute a cryptographic watermark (HMAC-SHA256) over the sanitized content
+  //    so recipients / downstream systems can verify the message originated here.
+  const crypto = await import("crypto");
+  const watermarkSecret = process.env.SMS_WATERMARK_SECRET ?? "default-watermark-secret";
+  const hmac = crypto.createHmac("sha256", watermarkSecret);
+  hmac.update(`${provenanceModel}|${provenanceTimestamp}|${responseText}`);
+  const watermark = hmac.digest("hex").substring(0, 16); // 16-char prefix is enough for SMS
+
+  // 4. Assemble the final message body with label, content, and provenance footer
+  const MAX_FINAL_LENGTH = 1600;
+  const provenanceFooter = `\n---\nModel:${provenanceModel} | ${provenanceTimestamp} | WM:${watermark}`;
+  const labeledBody = `${syntheticLabel}\n${responseText}`;
+  const fullBody = (labeledBody + provenanceFooter).substring(0, MAX_FINAL_LENGTH);
+
+    const to = queryMap["From"];
   const from = queryMap["To"];
   console.log("responseText: ", responseText);
+
+  // Enforce explicit tool allow-list before executing any LLM-driven tool action.
+  const TOOL_NAME = "send_sms";
+  if (!isToolAllowed(TOOL_NAME)) {
+    console.error(`SECURITY: Tool '${TOOL_NAME}' is not on the allow list. Execution blocked.`);
+    writeAuditRecord({
+      event: "tool_blocked",
+      tool: TOOL_NAME,
+      timestamp: new Date().toISOString(),
+      reason: "Tool not in ALLOWED_TOOLS allow list",
+    });
+    return new NextResponse(
+      JSON.stringify({ Message: "Tool action not permitted." }),
+      { status: 403, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  writeAuditRecord({
+    event: "tool_invoked",
+    tool: TOOL_NAME,
+    timestamp: new Date().toISOString(),
+    responseTextHash: sha256(responseText),
+  });
+
   await twilioClient.messages
     .create({
       body: responseText,
