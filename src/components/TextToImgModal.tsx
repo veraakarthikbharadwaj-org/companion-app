@@ -2,6 +2,47 @@ import dotenv from "dotenv";
 
 dotenv.config({ path: `.env.local` });
 
+// Approved model registry — only models listed here may be used for inference.
+const APPROVED_MODEL_REGISTRY: Record<string, string[]> = {
+  "stable-diffusion": ["v1-5", "v2-1"],
+  "dall-e": ["dall-e-3"],
+};
+
+// Pinned model identity for this workload — must match an entry in APPROVED_MODEL_REGISTRY.
+const PINNED_MODEL_ID = "stable-diffusion";
+const PINNED_MODEL_VERSION = "v2-1";
+
+/**
+ * Verifies that the model identity returned by the inference API matches
+ * the pinned, registry-approved model for this workload.
+ */
+function verifyModelIdentity(
+  resolvedModel: unknown,
+  resolvedVersion: unknown
+): void {
+  if (typeof resolvedModel !== "string" || typeof resolvedVersion !== "string") {
+    throw new Error(
+      "Model identity verification failed: API response did not include model or version fields."
+    );
+  }
+  if (resolvedModel !== PINNED_MODEL_ID) {
+    throw new Error(
+      `Model identity mismatch: expected "${PINNED_MODEL_ID}" but API resolved "${resolvedModel}".`
+    );
+  }
+  const approvedVersions = APPROVED_MODEL_REGISTRY[resolvedModel];
+  if (!approvedVersions || !approvedVersions.includes(resolvedVersion)) {
+    throw new Error(
+      `Model version "${resolvedVersion}" for model "${resolvedModel}" is not in the approved registry.`
+    );
+  }
+  if (resolvedVersion !== PINNED_MODEL_VERSION) {
+    throw new Error(
+      `Model version mismatch: expected "${PINNED_MODEL_VERSION}" but API resolved "${resolvedVersion}".`
+    );
+  }
+}
+
 import { Fragment, useState } from "react";
 import { useSession } from "next-auth/react";
 import { Dialog, Transition } from "@headlessui/react";
@@ -49,7 +90,7 @@ function sanitizeImageSrc(src: unknown): string | null {
 }
 
 const ALLOWED_IMG_HOSTNAMES: string[] = [
-  // Add trusted image hostnames here, e.g. "oaidalleapiprodscus.blob.core.windows.net"
+  "oaidalleapiprodscus.blob.core.windows.net",
 ];
 
 function validateImgUrl(value: unknown): string {
@@ -65,10 +106,7 @@ function validateImgUrl(value: unknown): string {
   if (parsed.protocol !== "https:") {
     throw new Error("Invalid image URL: only HTTPS URLs are allowed.");
   }
-  if (
-    ALLOWED_IMG_HOSTNAMES.length > 0 &&
-    !ALLOWED_IMG_HOSTNAMES.includes(parsed.hostname)
-  ) {
+  if (!ALLOWED_IMG_HOSTNAMES.includes(parsed.hostname)) {
     throw new Error(
       `Invalid image URL: hostname "${parsed.hostname}" is not allowed.`
     );
@@ -94,6 +132,45 @@ export default function TextToImgModal({
   const sanitizePrompt = (input: string): string => {
     // Trim whitespace
     let sanitized = input.trim();
+
+    // Reject prompts containing invisible/hidden Unicode characters (zero-width, soft hyphen, etc.)
+    if (/[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u2028\u2029]/.test(sanitized)) {
+      throw new Error("Prompt contains hidden or invisible characters and cannot be processed.");
+    }
+
+    // Reject prompts that appear to contain binary/non-text content
+    if (/[\x80-\xFF]/.test(sanitized)) {
+      throw new Error("Prompt contains binary or non-ASCII characters and cannot be processed.");
+    }
+
+    // Reject base64-encoded blocks (long runs of base64 chars) that may hide payloads
+    if (/(?:[A-Za-z0-9+/]{40,}={0,2})/.test(sanitized)) {
+      throw new Error("Prompt contains base64-encoded content and cannot be processed.");
+    }
+
+    // Reject shell command patterns
+    const shellPatterns = [
+      /\b(bash|sh|zsh|cmd|powershell|pwsh|exec|eval|system|popen|subprocess)\s*[\(\[\{`]/i,
+      /[;&|`$]\s*\w/,
+      /\$\([^)]*\)/,
+      /`[^`]*`/,
+      /\b(rm|del|format|mkfs|dd|wget|curl|nc|ncat|netcat|chmod|chown|sudo|su)\b/i,
+      />\/dev\/|\|\/bin\//,
+      /\.\.\/.*\.\.\//, // path traversal
+    ];
+    for (const pattern of shellPatterns) {
+      if (pattern.test(sanitized)) {
+        throw new Error("Prompt contains shell command patterns and cannot be processed.");
+      }
+    }
+
+    // Reject common leetspeak/obfuscation patterns used to bypass filters
+    // e.g. 3x3cut3, 1nj3ct, etc. — flag high density of digit-letter substitutions
+    const leetspeakPattern = /(?:[a-zA-Z][0-9]|[0-9][a-zA-Z]){4,}/;
+    if (leetspeakPattern.test(sanitized.replace(/\s/g, ""))) {
+      throw new Error("Prompt contains obfuscated (leetspeak) content and cannot be processed.");
+    }
+
     // Remove control characters and null bytes
     sanitized = sanitized.replace(/[\x00-\x1F\x7F]/g, "");
     // Truncate to maximum allowed length
@@ -132,7 +209,7 @@ export default function TextToImgModal({
       return;
     }
 
-    const response = await fetch("/api/txt2img", {
+    const response = await fetch("/api/approved-txt2img", {
       method: "POST",
       body: JSON.stringify({
         prompt: sanitizedPrompt,
@@ -156,7 +233,7 @@ export default function TextToImgModal({
     }
     setProvenance({
       generatedAt: new Date().toISOString(),
-      model: "txt2img-ai",
+      model: "approved-txt2img-model",
       synthetic: true,
     });
     setLoading(false);
