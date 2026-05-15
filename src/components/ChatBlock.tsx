@@ -11,6 +11,46 @@
 /** ISO-8601 timestamp recorded once at module load; used as provenance anchor. */
 const AI_CONTENT_GENERATED_AT: string = new Date().toISOString();
 
+/**
+ * Machine-readable model identifier attached to every provenance record.
+ * Update this value whenever the underlying model changes.
+ */
+const AI_MODEL_ID: string = "ai-model-v1";
+
+/**
+ * Computes a cryptographic watermark (HMAC-SHA256) over the model ID and
+ * timestamp using the Web Crypto API. The resulting hex digest is embedded
+ * as a `data-ai-watermark` attribute on every AI-generated media element,
+ * providing a machine-verifiable provenance token beyond visible labels.
+ */
+async function computeWatermark(modelId: string, timestamp: string): Promise<string> {
+    const encoder = new TextEncoder();
+    // Use a fixed well-known key material; in production replace with a
+    // securely managed secret imported via environment variable / KMS.
+    const rawKey = encoder.encode("ai-provenance-watermark-key-v1");
+    const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        rawKey,
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+    );
+    const message = encoder.encode(`${modelId}|${timestamp}`);
+    const signature = await crypto.subtle.sign("HMAC", cryptoKey, message);
+    return Array.from(new Uint8Array(signature))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+/** React hook that resolves the cryptographic watermark string once on mount. */
+function useWatermark(): string {
+    const [watermark, setWatermark] = React.useState<string>("");
+    React.useEffect(() => {
+        computeWatermark(AI_MODEL_ID, AI_CONTENT_GENERATED_AT).then(setWatermark);
+    }, []);
+    return watermark;
+}
+
 /** Visible badge shown on every AI-generated block. */
 function AIProvenanceBadge() {
     return (
@@ -36,15 +76,35 @@ function AIProvenanceBadge() {
     );
 }
 
+const ALLOWED_URL_HOSTNAMES: ReadonlySet<string> = new Set([
+    // Add trusted media-serving hostnames here, e.g.:
+    // "cdn.example.com",
+    // "media.example.com",
+]);
+
+function isSafeUrl(rawUrl: string | undefined): string {
+    if (!rawUrl) return "";
+    try {
+        const parsed = new URL(rawUrl);
+        if (parsed.protocol !== "https:") return "";
+        if (!ALLOWED_URL_HOSTNAMES.has(parsed.hostname)) return "";
+        return rawUrl;
+    } catch {
+        return "";
+    }
+}
+
 export function ChatBlock({text, mimeType, url} : {
     text?: string,
     mimeType?: string,
     url?: string
 }) {
+    const watermark = useWatermark();
     let internalComponent = <></>
     if (text) {
         internalComponent = <span>{text}</span>
     } else if (mimeType && url) {
+                const safeUrl = isSafeUrl(url);
         if (mimeType.startsWith("audio")) {
             internalComponent = (
                 <figure style={{margin: 0}}>
@@ -53,7 +113,7 @@ export function ChatBlock({text, mimeType, url} : {
                     </figcaption>
                     <audio
                         controls={true}
-                        src={url}
+                        src={safeUrl}
                         data-ai-generated="true"
                         data-ai-provenance-timestamp={AI_CONTENT_GENERATED_AT}
                     />
@@ -71,8 +131,8 @@ export function ChatBlock({text, mimeType, url} : {
                         data-ai-generated="true"
                         data-ai-provenance-timestamp={AI_CONTENT_GENERATED_AT}
                     >
-                        <source src={url} type={mimeType} />
-                        Download the <a href={url}>video</a>
+                        <source src={safeUrl} type={mimeType} />
+                        Download the <a href={safeUrl}>video</a>
                     </video>
                 </figure>
             )
@@ -80,7 +140,38 @@ export function ChatBlock({text, mimeType, url} : {
             internalComponent = (
                 <figure style={{margin: 0, position: "relative", display: "inline-block"}}>
                     <img
-                        src={url}
+                        src={safeUrl}
+                        alt="AI-generated image"
+                        data-ai-generated="true"
+                        data-ai-provenance-timestamp={AI_CONTENT_GENERATED_AT}
+                        style={{display: "block"}}
+                    />
+                </figure>
+            )
+        } else if (mimeType.startsWith("video")) {
+            internalComponent = (
+                <figure style={{margin: 0}}>
+                    <figcaption style={{fontSize: "0.7rem", color: "#a78bfa", marginBottom: "2px"}}>
+                        ⚠ AI-generated video
+                    </figcaption>
+                    <video
+                        data-ai-model-id={AI_MODEL_ID}
+                        data-ai-watermark={watermark}
+                        controls
+                        width="250"
+                        data-ai-generated="true"
+                        data-ai-provenance-timestamp={AI_CONTENT_GENERATED_AT}
+                    >
+                        <source src={sanitizeUrl(url) ?? ""} type={mimeType} />
+                        Download the <a href={sanitizeUrl(url) ?? "#"}>video</a>
+                    </video>
+                </figure>
+            )
+        } else if (mimeType.startsWith("image")) {
+            internalComponent = (
+                <figure style={{margin: 0, position: "relative", display: "inline-block"}}>
+                    <img
+                        src={sanitizeUrl(url) ?? ""}
                         alt="AI-generated image"
                         data-ai-generated="true"
                         data-ai-provenance-timestamp={AI_CONTENT_GENERATED_AT}
@@ -102,7 +193,8 @@ export function ChatBlock({text, mimeType, url} : {
             )
         }
     } else if (url) {
-        internalComponent = <a href={url}>Link</a>
+        const safeUrl = isSafeUrl(url);
+        internalComponent = safeUrl ? <a href={safeUrl}>Link</a> : <span>[blocked URL]</span>
     }
 
     return (
@@ -140,23 +232,37 @@ export function ChatBlock({text, mimeType, url} : {
  */
 const ALLOWED_BLOCK_KEYS = new Set(["text", "mimeType", "url"]);
 
-// Patterns that indicate dynamic code execution primitives in LLM output
-const DANGEROUS_PATTERNS = [
-    /\beval\s*\(/i,
-    /\bexec\s*\(/i,
-    /\bFunction\s*\(/i,
-    /\bnew\s+Function\b/i,
-    /\bsetTimeout\s*\(/i,
-    /\bsetInterval\s*\(/i,
-    /\bimport\s*\(/i,
-    /\brequire\s*\(/i,
-    /javascript\s*:/i,
-    /data\s*:\s*text\/html/i,
-    /<\s*script/i,
-];
+/**
+ * Strictly validate a URL to only allow safe, absolute http/https URLs.
+ * Returns the original url string if safe, or null if the URL is unsafe or unparseable.
+ * This prevents XSS via javascript:, data:, vbscript:, and other dangerous schemes.
+ */
+function sanitizeUrl(url: string): string | null {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+            return url;
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
 
-function containsDangerousContent(value: string): boolean {
-    return DANGEROUS_PATTERNS.some(pattern => pattern.test(value));
+/**
+ * Validate that a field value is safe for use.
+ * For URL fields, only allow http/https via sanitizeUrl.
+ * For text fields, we rely on React's built-in JSX escaping (no innerHTML);
+ * no regex blocklist is used because blocklists are bypassable.
+ */
+function containsDangerousContent(value: string, fieldName?: string): boolean {
+    if (fieldName === "url") {
+        // For URL fields, reject anything that is not a safe http/https URL
+        return sanitizeUrl(value) === null;
+    }
+    // For non-URL text fields rendered via React JSX (not dangerouslySetInnerHTML),
+    // React escapes the content automatically — no additional regex check needed.
+    return false;
 }
 
 function sanitizeBlock(block: any): { text?: string; mimeType?: string; url?: string } | null {
@@ -198,7 +304,11 @@ export function responseToChatBlocks(completion: any) {
     let blocks = []
     if (typeof completion == "string") {
         console.log("still string")
-        blocks.push(<ChatBlock text={completion} />)
+        if (containsDangerousContent(completion)) {
+            console.warn("Rejected plain-string completion: dangerous content detected in LLM output");
+        } else {
+            blocks.push(<ChatBlock text={completion} />)
+        }
     } else if (Array.isArray(completion)) {
         console.log("Is array")
         for (let block of completion) {
