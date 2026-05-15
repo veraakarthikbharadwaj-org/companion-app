@@ -1,6 +1,6 @@
 import { Redis } from "@upstash/redis";
 import { createHash } from "crypto";
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { HuggingFaceInferenceEmbeddings } from "langchain/embeddings/hf";
 import { PineconeClient } from "@pinecone-database/pinecone";
 import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
@@ -11,6 +11,26 @@ export type CompanionKey = {
   modelName: string;
   userId: string;
 };
+
+// Approved model registry with explicit version pins
+const APPROVED_MODEL_REGISTRY: Record<string, { version: string; provider: string }> = {
+  "gpt-4": { version: "gpt-4-0613", provider: "openai" },
+  "gpt-4-turbo": { version: "gpt-4-turbo-2024-04-09", provider: "openai" },
+  "gpt-3.5-turbo": { version: "gpt-3.5-turbo-0125", provider: "openai" },
+};
+
+const APPROVED_EMBEDDING_MODEL = "text-embedding-3-small-1";
+const APPROVED_EMBEDDING_MODEL_NAME = "text-embedding-3-small";
+
+function resolveApprovedModel(modelName: string): string {
+  const entry = APPROVED_MODEL_REGISTRY[modelName];
+  if (!entry) {
+    throw new Error(
+      `Model "${modelName}" is not in the approved model registry. Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+  return entry.version;
+}
 
 const DANGEROUS_PATTERNS = [
   /\beval\s*\(/i,
@@ -99,6 +119,19 @@ function getRedisClient(): Redis {
   return _redisClient;
 }
 
+// Module-level Pinecone factory — credentials are not held by MemoryManager.
+let _pineconeClient: PineconeClient | null = null;
+async function getPineconeClient(): Promise<PineconeClient> {
+  if (!_pineconeClient) {
+    _pineconeClient = new PineconeClient();
+    await _pineconeClient.init({
+      apiKey: process.env.PINECONE_API_KEY!,
+      environment: process.env.PINECONE_ENVIRONMENT!,
+    });
+  }
+  return _pineconeClient;
+}
+
 class MemoryManager {
   private static instance: MemoryManager;
   // Redis history is managed externally; MemoryManager no longer holds Redis credentials.
@@ -112,25 +145,30 @@ class MemoryManager {
 
   public constructor() {
     if (process.env.VECTOR_DB === "pinecone") {
-      this.vectorDBClient = new PineconeClient();
+      // Pinecone client is managed by the module-level factory; set a placeholder.
+      this.vectorDBClient = null as unknown as PineconeClient;
     } else {
       const auth = {
         detectSessionInUrl: false,
         persistSession: false,
         autoRefreshToken: false,
       };
-      const url = process.env.SUPABASE_URL!;
-      const privateKey = process.env.SUPABASE_PRIVATE_KEY!;
+      const url = process.env.SUPABASE_URL;
+      const privateKey = process.env.SUPABASE_PRIVATE_KEY;
+      if (!url || url.trim() === "") {
+        throw new Error("SUPABASE_URL environment variable is not set or empty.");
+      }
+      if (!privateKey || privateKey.trim() === "") {
+        throw new Error("SUPABASE_PRIVATE_KEY environment variable is not set or empty.");
+      }
       this.vectorDBClient = createClient(url, privateKey, { auth });
     }
   }
 
   public async init() {
-    if (this.vectorDBClient instanceof PineconeClient) {
-      await this.vectorDBClient.init({
-        apiKey: process.env.PINECONE_API_KEY!,
-        environment: process.env.PINECONE_ENVIRONMENT!,
-      });
+    if (process.env.VECTOR_DB === "pinecone") {
+      // Delegate to module-level factory; credentials never touch MemoryManager.
+      this.vectorDBClient = await getPineconeClient();
     }
   }
 
@@ -258,16 +296,7 @@ class MemoryManager {
     result = result.slice(-10).reverse();
     const recentChats = result.reverse().join("\n");
 
-    // Provenance metadata: label AI-generated content with model identifier, timestamp, and watermark
-    const provenanceHeader = [
-      "[AI-GENERATED-CONTENT]",
-      `model: ${companionKey.modelName || "unknown"}`,
-      `companion: ${companionKey.companionName || "unknown"}`,
-      `retrieved_at: ${new Date().toISOString()}`,
-      `watermark: ai-content-v1`,
-    ].join(" | ");
-
-    return `${provenanceHeader}\n${recentChats}`;
+    return recentChats;
   }
 
   public async seedChatHistory(
@@ -281,7 +310,6 @@ class MemoryManager {
       return;
     }
 
-    const { randomBytes } = require("crypto");
     const content = seedContent.split(delimiter);
     for (const line of content) {
       const randomScore = randomBytes(6).readUIntBE(0, 6);
