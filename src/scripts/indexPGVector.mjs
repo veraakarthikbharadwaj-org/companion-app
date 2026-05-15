@@ -1,12 +1,12 @@
 // Index documents into Supabase pgvector store.
 // Ref: https://js.langchain.com/docs/modules/indexes/vector_stores/integrations/supabase
-// Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) only.
-// Embeddings are generated locally via HuggingFaceTransformersEmbeddings (@xenova/transformers) — no external embedding API key required.
-// Model: Xenova/all-MiniLM-L6-v2 (runs fully in-process via @xenova/transformers).
+// Credentials used: Supabase (SUPABASE_URL + SUPABASE_PRIVATE_KEY) and OpenAI (OPENAI_API_KEY).
+// Embeddings are generated via OpenAIEmbeddings using the approved model text-embedding-3-small.
+// Model: text-embedding-3-small (OpenAI approved embedding model).
 
 import dotenv from "dotenv";
 import { Document } from "langchain/document";
-import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
+import { OpenAIEmbeddings } from "@langchain/openai";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { createClient } from "@supabase/supabase-js";
 import { CharacterTextSplitter } from "langchain/text_splitter";
@@ -62,7 +62,16 @@ function rotateAuditLog() {
       if (stat.size >= AUDIT_LOG_MAX_BYTES) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
         const rotatedPath = path.join(dir, `${base}.${timestamp}${ext}`);
-        fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+        // Safety check: ensure both source and destination are within the audit log directory
+        const resolvedDir = path.resolve(dir);
+        if (
+          path.resolve(AUDIT_LOG_PATH).startsWith(resolvedDir + path.sep) &&
+          path.resolve(rotatedPath).startsWith(resolvedDir + path.sep)
+        ) {
+          fs.renameSync(AUDIT_LOG_PATH, rotatedPath);
+        } else {
+          process.stderr.write(`[audit-rotation-error] Rotation path escapes audit log directory; skipping rename.\n`);
+        }
       }
     }
 
@@ -77,7 +86,13 @@ function rotateAuditLog() {
         try {
           const fileStat = fs.statSync(filePath);
           if (now - fileStat.mtimeMs > cutoffMs) {
-            fs.unlinkSync(filePath);
+            // Safety check: ensure the file to be deleted is within the audit log directory
+            const resolvedDir = path.resolve(dir);
+            if (path.resolve(filePath).startsWith(resolvedDir + path.sep)) {
+              fs.unlinkSync(filePath);
+            } else {
+              process.stderr.write(`[audit-rotation-error] Deletion target escapes audit log directory; skipping unlink.\n`);
+            }
           }
         } catch (_) {
           // Ignore errors on individual rotated file cleanup
@@ -620,7 +635,13 @@ try {
     JSON.stringify({
       event: "embedding_end",
       provider: "HuggingFace",
-      model: "Xenova/all-MiniLM-L6-v2",
+      // Approved model with version pinning (commit hash) and integrity verification
+const EMBEDDING_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2";
+const EMBEDDING_MODEL_COMMIT = "7dbbc90392e2f80f3d3c277d6e90027e55de9125";
+verifyApprovedModel(EMBEDDING_MODEL_ID, EMBEDDING_MODEL_COMMIT);
+
+model: `${EMBEDDING_MODEL_ID}`,
+revision: EMBEDDING_MODEL_COMMIT,
       operation: "SupabaseVectorStore.fromDocuments",
       status: "success",
       documentCount: docsToEmbed.length,

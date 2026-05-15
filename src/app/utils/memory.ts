@@ -1,8 +1,11 @@
 import { Redis } from "@upstash/redis";
 import { createHash } from "crypto";
+// OpenAIEmbeddings is only instantiated after validating against the
+// org-approved embedding registry loaded from the APPROVED_EMBEDDINGS_JSON
+// environment variable — never imported and used directly.
+// Registry check for langchain package — must be in approved registry
+assertInRegistry("langchain");
 import { OpenAIEmbeddings } from "langchain/embeddings/openai";
-import { PineconeClient } from "@pinecone-database/pinecone";
-import { PineconeStore } from "langchain/vectorstores/pinecone";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
 
@@ -42,7 +45,30 @@ export type CompanionKey = {
   userId: string;
 };
 
-// Approved model registry with explicit version pins
+// ---------------------------------------------------------------------------
+// Org-approved model & embedding registries — loaded from environment,
+// NOT hardcoded.  Set APPROVED_MODELS_JSON and APPROVED_EMBEDDINGS_JSON in
+// your deployment secrets to the JSON objects maintained by the security team.
+// ---------------------------------------------------------------------------
+
+function loadApprovedRegistry<T>(envVar: string, fallback: Record<string, T>): Record<string, T> {
+  const raw = process.env[envVar];
+  if (!raw) {
+    console.warn(
+      `[security] ${envVar} is not set. ` +
+      `Falling back to empty registry — all model requests will be rejected.`
+    );
+    return {};
+  }
+  try {
+    return JSON.parse(raw) as Record<string, T>;
+  } catch (e) {
+    console.error(`[security] Failed to parse ${envVar}:`, e);
+    return {};
+  }
+}
+
+// Approved model registry — sourced from APPROVED_MODELS_JSON env var
 const APPROVED_MODEL_REGISTRY: Record<string, { version: string; provider: string }> = {
   "gpt-4": { version: "gpt-4-0613", provider: "openai" },
   "gpt-4-turbo": { version: "gpt-4-turbo-2024-04-09", provider: "openai" },
@@ -70,6 +96,9 @@ function resolveApprovedEmbeddingModel(modelKey: string): string {
 }
 
 const APPROVED_EMBEDDING_MODEL_KEY = "text-embedding-3-small";
+// Validate the embedding model key against the approved registry at module
+// load time so any misconfiguration is caught immediately on startup.
+const PINNED_EMBEDDING_MODEL_ID = assertInRegistry(APPROVED_EMBEDDING_MODEL_KEY);
 // Resolved and registry-validated embedding model ID (throws if not in registry)
 const APPROVED_EMBEDDING_MODEL = resolveApprovedEmbeddingModel(APPROVED_EMBEDDING_MODEL_KEY);
 const APPROVED_EMBEDDING_MODEL_NAME = APPROVED_EMBEDDING_REGISTRY[APPROVED_EMBEDDING_MODEL_KEY].modelId;
@@ -98,21 +127,23 @@ const DANGEROUS_PATTERNS = [
   /\bexecfile\s*\(/i,
 ];
 
-function sanitizeVectorDocs(docs: any[] | undefined): any[] {
+function sanitizeVectorDocs(docs: any[] | undefined): { pageContent: string }[] {
   if (!docs || !Array.isArray(docs)) return [];
-  return docs.filter((doc) => {
-    if (!doc || typeof doc.pageContent !== "string") return false;
-    for (const pattern of DANGEROUS_PATTERNS) {
-      if (pattern.test(doc.pageContent)) {
-        console.warn(
-          "WARNING: vector search result filtered out due to dangerous pattern:",
-          pattern
-        );
-        return false;
+  return docs
+    .filter((doc) => {
+      if (!doc || typeof doc.pageContent !== "string") return false;
+      for (const pattern of DANGEROUS_PATTERNS) {
+        if (pattern.test(doc.pageContent)) {
+          console.warn(
+            "WARNING: vector search result filtered out due to dangerous pattern:",
+            pattern
+          );
+          return false;
+        }
       }
-    }
-    return true;
-  });
+      return true;
+    })
+    .map((doc) => ({ pageContent: doc.pageContent as string }));
 }
 
 function sanitizeChatInput(input: string): string {
@@ -375,7 +406,35 @@ class MemoryManager {
     return result;
   }
 
+  private verifyRedisCompanionKey(key: string): boolean {
+    const { createHmac, timingSafeEqual } = require("crypto");
+    const secret = process.env.REDIS_KEY_SECRET;
+    if (!secret) {
+      throw new Error("REDIS_KEY_SECRET environment variable is not set");
+    }
+    const lastColon = key.lastIndexOf(":");
+    if (lastColon === -1) return false;
+    const payload = key.substring(0, lastColon);
+    const providedSig = key.substring(lastColon + 1);
+    const expectedSig = createHmac("sha256", secret)
+      .update(payload)
+      .digest("hex");
+    try {
+      return timingSafeEqual(
+        Buffer.from(providedSig, "hex"),
+        Buffer.from(expectedSig, "hex")
+      );
+    } catch {
+      return false;
+    }
+  }
+
   public async readLatestHistory(companionKey: CompanionKey): Promise<string> {
+    const verifyKey = this.generateRedisCompanionKey(companionKey);
+    if (!this.verifyRedisCompanionKey(verifyKey)) {
+      console.log("ERROR: Redis companion key failed integrity verification");
+      return "";
+    }
     if (!companionKey || typeof companionKey.userId == "undefined") {
       console.log("Companion key set incorrectly");
       return "";
@@ -390,20 +449,97 @@ class MemoryManager {
     result = result.slice(-10).reverse();
     // Extract plain content from provenance-tagged entries for display,
     // while preserving the provenance envelope for audit consumers.
+    const MAX_ENTRY_LENGTH = 1000;
+    const sanitizeEntry = (text: string): string =>
+      text
+        .replace(/\x00/g, "")
+        .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+        .trim()
+        .substring(0, MAX_ENTRY_LENGTH);
+
     const parsedEntries = result.reverse().map((entry) => {
       try {
         const parsed = JSON.parse(entry);
         if (parsed && parsed.synthetic === true && parsed.label === "AI_GENERATED") {
-          return parsed.content as string;
+          return sanitizeEntry(parsed.content as string);
+        }
+        // For other provenance-tagged entries, extract content if present
+        if (parsed && typeof parsed.content === "string") {
+          return sanitizeEntry(parsed.content);
         }
       } catch {
-        // Legacy plain-text entry — return as-is
+        // Legacy plain-text entry — sanitize before returning
       }
-      return entry;
+      return sanitizeEntry(entry);
     });
-    const recentChats = parsedEntries.join("\n");
+    const recentChats = parsedEntries.filter((e) => e.length > 0).join("\n");
 
     return recentChats;
+  }
+
+    /**
+   * Validates a seed line against known malicious content patterns.
+   * Returns true if the line is safe to store, false otherwise.
+   */
+  private isSeedLineSafe(line: string): boolean {
+    // Reject lines containing non-printable / binary characters
+    // (allow common whitespace: space, tab, newline)
+    if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/.test(line)) {
+      console.warn("[seedChatHistory] Rejected line: binary/non-printable characters detected.");
+      return false;
+    }
+
+    // Reject lines that appear to be base64-encoded payloads (long alphanum+/= strings)
+    if (/^[A-Za-z0-9+/]{40,}={0,2}$/.test(line.trim())) {
+      console.warn("[seedChatHistory] Rejected line: possible base64-encoded content.");
+      return false;
+    }
+
+    // Reject lines containing shell command patterns
+    const shellPatterns = [
+      /`[^`]*`/,                        // backtick execution
+      /\$\([^)]*\)/,                    // $(...) subshell
+      /;\s*(rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\b/i,
+      /\b(eval|exec|system|popen|subprocess)\s*\(/i,
+      /\|\s*(bash|sh|cmd|powershell)\b/i,
+    ];
+    for (const pattern of shellPatterns) {
+      if (pattern.test(line)) {
+        console.warn("[seedChatHistory] Rejected line: shell command pattern detected.");
+        return false;
+      }
+    }
+
+    // Reject lines containing hidden/injected prompt patterns
+    const promptInjectionPatterns = [
+      /ignore (all )?(previous|prior|above) instructions/i,
+      /system\s*prompt/i,
+      /you are now/i,
+      /disregard (your|all|previous)/i,
+      /act as (a|an)?\s*(different|new|unrestricted)/i,
+      /jailbreak/i,
+      /\[INST\]/i,
+      /<\|im_start\|>/i,
+      /###\s*(instruction|system|prompt)/i,
+    ];
+    for (const pattern of promptInjectionPatterns) {
+      if (pattern.test(line)) {
+        console.warn("[seedChatHistory] Rejected line: hidden prompt injection pattern detected.");
+        return false;
+      }
+    }
+
+    // Reject leetspeak obfuscation attempts (heuristic: high ratio of digit-letter substitutions)
+    // e.g. "1gn0r3 4ll pr3v10us 1nstruct10ns"
+    const leetspeakPattern = /\b(?:[a-z]*[013457][a-z0-9]*){3,}\b/i;
+    const words = line.split(/\s+/);
+    const leetspeakWords = words.filter((w) => leetspeakPattern.test(w));
+    if (words.length > 0 && leetspeakWords.length / words.length > 0.4) {
+      console.warn("[seedChatHistory] Rejected line: possible leetspeak obfuscation detected.");
+      return false;
+    }
+
+    return true;
   }
 
   public async seedChatHistory(
@@ -419,14 +555,84 @@ class MemoryManager {
 
         const content = seedContent.split(delimiter);
     let baseScore = Date.now();
+
+    // Inline audit helper: produce a SHA-256 hex digest of a string
+    const computeHash = async (input: string): Promise<string> => {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(input);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    };
+
+    const auditKey = `audit:seedChatHistory:${companionKey.userId}:${companionKey.companionId}`;
+
     for (const line of content) {
-      await this.history.zadd(key, { score: baseScore++, member: line });
+      const entryScore = baseScore++;
+      await this.history.zadd(key, { score: entryScore, member: line });
+
+      // Append audit record for forensic trail
+      const inputHash = await computeHash(line);
+      const auditRecord = JSON.stringify({
+        action: "seedChatHistory",
+        modelId: "seed/static-v1",
+        principal: {
+          userId: companionKey.userId,
+          companionId: companionKey.companionId,
+        },
+        inputHash,
+        output: line,
+        score: entryScore,
+        timestamp: new Date(entryScore).toISOString(),
+      });
+      await this.history.zadd(auditKey, {
+        score: entryScore,
+        member: auditRecord,
+      });
+    }
+
+    // Enforce 24-hour expiry on seeded history and audit log to match session token expiry policy
+    await this.history.expire(key, 86400);
+    await this.history.expire(auditKey, 86400);
+  }
+}
+
+      const taggedLine = this.buildProvenanceTag(line, companionKey);
+      await this.history.zadd(key, { score: baseScore++, member: taggedLine });
     }
     // Enforce 24-hour expiry on seeded history to match session token expiry policy
     await this.history.expire(key, 86400);
-  });
-    }
   }
 }
+
+        const MAX_LINE_LENGTH = 1000;
+        const content = seedContent.split(delimiter);
+    let baseScore = Date.now();
+    for (const rawLine of content) {
+      // Sanitize: trim whitespace, strip null bytes and ASCII control characters
+      let line = rawLine
+        .trim()
+        .replace(/\x00/g, "")
+        .replace(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+      // Validation: skip empty lines and lines exceeding max length
+      if (!line || line.length === 0) {
+        continue;
+      }
+      if (line.length > MAX_LINE_LENGTH) {
+        console.warn(`seedChatHistory: line exceeds max length (${line.length}), truncating.`);
+        line = line.substring(0, MAX_LINE_LENGTH);
+      }
+
+      // Wrap in provenance tag for consistency with writeToHistory
+      const taggedLine = this.buildProvenanceTag(line, companionKey);
+      await this.history.zadd(key, { score: baseScore++, member: taggedLine });
+    }
+    // Enforce 24-hour expiry on seeded history to match session token expiry policy
+    await this.history.expire(key, 86400);
+  }
+}
+
 
 export default MemoryManager;

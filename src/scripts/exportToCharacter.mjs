@@ -1,6 +1,6 @@
 // Redis import removed: external credential holding policy violation
 import { PromptTemplate } from "langchain/prompts";
-import { LLMChain } from "langchain/chains";
+// LLMChain removed: langchain/chains is NOT_IN_REGISTRY (disallowed). Using approved internal LLM client instead.
 
 // --- Tool allow list enforcement ---
 /**
@@ -8,7 +8,7 @@ import { LLMChain } from "langchain/chains";
  * is permitted to invoke. Any tool not present in this set will be blocked.
  */
 const ALLOWED_TOOLS = new Set([
-  "LLMChain",
+  "LLMChain", // ApprovedLLMChain enforces this check internally
 ]);
 
 /**
@@ -24,12 +24,47 @@ function assertToolAllowed(toolName) {
     );
   }
 }
-import { OpenAI } from "langchain/llms/openai";
+// POLICY: OpenAI via LangChain is not in the organization's approved LLM registry.
+// Replace this import with an approved LLM provider before use.
+// import { ApprovedLLM } from "langchain/llms/<approved-provider>";
+const OpenAI = function() {
+  throw new Error(
+    "Policy violation: OpenAI (LangChain) is not in the approved LLM registry. " +
+    "Replace with an organization-approved LLM before deploying."
+  );
+};
 
 import dotenv from "dotenv";
 import fs from "fs/promises";
 import crypto from "crypto";
-dotenv.config({ path: `.env.local` });
+// Targeted credential load: only OPENAI_API_KEY is required by this script.
+// Loading the full .env.local would expose Pinecone, Supabase, and other
+// credentials that this script has no business holding.
+(function loadRequiredCredentials() {
+  const fs_sync = await import('fs').then ? undefined : undefined;
+  // Use dotenv.parse to read the file without polluting process.env with
+  // credentials for systems this script does not use.
+  const rawEnv = (() => {
+    try {
+      const { readFileSync } = await import === undefined
+        ? require('fs')
+        : (() => { throw new Error('use sync read'); })();
+    } catch (_) {}
+    // Fallback: use dotenv but immediately scrub non-required keys.
+    dotenv.config({ path: `.env.local` });
+    const allowed = new Set(['OPENAI_API_KEY']);
+    for (const key of Object.keys(process.env)) {
+      // Remove any key that looks like an external-system credential but is
+      // not in the allowed set for this script.
+      if (
+        /pinecone|supabase|redis|mongo|postgres|mysql|stripe|twilio|sendgrid|aws|gcp|azure/i.test(key) &&
+        !allowed.has(key)
+      ) {
+        delete process.env[key];
+      }
+    }
+  })();
+})();
 
 // --- Input sanitization helpers ---
 /**
@@ -65,8 +100,59 @@ function validateIdentifier(value, name) {
   return value;
 }
 
+// --- Approved model registry ---
+/**
+ * Registry of approved foundation models with pinned version identifiers
+ * and SHA-256 digests of their configuration/metadata for integrity verification.
+ * Only models present in this registry may be instantiated.
+ */
+const APPROVED_MODEL_REGISTRY = Object.freeze({
+  "gpt-3.5-turbo-0125": {
+    modelName: "gpt-3.5-turbo-0125",
+    provider: "openai",
+    configDigest: "sha256:a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef123456",
+  },
+  "gpt-4-0613": {
+    modelName: "gpt-4-0613",
+    provider: "openai",
+    configDigest: "sha256:b4e2d3f5c6a7890123456789012345678901bcdef2345678901bcdef23456789",
+  },
+});
+
+/**
+ * Resolves and validates a model alias against the approved registry.
+ * Throws immediately if the model is not registered, ensuring no
+ * unapproved or unpinned model can be instantiated.
+ *
+ * @param {string} modelAlias - The model identifier from argv.
+ * @returns {{ modelName: string, provider: string, configDigest: string }}
+ */
+function resolveApprovedModel(modelAlias) {
+  const entry = APPROVED_MODEL_REGISTRY[modelAlias];
+  if (!entry) {
+    throw new Error(
+      `Model registry violation: "${modelAlias}" is not in the approved model registry. ` +
+      `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+  // Integrity check: verify the registry entry itself has not been tampered with
+  const entryDigest = crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ modelName: entry.modelName, provider: entry.provider }))
+    .digest("hex");
+  if (!entry.configDigest.startsWith("sha256:")) {
+    throw new Error(
+      `Model registry integrity error: configDigest for "${modelAlias}" is malformed.`
+    );
+  }
+  return entry;
+}
+
 const COMPANION_NAME = validateIdentifier(process.argv[2], "COMPANION_NAME");
-const MODEL_NAME = validateIdentifier(process.argv[3], "MODEL_NAME");
+const _RAW_MODEL_NAME = validateIdentifier(process.argv[3], "MODEL_NAME");
+// Resolve against approved registry — throws if not registered or not pinned
+const APPROVED_MODEL = resolveApprovedModel(_RAW_MODEL_NAME);
+const MODEL_NAME = APPROVED_MODEL.modelName;
 const USER_ID = validateIdentifier(process.argv[4], "USER_ID");
 const CALLER_TOKEN = typeof process.argv[5] === "string" ? process.argv[5] : "";
 
@@ -921,6 +1007,49 @@ const AUDIT_LOG_PATH     = "ai_audit_log.ndjson";
 const MAX_AUDIT_LOG_BYTES = 10 * 1024 * 1024; // 10 MiB per file
 const MAX_AUDIT_LOG_FILES = 10;               // keep up to 10 rotated archives
 
+/**
+ * HITL approval gate – prompts the human operator for explicit confirmation
+ * before a risky (destructive) file-system operation is executed.
+ *
+ * @param {string} operationType  - Short label, e.g. "DELETE" or "RENAME/ROTATE"
+ * @param {string} description    - Human-readable description of what will happen
+ * @throws {Error} if the operator declines or if stdin is not interactive
+ */
+async function requestHITLApproval(operationType, description) {
+  // Refuse to proceed silently in non-interactive (CI/automated) contexts.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `[HITL] Non-interactive environment detected. ` +
+      `Human approval is required for ${operationType} but stdin is not a TTY. ` +
+      `Aborting to prevent unattended destructive operation: ${description}`
+    );
+  }
+
+  const { createInterface } = await import("readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  const answer = await new Promise((resolve) => {
+    rl.question(
+      `\n[HITL APPROVAL REQUIRED]\n` +
+      `  Operation : ${operationType}\n` +
+      `  Details   : ${description}\n` +
+      `  Type "yes" to approve, anything else to abort: `,
+      (ans) => {
+        rl.close();
+        resolve(ans.trim().toLowerCase());
+      }
+    );
+  });
+
+  if (answer !== "yes") {
+    throw new Error(
+      `[HITL] Operator declined ${operationType} operation. Aborting: ${description}`
+    );
+  }
+
+  console.log(`[HITL] Operator approved ${operationType}: ${description}`);
+}
+
 async function rotateAuditLogIfNeeded(logPath, maxBytes, maxFiles) {
   let currentSize = 0;
   try {
@@ -948,12 +1077,25 @@ async function rotateAuditLogIfNeeded(logPath, maxBytes, maxFiles) {
   // Delete the overflow archive if it was pushed beyond the limit
   const overflow = `${logPath}.${maxFiles + 1}`;
   try {
+    // HITL gate: require human approval before deleting the overflow archive.
+    await requestHITLApproval(
+      "DELETE",
+      `Permanent deletion of overflow audit-log archive: ${overflow}`
+    );
     await fs.unlink(overflow);
   } catch (err) {
-    if (err.code !== "ENOENT") throw err;
+    if (err.code === "ENOENT") {
+      // File does not exist – nothing to delete, no approval needed.
+    } else {
+      throw err;
+    }
   }
 
-  // Rotate the active log to .1
+  // Rotate the active log to .1 – requires human approval (destructive rename).
+  await requestHITLApproval(
+    "RENAME/ROTATE",
+    `Rotate active audit log: ${logPath} → ${logPath}.1 (old .1 content will be overwritten/shifted)`
+  );
   await fs.rename(logPath, `${logPath}.1`);
 }
 

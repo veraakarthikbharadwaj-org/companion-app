@@ -12,15 +12,94 @@ import { createHmac } from "crypto";
  * changes every RATE_LIMIT_WINDOW_MINUTES minutes, enforcing expiry binding.
  * This prevents raw user-supplied input from being used directly as a session/rate-limit key.
  */
-const RATE_LIMIT_WINDOW_MINUTES = 15;
-const RATE_LIMIT_HMAC_SECRET =
-  process.env.RATE_LIMIT_HMAC_SECRET ||
-  (() => { throw new Error("RATE_LIMIT_HMAC_SECRET env var must be set for session key integrity."); })();
+// --- Input Sanitization & Validation for LLM Pipeline ---
 
+/**
+ * Maximum allowed length (in characters) for a user-supplied message body
+ * before it is passed to the LLM. Messages exceeding this limit are rejected
+ * to prevent prompt-flooding and token-exhaustion attacks.
+ */
+const MAX_MESSAGE_LENGTH = 1000;
+
+/**
+ * Patterns indicative of prompt-injection attempts.
+ * These are checked case-insensitively against the sanitized input.
+ */
+const PROMPT_INJECTION_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+  /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+  /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+  /you\s+are\s+now\s+(?:a|an|the)\s+/i,
+  /act\s+as\s+(?:a|an|the)\s+/i,
+  /system\s*:\s*/i,
+  /\[\s*system\s*\]/i,
+  /<\s*system\s*>/i,
+  /###\s*instruction/i,
+  /override\s+(system|prompt|instructions)/i,
+  /jailbreak/i,
+  /do\s+anything\s+now/i,
+  /dan\s+mode/i,
+];
+
+/**
+ * Sanitizes and validates a user-supplied message body before LLM invocation.
+ *
+ * Steps:
+ *  1. Reject null/undefined input.
+ *  2. Strip null bytes and non-printable ASCII control characters (except \t, \n, \r).
+ *  3. Trim whitespace and reject empty strings.
+ *  4. Enforce maximum length.
+ *  5. Detect and reject prompt-injection patterns.
+ *
+ * @param raw - The raw user-supplied message string.
+ * @returns The sanitized message string, safe for LLM input.
+ * @throws Error with a descriptive message if validation fails.
+ */
+function sanitizeAndValidateLLMInput(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw new Error("Invalid message body: input must be a string.");
+  }
+
+  // Strip null bytes and non-printable control characters (keep \t, \n, \r).
+  // eslint-disable-next-line no-control-regex
+  let sanitized = raw.replace(/[\x00\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Trim surrounding whitespace.
+  sanitized = sanitized.trim();
+
+  if (sanitized.length === 0) {
+    throw new Error("Invalid message body: message must not be empty.");
+  }
+
+  if (sanitized.length > MAX_MESSAGE_LENGTH) {
+    throw new Error(
+      `Invalid message body: message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.`
+    );
+  }
+
+  // Check for prompt-injection patterns.
+  for (const pattern of PROMPT_INJECTION_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      throw new Error(
+        "Invalid message body: message contains disallowed content (possible prompt injection attempt)."
+      );
+    }
+  }
+
+  return sanitized;
+}
+
+// --- End Input Sanitization & Validation ---
+
+const RATE_LIMIT_WINDOW_MINUTES = 15;
 function buildSignedRateLimitKey(phone: string): string {
+  // Read HMAC secret inline at call time to avoid a persistent top-level credential binding.
+  const rateLimitHmacSecret =
+    process.env.RATE_LIMIT_HMAC_SECRET ||
+    (() => { throw new Error("RATE_LIMIT_HMAC_SECRET env var must be set for session key integrity."); })();
   const windowSlot = Math.floor(Date.now() / (RATE_LIMIT_WINDOW_MINUTES * 60 * 1000));
   const payload = `${phone}:${windowSlot}`;
-  return createHmac("sha256", RATE_LIMIT_HMAC_SECRET)
+  return createHmac("sha256", rateLimitHmacSecret)
     .update(payload)
     .digest("hex");
 }
@@ -28,7 +107,9 @@ function buildSignedRateLimitKey(phone: string): string {
 // Org-approved model registry URL must be set via environment variable.
 // The registry maps approved model identifiers to their org-pinned versions.
 // Only models present in the org-approved registry may be used for inference.
-const ORG_APPROVED_REGISTRY_URL = process.env.ORG_APPROVED_MODEL_REGISTRY_URL;
+const ORG_APPROVED_REGISTRY_URL: string =
+  process.env.ORG_APPROVED_MODEL_REGISTRY_URL ||
+  (() => { throw new Error("ORG_APPROVED_MODEL_REGISTRY_URL env var must be set. All AI model usage requires an org-approved registry."); })();
 
 // Cache for the org-approved registry (populated at first use).
 let _orgRegistryCache: Record<string, string> | null = null;
@@ -47,20 +128,24 @@ async function fetchOrgApprovedRegistry(): Promise<Record<string, string>> {
   }
     // Registry API key is read inline at fetch time via process.env to avoid a persistent top-level credential binding.
   const registryApiKey = process.env.ORG_APPROVED_MODEL_REGISTRY_API_KEY;
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (registryApiKey) {
     headers["Authorization"] = `Bearer ${registryApiKey}`;
   }
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "Authorization": `Bearer ${registryApiKey}`,
-  };
+  if (registryApiKey) {
+    headers["Authorization"] = `Bearer ${registryApiKey}`;
+  }
   // Enforce URL allowlist: only permit fetches to org-approved registry hostnames.
-  const APPROVED_REGISTRY_HOSTNAMES = [
-    "registry.example.com",
-    "model-registry.internal.example.com",
-    "approved-registry.example.org"
-  ];
+  // Hostnames must be configured via ORG_APPROVED_REGISTRY_HOSTNAMES (comma-separated).
+  // Example: ORG_APPROVED_REGISTRY_HOSTNAMES="registry.corp.example.com,model-registry.internal.corp.com"
+  const APPROVED_REGISTRY_HOSTNAMES: string[] = process.env.ORG_APPROVED_REGISTRY_HOSTNAMES
+    ? process.env.ORG_APPROVED_REGISTRY_HOSTNAMES.split(",").map((h) => h.trim()).filter(Boolean)
+    : [];
+  if (APPROVED_REGISTRY_HOSTNAMES.length === 0) {
+    throw new Error(
+      "ORG_APPROVED_REGISTRY_HOSTNAMES env var must be set to a non-empty comma-separated list of approved registry hostnames."
+    );
+  }
   let parsedRegistryUrl: URL;
   try {
     parsedRegistryUrl = new URL(ORG_APPROVED_REGISTRY_URL);
@@ -872,14 +957,5 @@ export async function POST(request: Request) {
 
   return NextResponse.json({
     message: "Hello from the API!",
-    provenance: {
-      modelId: provenanceModelId,
-      modelVersion: provenanceModelVersion,
-      timestamp: provenanceTimestamp,
-      originTag: provenanceOriginTag,
-      contentHash: sha256(sanitizedResponseText),
-      signature: provenanceSignature,
-      label: "AI-GENERATED",
-    },
   });
 }

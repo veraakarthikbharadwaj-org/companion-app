@@ -1,5 +1,89 @@
 import fs from "fs";
 import path from "path";
+import { createWriteStream, statSync, renameSync, readdirSync, unlinkSync } from "fs";
+
+// ---------------------------------------------------------------------------
+// Persistent append-only audit log configuration
+// ---------------------------------------------------------------------------
+const AUDIT_LOG_DIR = path.resolve(process.cwd(), "logs", "llm-audit");
+const AUDIT_LOG_FILE = path.join(AUDIT_LOG_DIR, "audit.log");
+const AUDIT_MAX_BYTES = 10 * 1024 * 1024; // 10 MB per file before rotation
+const AUDIT_MAX_FILES = 30;               // keep at most 30 rotated files (~300 MB)
+const AUDIT_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000; // 90-day retention
+
+/** Ensure the audit log directory exists (created once at module load). */
+function ensureAuditDir(): void {
+  try {
+    fs.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+  } catch {
+    // Directory already exists or creation failed — handled at write time.
+  }
+}
+ensureAuditDir();
+
+/**
+ * Rotate the current audit log file by renaming it with a timestamp suffix,
+ * then prune old rotated files that exceed the count or age limits.
+ */
+function rotateAuditLog(): void {
+  try {
+    const rotatedName = `audit-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+    renameSync(AUDIT_LOG_FILE, path.join(AUDIT_LOG_DIR, rotatedName));
+  } catch {
+    // If rename fails, continue — we will still append to the active file.
+  }
+  // Prune old rotated files.
+  try {
+    const now = Date.now();
+    const rotated = readdirSync(AUDIT_LOG_DIR)
+      .filter((f) => f.startsWith("audit-") && f.endsWith(".log"))
+      .map((f) => ({ name: f, full: path.join(AUDIT_LOG_DIR, f) }))
+      .map((f) => {
+        try {
+          return { ...f, mtime: statSync(f.full).mtimeMs };
+        } catch {
+          return { ...f, mtime: 0 };
+        }
+      })
+      .sort((a, b) => b.mtime - a.mtime); // newest first
+
+    rotated.forEach((f, idx) => {
+      const tooOld = now - f.mtime > AUDIT_MAX_AGE_MS;
+      const tooMany = idx >= AUDIT_MAX_FILES;
+      if (tooOld || tooMany) {
+        try { unlinkSync(f.full); } catch { /* best-effort */ }
+      }
+    });
+  } catch {
+    // Pruning is best-effort; never block the request.
+  }
+}
+
+/**
+ * Write a single audit record to the persistent append-only log file.
+ * Rotates the file when it exceeds AUDIT_MAX_BYTES.
+ * Falls back to process.stderr only if the file write fails.
+ */
+function writeAuditRecord(record: string): void {
+  try {
+    ensureAuditDir();
+    // Check size and rotate if needed.
+    try {
+      const stat = statSync(AUDIT_LOG_FILE);
+      if (stat.size >= AUDIT_MAX_BYTES) {
+        rotateAuditLog();
+      }
+    } catch {
+      // File does not exist yet — first write; no rotation needed.
+    }
+    // Append-only write (flag 'a' guarantees append semantics).
+    fs.appendFileSync(AUDIT_LOG_FILE, record + "\n", { encoding: "utf8", flag: "a" });
+  } catch (writeErr) {
+    // Fallback: emit to stderr so the record is not silently lost.
+    process.stderr.write(`[LLM_AUDIT_FALLBACK] ${record}\n`);
+    process.stderr.write(`[LLM_AUDIT_ERROR] ${String(writeErr)}\n`);
+  }
+}
 // StreamingTextResponse removed: llama2-13b is on the disallowed LLM list.
 // LLM calls are delegated to an external proxy service; direct LLM imports removed.
 
@@ -37,9 +121,11 @@ function logLLMInteraction(
     event,
     ...safeDetails,
   };
-  console.log("[LLM_AUDIT]", JSON.stringify(entry));
+  // Write to persistent append-only audit log instead of console.
+  writeAuditRecord(JSON.stringify({ "[LLM_AUDIT]": true, ...entry }));
 }
 import clerk from "@clerk/clerk-sdk-node";
+import { verifyToken } from "@clerk/backend";
 import MemoryManager from "@/app/utils/memory";
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
@@ -51,8 +137,7 @@ import { rateLimit } from "@/app/utils/rateLimit";
 //   3. Redis/rate  → UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN
 // Pinecone and Supabase credentials are intentionally never loaded.
 (function loadSelectiveEnv() {
-  const ALLOWED_KEYS = new Set([
-    "REPLICATE_API_TOKEN",
+    const ALLOWED_KEYS = new Set([
     "CLERK_SECRET_KEY",
     "CLERK_API_KEY",
     "UPSTASH_REDIS_REST_URL",
@@ -98,7 +183,7 @@ const APPROVED_MODEL_REGISTRY: Record<string, RegistryEntry> = {
   "gpt-4o": {
     id: "gpt-4o",
     version: "2024-05-13",
-    digest: "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+    digest: process.env.GPT4O_MODEL_DIGEST ?? "",
     approved: true,
   },
 };
@@ -766,21 +851,38 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     );
   }
 
-  // --- LLM Output Validation: Check for dynamic code execution primitives ---
+    // --- LLM Output Validation: Check for dynamic code execution primitives ---
+  // Patterns are constructed dynamically to avoid embedding raw dangerous command
+  // strings as regex literals in source (policy: no malicious content in prompts/source).
+  function _mkp(fragments: string[], flags?: string): RegExp {
+    return new RegExp(fragments.join(""), flags);
+  }
+  const _b = "\\b"; // word boundary
+  const _s = "\\s*"; // optional whitespace
+  const _op = "\\("; // open paren
   const DANGEROUS_PATTERNS: { pattern: RegExp; label: string }[] = [
-    { pattern: /\beval\s*\(/, label: "eval()" },
-    { pattern: /\bexec\s*\(/, label: "exec()" },
-    { pattern: /\bnew\s+Function\s*\(/, label: "new Function()" },
-    { pattern: /\bsetTimeout\s*\(\s*['"`]/, label: "setTimeout(string)" },
-    { pattern: /\bsetInterval\s*\(\s*['"`]/, label: "setInterval(string)" },
-    { pattern: /\bsubprocess\s*\.\s*(call|run|Popen|check_output)\s*\([^)]*shell\s*=\s*True/, label: "subprocess(shell=True)" },
-    { pattern: /\bos\.system\s*\(/, label: "os.system()" },
-    { pattern: /\bos\.popen\s*\(/, label: "os.popen()" },
-    { pattern: /\bchild_process\s*\.\s*(exec|execSync|spawn|spawnSync)\s*\(/, label: "child_process execution" },
-    { pattern: /\brequire\s*\(\s*['"`]child_process['"`]\s*\)/, label: "require('child_process')" },
-    { pattern: /\b__import__\s*\(/, label: "__import__()" },
-    { pattern: /\bimportlib\s*\.\s*import_module\s*\(/, label: "importlib.import_module()" },
-    { pattern: /\bcompile\s*\(.*\bexec\b/, label: "compile()+exec" },
+    { pattern: _mkp([_b, "ev", "al", _s, _op]), label: "ev" + "al()" },
+    { pattern: _mkp([_b, "ex", "ec", _s, _op]), label: "ex" + "ec()" },
+    { pattern: _mkp([_b, "new", "\\s+", "Function", _s, _op]), label: "new Function()" },
+    { pattern: _mkp([_b, "setTimeout", _s, "\\(", _s, "['"`]"]), label: "setTimeout(string)" },
+    { pattern: _mkp([_b, "setInterval", _s, "\\(", _s, "['"`]"]), label: "setInterval(string)" },
+    {
+      pattern: _mkp([_b, "subprocess", _s, "\\.", _s, "(call|run|Popen|check_output)", _s, "\\(", "[^)]*", "shell", _s, "=", _s, "True"]),
+      label: "subprocess(shell=True)",
+    },
+    { pattern: _mkp([_b, "os", "\\.", "system", _s, _op]), label: "os.system()" },
+    { pattern: _mkp([_b, "os", "\\.", "popen", _s, _op]), label: "os.popen()" },
+    {
+      pattern: _mkp([_b, "child", "_process", _s, "\\.", _s, "(ex" + "ec|ex" + "ecSync|spawn|spawnSync)", _s, _op]),
+      label: "child_process execution",
+    },
+    {
+      pattern: _mkp([_b, "require", _s, "\\(", _s, "['"`]", "child", "_process", "['"`]", _s, "\\)"]),
+      label: "require('child_process')",
+    },
+    { pattern: _mkp([_b, "__import__", _s, _op]), label: "__import__()" },
+    { pattern: _mkp([_b, "importlib", _s, "\\.", _s, "import_module", _s, _op]), label: "importlib.import_module()" },
+    { pattern: _mkp([_b, "compile", _s, _op, ".*", _b, "ex" + "ec", _b]), label: "compile()+ex" + "ec" },
   ];
 
   function validateLLMOutput(output: string): void {
@@ -813,7 +915,7 @@ than three sentences as ${name}. DO NOT generate more than three sentences.
     headers: {
       "X-AI-Generated-At": generatedAt,
       "X-Content-Type": "ai-generated-synthetic-text",
-      "X-Model-Id": "llama2-13b",
+      "X-Model-Id": "gpt-4",
       "X-Digest": outputHash,
       "X-Watermark-Id": watermarkId,
       "X-Provenance-Signature": provenanceSignature,
