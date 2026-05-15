@@ -34,7 +34,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 - App logic: [Next.js](https://nextjs.org/)
 - VectorDB: [Pinecone](https://www.pinecone.io/) / [Supabase pgvector](https://supabase.com/docs/guides/database/extensions/pgvector)
 - LLM orchestration: [Langchain.js](https://js.langchain.com/docs/)
-- Text model: `approved-registry/llama-2-13b-chat@sha256:a1b2c3d4e5f6` (pinned digest — update to your organization's approved registry entry and immutable digest before deployment)
+- Text model: `approved-registry/<approved-model-name>@sha256:<digest>` (replace `<approved-model-name>` and `<digest>` with an entry from your organization's approved model registry before deployment)
 - Text streaming: [ai sdk](https://github.com/vercel-labs/ai)
 - Conversation history: [Upstash](https://upstash.com/)
 - Deployment: [Fly](https://fly.io/)
