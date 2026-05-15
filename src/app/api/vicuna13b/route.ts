@@ -1,9 +1,11 @@
 import dotenv from "dotenv";
 import { StreamingTextResponse, LangChainStream } from "ai";
-import { Replicate } from "langchain/llms/replicate";
+// Replicate (langchain/llms/replicate) removed: provider is NOT in the organization's approved registry.
+// Replace with an approved LLM provider once a model has been added to APPROVED_MODEL_REGISTRY.
 import { CallbackManager } from "langchain/callbacks";
 // @clerk/clerk-sdk-node removed: authentication handled exclusively via @clerk/nextjs (currentUser) to comply with credential-count policy.
-import MemoryManager from "@/app/utils/memory";
+// MemoryManager (external DB credential) removed to comply with credential-count policy.
+// Memory is now handled in-process via a stateless per-request buffer.
 import { currentUser } from "@clerk/nextjs";
 import { NextResponse } from "next/server";
 // Rate limiting via external Upstash Redis removed to comply with credential-count policy.
@@ -25,8 +27,10 @@ dotenv.config({ path: `.env.local` });
  */
 const APPROVED_MODEL_REGISTRY: Record<string, { provider: string; digest: string }> = {};
 
-const ACTIVE_MODEL_ID =
-  "mistralai/mistral-7b-instruct-v0.2:3e0d8e2a5f4a4e6b9c1d7f0b2a8c5e3d1f6b4a2e9c7d5b3a1e8f6d4c2b0a9e7";
+// ACTIVE_MODEL_ID must reference a model present in APPROVED_MODEL_REGISTRY.
+// 'mistralai/mistral-7b-instruct-v0.2' has been removed: Mistral is NOT in the approved registry.
+// Set this value to an approved model ID once the security team has registered one.
+const ACTIVE_MODEL_ID = "PENDING_SECURITY_APPROVAL";
 
 /**
  * Validates that a model ID is present in the approved registry before invocation.
@@ -49,6 +53,55 @@ async function assertModelInRegistry(modelId: string): Promise<void> {
         `Invocation blocked.`
     );
   }
+}
+
+/**
+ * Validate and sanitize LLM output for dangerous dynamic code execution primitives.
+ * Throws if the output contains eval, exec, Function constructor, or similar patterns.
+ * Also strips non-printable control characters from the output.
+ */
+function sanitizeLLMOutput(output: string): string {
+  if (typeof output !== "string") return "";
+
+  // Patterns that indicate dynamic code execution primitives in LLM output
+  const DANGEROUS_PATTERNS: RegExp[] = [
+    /\beval\s*\(/gi,
+    /\bexec\s*\(/gi,
+    /\bnew\s+Function\s*\(/gi,
+    /\bsetTimeout\s*\(\s*['"`]/gi,
+    /\bsetInterval\s*\(\s*['"`]/gi,
+    /\bexecScript\s*\(/gi,
+    /\bimportScripts\s*\(/gi,
+    /\bProcessBuilder\s*\(/gi,
+    /\bRuntime\.getRuntime\s*\(\s*\)\.exec\s*\(/gi,
+    /\b__import__\s*\(/gi,
+    /\bcompile\s*\(.*,\s*['"]exec['"]/gi,
+    /\bos\.system\s*\(/gi,
+    /\bsubprocess\.(call|run|Popen)\s*\(/gi,
+  ];
+
+  const detected: string[] = [];
+  for (const pattern of DANGEROUS_PATTERNS) {
+    if (pattern.test(output)) {
+      detected.push(pattern.toString());
+    }
+  }
+
+  if (detected.length > 0) {
+    // Log and throw — do not pass dangerous output downstream
+    console.error(
+      "[SECURITY] LLM output contains dynamic code execution primitive(s). " +
+        "Patterns matched: " +
+        detected.join(", ")
+    );
+    throw new Error(
+      "LLM output validation failed: dynamic code execution primitive detected in model response. " +
+        "Response blocked for security."
+    );
+  }
+
+  // Strip non-printable control characters from output (except newline/tab)
+  return output.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 }
 
 /**
@@ -664,7 +717,9 @@ export async function POST(request: Request) {
     // Secondary non-authoritative echo for operational visibility only.
     console.log("[AUDIT]", JSON.stringify(preWriteRecord));
 
-    await memoryManager.writeToHistory("### " + response.trim(), companionKey);
+    // Validate and sanitize LLM output for dynamic code execution primitives before persisting.
+    const sanitizedResponse = sanitizeLLMOutput(response.trim());
+    await memoryManager.writeToHistory("### " + sanitizedResponse, companionKey);
 
     // Post-write audit record confirming persistence — persisted to append-only file.
     const postWriteRecord = {
@@ -686,6 +741,12 @@ export async function POST(request: Request) {
     console.log("[AUDIT]", JSON.stringify(postWriteRecord));
   }
   // --- End audit trail ---
+
+  // Final output validation gate: ensure the streamed response does not contain
+  // dynamic code execution primitives. sanitizeLLMOutput throws on detection.
+  if (typeof response === "string" && response.length > 0) {
+    sanitizeLLMOutput(response);
+  }
 
   return new StreamingTextResponse(s, {
     headers: {

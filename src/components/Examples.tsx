@@ -6,6 +6,16 @@ import { Tooltip } from "react-tooltip";
 
 import { getCompanions } from "./actions";
 
+function logMCPInteraction(action: string, status: "request" | "response" | "error", data?: unknown): void {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    mcp_interaction: true,
+    action,
+    status,
+    data: data !== undefined ? data : null,
+  }));
+}
+
 const ALLOWED_IMAGE_HOSTS = ["res.cloudinary.com", "cdn.example.com", "lh3.googleusercontent.com", "avatars.githubusercontent.com"];
 
 function getSafeImageUrl(url: string): string {
@@ -50,7 +60,6 @@ export default function Examples() {
   ]);
 
   // APPROVED_LLMS must only contain models confirmed in the organization's registry.
-  // Claude, GPT, and Gemini models are NOT_IN_REGISTRY and have been removed.
   // Add only org-registry-approved model identifiers here.
     // Approved model registry with pinned versions and integrity fingerprints.
   // Each entry is immutable: modelId is the canonical name, version is pinned,
@@ -61,10 +70,8 @@ export default function Examples() {
     readonly integrityHash: string; // sha256(modelId + "@" + version)
   }> = Object.freeze([
     // TODO: Add only models confirmed in the organization's approved registry.
-    // All previously listed models (gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo,
-    // claude-3-5-sonnet, claude-3-haiku, gemini-1.5-pro, gemini-1.5-flash) are
-    // NOT_IN_REGISTRY and have been removed pending approval.
-    // gemini-1.5-flash is NOT_IN_REGISTRY — removed pending org approval.
+    // No models are currently approved. Populate this registry with org-approved,
+    // version-pinned model entries once they have been confirmed in the registry.
   ]);
 
   const getApprovedLlmLabel = (llm: string): string => {
@@ -101,18 +108,13 @@ export default function Examples() {
         window.crypto.subtle.digest("SHA-256", data).then((hashBuffer) => {
           const hashArray = Array.from(new Uint8Array(hashBuffer));
           const provenanceSignature = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-          // Attach signed provenance to window for downstream consumers
-          (window as any).__lastAIProvenanceSignature = provenanceSignature;
-          (window as any).__lastAIProvenanceBlock = { ...provenanceBlock, provenanceSignature };
+          // Provenance signature computed but not exposed to window globals
         }).catch(() => {});
       } catch {
         // SubtleCrypto unavailable; provenance block still attached without signature
       }
     }
-    // Always attach provenance block (without async signature) synchronously for immediate consumers
-    if (typeof window !== "undefined") {
-      (window as any).__lastAIProvenanceBlock = provenanceBlock;
-    }
+    // Provenance block is used internally only; not exposed to window globals
     // Record model identity in request metadata for audit traceability
     if (typeof window !== "undefined") {
       try {
@@ -179,6 +181,18 @@ export default function Examples() {
     }
     return pinnedLabel;
   };
+
+  function sanitizeCompanion(item: unknown): { name: string; title: string; imageUrl: string; telegramLink: string | null } {
+    if (!item || typeof item !== "object") {
+      return { name: "", title: "", imageUrl: getSafeImageUrl(""), telegramLink: null };
+    }
+    const obj = item as Record<string, unknown>;
+    const name = typeof obj.name === "string" ? obj.name.trim().slice(0, 200) : "";
+    const title = typeof obj.title === "string" ? obj.title.trim().slice(0, 500) : "";
+    const imageUrl = getSafeImageUrl(typeof obj.imageUrl === "string" ? obj.imageUrl : "");
+    const telegramLink = getSafeTelegramLink(typeof obj.telegramLink === "string" ? obj.telegramLink : null);
+    return { name, title, imageUrl, telegramLink: telegramLink === "#" ? null : telegramLink };
+  }
 
   useEffect(() => {
     const fetchData = async () => {
@@ -348,29 +362,22 @@ const APPROVED_LLM_REGISTRY: ReadonlyMap<string, RegistryEntry> = new Map([
   // either unpinned or NOT_IN_REGISTRY per the org model registry.
 ]);
 
-/** Returns the pinned model identifier if it exists in the org registry. Throws if registry is empty or model is unregistered to block execution with unapproved models. */
+/** Returns the pinned model identifier if it exists in the org registry. Throws if registry is empty or model is unregistered to block execution with unapproved models. Also rejects any value containing dangerous code execution primitives. */
 function sanitizeLlm(llm: unknown): string {
   if (APPROVED_LLM_REGISTRY.size === 0) {
     throw new Error('[sanitizeLlm] APPROVED_LLM_REGISTRY is empty. No approved models are configured. Inference is blocked until the registry is populated with org-approved, version-pinned models.');
   }
-  if (typeof llm === 'string' && APPROVED_LLM_REGISTRY.has(llm)) {
-    return llm;
-  }
-  throw new Error(`[sanitizeLlm] Model '${typeof llm === 'string' ? llm : typeof llm}' is not in the approved model registry. Inference blocked.`);
-}
-
-function sanitizeLlm(llm: unknown): string {
   if (typeof llm !== 'string') {
-    return 'Unknown';
+    throw new Error(`[sanitizeLlm] Model value is not a string (got ${typeof llm}). Inference blocked.`);
   }
   if (containsDangerousCodeExecution(llm)) {
     console.warn('[sanitizeLlm] Dangerous code execution pattern detected in LLM output; rejecting value.');
-    return 'Unknown';
+    throw new Error(`[sanitizeLlm] Model identifier '${llm}' contains dangerous code execution primitives. Inference blocked.`);
   }
-  if (APPROVED_LLMS.has(llm)) {
+  if (APPROVED_LLM_REGISTRY.has(llm)) {
     return llm;
   }
-  return 'Unknown';
+  throw new Error(`[sanitizeLlm] Model '${llm}' is not in the approved model registry. Inference blocked.`);
 }
 
 function maskPhoneNumber(phone: string): string {

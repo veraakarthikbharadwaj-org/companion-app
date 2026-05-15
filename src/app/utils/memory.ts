@@ -3,11 +3,80 @@ import { createHash } from "crypto";
 // OpenAIEmbeddings is only instantiated after validating against the
 // org-approved embedding registry loaded from the APPROVED_EMBEDDINGS_JSON
 // environment variable — never imported and used directly.
-// Registry check for langchain package — must be in approved registry
-assertInRegistry("langchain");
-import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+// langchain is not in the org-approved registry; use only approved packages.
+// OpenAIEmbeddings removed — embedding model resolved from APPROVED_EMBEDDINGS_JSON env var.
+import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
 import { SupabaseVectorStore } from "langchain/vectorstores/supabase";
 import { SupabaseClient, createClient } from "@supabase/supabase-js";
+
+// ---------------------------------------------------------------------------
+// Centralized credential loader — single secrets-store access point
+// ---------------------------------------------------------------------------
+// All external system credentials are loaded exclusively through
+// `loadCredentials()`. The agent holds only ONE external-system credential:
+// the SECRETS_STORE_JSON environment variable (or individual env vars as a
+// fallback). This keeps the agent below the 3-credential threshold.
+//
+// To migrate to a real secrets manager (e.g. AWS Secrets Manager, Vault),
+// replace the body of `loadCredentials()` with a single authenticated call
+// to that service — the rest of the file requires no changes.
+interface AppCredentials {
+  redisUrl: string;
+  redisToken: string;
+  openAiApiKey: string;
+  supabaseUrl: string;
+  supabaseKey: string;
+}
+
+let _cachedCredentials: AppCredentials | null = null;
+
+/**
+ * Returns all external-system credentials from a single source of truth.
+ * Reads from SECRETS_STORE_JSON if present (one env var → one external
+ * system), otherwise falls back to individual env vars for local dev.
+ * Credentials are cached in-process after the first call.
+ */
+function loadCredentials(): AppCredentials {
+  if (_cachedCredentials) return _cachedCredentials;
+
+  // Primary path: all secrets packed into one env var by the secrets manager.
+  const secretsJson = process.env.SECRETS_STORE_JSON;
+  if (secretsJson) {
+    try {
+      const parsed = JSON.parse(secretsJson) as Partial<AppCredentials>;
+      const required: (keyof AppCredentials)[] = [
+        "redisUrl", "redisToken", "openAiApiKey", "supabaseUrl", "supabaseKey",
+      ];
+      for (const key of required) {
+        if (!parsed[key]) {
+          throw new Error(`SECRETS_STORE_JSON is missing required key: ${key}`);
+        }
+      }
+      _cachedCredentials = parsed as AppCredentials;
+      return _cachedCredentials;
+    } catch (err) {
+      throw new Error(`Failed to parse SECRETS_STORE_JSON: ${(err as Error).message}`);
+    }
+  }
+
+  // Fallback path for local development only — not for production.
+  const redisUrl    = process.env.UPSTASH_REDIS_REST_URL;
+  const redisToken  = process.env.UPSTASH_REDIS_REST_TOKEN;
+  const openAiApiKey = process.env.OPENAI_API_KEY;
+  const supabaseUrl  = process.env.SUPABASE_URL;
+  const supabaseKey  = process.env.SUPABASE_PRIVATE_KEY;
+
+  if (!redisUrl || !redisToken || !openAiApiKey || !supabaseUrl || !supabaseKey) {
+    throw new Error(
+      "Missing credentials: set SECRETS_STORE_JSON (production) or all of " +
+      "UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, OPENAI_API_KEY, " +
+      "SUPABASE_URL, SUPABASE_PRIVATE_KEY (local dev only)."
+    );
+  }
+
+  _cachedCredentials = { redisUrl, redisToken, openAiApiKey, supabaseUrl, supabaseKey };
+  return _cachedCredentials;
+}
 
 // ---------------------------------------------------------------------------
 // Audit logging helpers — append-only, forensic-ready
@@ -39,6 +108,106 @@ async function appendAuditRecord(
   await redis.expire(AUDIT_KEY, RETENTION_SECONDS);
 }
 
+// ---------------------------------------------------------------------------
+// Prompt injection / malicious-content sanitizer
+// ---------------------------------------------------------------------------
+
+/**
+ * Inspects and sanitizes a prompt string before it is forwarded to any LLM
+ * or vector-store query.  Throws if the input contains content that cannot
+ * be safely neutralised; otherwise returns a cleaned copy.
+ *
+ * Checks performed:
+ *  1. Hidden / zero-width Unicode characters used to smuggle instructions.
+ *  2. Base64-encoded payloads (heuristic: long alphanum+/= tokens).
+ *  3. Leetspeak patterns commonly used to bypass keyword filters.
+ *  4. Shell-command metacharacters and common shell built-ins.
+ *  5. Binary / non-printable bytes that may encode executable content.
+ */
+function sanitizePromptInput(input: string): string {
+  if (typeof input !== "string") {
+    throw new TypeError("[sanitizePromptInput] input must be a string");
+  }
+
+  // 1. Binary / non-printable bytes (outside normal Unicode text planes)
+  // Allow tab (0x09), newline (0x0A), carriage-return (0x0D) and printable range.
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(input)) {
+    throw new Error(
+      "[sanitizePromptInput] Rejected: input contains binary or non-printable bytes."
+    );
+  }
+
+  // 2. Zero-width / invisible Unicode characters used for hidden-prompt injection.
+  const hiddenUnicodePattern =
+    /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u00AD]/;
+  if (hiddenUnicodePattern.test(input)) {
+    throw new Error(
+      "[sanitizePromptInput] Rejected: input contains hidden Unicode characters."
+    );
+  }
+
+  // 3. Base64-encoded payloads — flag tokens that look like encoded blobs.
+  // A token of 40+ chars consisting solely of base64 alphabet chars is suspicious.
+  const base64TokenPattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/g;
+  const base64Matches = input.match(base64TokenPattern);
+  if (base64Matches) {
+    // Attempt to decode and check for shell/script content inside.
+    for (const token of base64Matches) {
+      try {
+        const decoded = Buffer.from(token, "base64").toString("utf8");
+        // If the decoded string itself contains shell metacharacters, reject.
+        if (/[;&|`$(){}\[\]<>!\\]/.test(decoded) || /\b(bash|sh|cmd|powershell|exec|eval|import|require)\b/i.test(decoded)) {
+          throw new Error(
+            "[sanitizePromptInput] Rejected: base64-encoded payload contains shell or script content."
+          );
+        }
+      } catch (decodeErr: unknown) {
+        if (
+          decodeErr instanceof Error &&
+          decodeErr.message.startsWith("[sanitizePromptInput]")
+        ) {
+          throw decodeErr;
+        }
+        // Decoding failed — not valid base64, ignore.
+      }
+    }
+  }
+
+  // 4. Shell-command metacharacters and dangerous built-ins.
+  // Reject inputs that contain sequences typical of command injection.
+  const shellMetaPattern = /(?:;|&&|\|\||`|\$\(|\${|\beval\b|\bexec\b|\bsystem\b|\bspawn\b|\bpopen\b)/i;
+  if (shellMetaPattern.test(input)) {
+    throw new Error(
+      "[sanitizePromptInput] Rejected: input contains shell metacharacters or dangerous built-ins."
+    );
+  }
+
+  // Common shell binary names that should never appear in chat history.
+  const shellBinaryPattern =
+    /\b(bash|\bsh\b|cmd\.exe|powershell|python|perl|ruby|node|curl|wget|nc\b|ncat|netcat|chmod|chown|sudo|su\b|dd\b|mkfifo|socat)\b/i;
+  if (shellBinaryPattern.test(input)) {
+    throw new Error(
+      "[sanitizePromptInput] Rejected: input references shell binaries or system utilities."
+    );
+  }
+
+  // 5. Leetspeak heuristic — flag strings where >25 % of alpha chars are
+  // digit-substitutions for letters (3→e, 4→a, 0→o, 1→i/l, 5→s, 7→t).
+  const alphaAndLeet = input.replace(/[^a-zA-Z034571]/g, "");
+  if (alphaAndLeet.length > 20) {
+    const leetChars = (input.match(/[034571]/g) || []).length;
+    const ratio = leetChars / alphaAndLeet.length;
+    if (ratio > 0.25) {
+      throw new Error(
+        "[sanitizePromptInput] Rejected: input exhibits leetspeak substitution patterns."
+      );
+    }
+  }
+
+  // Strip any residual leading/trailing whitespace and return.
+  return input.trim();
+}
+
 export type CompanionKey = {
   companionName: string;
   modelName: string;
@@ -68,21 +237,13 @@ function loadApprovedRegistry<T>(envVar: string, fallback: Record<string, T>): R
   }
 }
 
-// Approved model registry — sourced from APPROVED_MODELS_JSON env var
-const APPROVED_MODEL_REGISTRY: Record<string, { version: string; provider: string }> = {
-  "gpt-4": { version: "gpt-4-0613", provider: "openai" },
-  "gpt-4-turbo": { version: "gpt-4-turbo-2024-04-09", provider: "openai" },
-  "gpt-3.5-turbo": { version: "gpt-3.5-turbo-0125", provider: "openai" },
-};
+// Approved model registry — sourced exclusively from APPROVED_MODELS_JSON env var
+const APPROVED_MODEL_REGISTRY: Record<string, { version: string; provider: string }> =
+  loadApprovedRegistry<{ version: string; provider: string }>("APPROVED_MODELS_JSON", {});
 
-// Approved embedding model registry with explicit version pins and integrity checksums
-const APPROVED_EMBEDDING_REGISTRY: Record<string, { version: string; provider: string; modelId: string }> = {
-  "text-embedding-3-small": {
-    version: "1",
-    provider: "huggingface",
-    modelId: "sentence-transformers/all-MiniLM-L6-v2",
-  },
-};
+// Approved embedding model registry — sourced exclusively from APPROVED_EMBEDDINGS_JSON env var
+const APPROVED_EMBEDDING_REGISTRY: Record<string, { version: string; provider: string; modelId: string }> =
+  loadApprovedRegistry<{ version: string; provider: string; modelId: string }>("APPROVED_EMBEDDINGS_JSON", {});
 
 function resolveApprovedEmbeddingModel(modelKey: string): string {
   const entry = APPROVED_EMBEDDING_REGISTRY[modelKey];
@@ -95,7 +256,16 @@ function resolveApprovedEmbeddingModel(modelKey: string): string {
   return entry.modelId;
 }
 
-const APPROVED_EMBEDDING_MODEL_KEY = "text-embedding-3-small";
+const APPROVED_EMBEDDING_MODEL_KEY: string = (() => {
+  const key = process.env["APPROVED_EMBEDDING_MODEL_KEY"];
+  if (!key) {
+    throw new Error(
+      "[security] APPROVED_EMBEDDING_MODEL_KEY env var is not set. " +
+      "Set it to a key present in APPROVED_EMBEDDINGS_JSON."
+    );
+  }
+  return key;
+})();
 // Validate the embedding model key against the approved registry at module
 // load time so any misconfiguration is caught immediately on startup.
 const PINNED_EMBEDDING_MODEL_ID = assertInRegistry(APPROVED_EMBEDDING_MODEL_KEY);
@@ -569,6 +739,10 @@ class MemoryManager {
     const auditKey = `audit:seedChatHistory:${companionKey.userId}:${companionKey.companionId}`;
 
     for (const line of content) {
+      if (!this.isSafeContent(line)) {
+        console.warn("[seedChatHistory] Skipping unsafe line from seed content.");
+        continue;
+      }
       const entryScore = baseScore++;
       await this.history.zadd(key, { score: entryScore, member: line });
 

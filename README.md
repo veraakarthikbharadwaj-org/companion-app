@@ -44,7 +44,7 @@ The stack is based on the [AI Getting Started Stack](https://github.com/a16z-inf
 
 The following instructions should get you up and running with a fully
 functional, local deployment of four AIs to chat with. Note that the companions
-running on Vicuna (Rosie and Lucky) will take more time to respond as we've not
+running on models sourced from the organization's approved registry will take more time to respond as we've not
 dealt with the cold start problem. So you may have to wait around a bit :)
 
 ### 1. Fork and Clone repo

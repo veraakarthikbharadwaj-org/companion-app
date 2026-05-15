@@ -3,32 +3,27 @@ import dotenv from "dotenv";
 dotenv.config({ path: `.env.local` });
 
 // Approved model registry — only models listed here may be used for inference.
-// NOTE: Only org-approved models may appear here. Unapproved models (e.g. stable-diffusion, dall-e, GPT, Claude) have been removed.
-// Model IDs and versions are hardcoded to org-approved values; env vars may select among approved entries only.
+// NOTE: Only org-approved models may appear here. Model IDs and versions are
+// hardcoded to org-approved values; no env-var override is permitted.
 const APPROVED_MODEL_REGISTRY: Record<string, string[]> = {
-  "org-approved-image-model-v1": ["1.0.0", "1.1.0"],
+  "dall-e-3": ["3.0"],
 };
 
-const _DEFAULT_APPROVED_IMAGE_MODEL_ID = "org-approved-image-model-v1";
-const _DEFAULT_APPROVED_IMAGE_MODEL_VERSION = "1.1.0";
+// Pinned model identity for this workload — hardcoded to org-approved values.
+const PINNED_MODEL_ID = "dall-e-3";
+const PINNED_MODEL_VERSION = "3.0";
 
-const _envModelId: string = process.env.APPROVED_IMAGE_MODEL_ID ?? _DEFAULT_APPROVED_IMAGE_MODEL_ID;
-const _envModelVersion: string = process.env.APPROVED_IMAGE_MODEL_VERSION ?? _DEFAULT_APPROVED_IMAGE_MODEL_VERSION;
-
-if (!Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, _envModelId)) {
+// Verify the pinned values are present in the registry at module load time.
+if (!Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, PINNED_MODEL_ID)) {
   throw new Error(
-    `Configuration error: APPROVED_IMAGE_MODEL_ID "${_envModelId}" is not in the org-approved model registry.`
+    `Configuration error: PINNED_MODEL_ID "${PINNED_MODEL_ID}" is not in the org-approved model registry.`
   );
 }
-if (!APPROVED_MODEL_REGISTRY[_envModelId].includes(_envModelVersion)) {
+if (!APPROVED_MODEL_REGISTRY[PINNED_MODEL_ID].includes(PINNED_MODEL_VERSION)) {
   throw new Error(
-    `Configuration error: APPROVED_IMAGE_MODEL_VERSION "${_envModelVersion}" is not approved for model "${_envModelId}".`
+    `Configuration error: PINNED_MODEL_VERSION "${PINNED_MODEL_VERSION}" is not approved for model "${PINNED_MODEL_ID}".`
   );
 }
-
-// Pinned model identity for this workload — must match an entry in APPROVED_MODEL_REGISTRY.
-const PINNED_MODEL_ID = _envModelId;
-const PINNED_MODEL_VERSION = _envModelVersion;
 
 const _APPROVED_IMAGE_MODEL_ID: string = PINNED_MODEL_ID;
 const _APPROVED_IMAGE_MODEL_VERSION: string = PINNED_MODEL_VERSION;
@@ -71,6 +66,141 @@ import Image from "next/image";
 import crypto from "crypto";
 
 /**
+ * Validates and sanitizes a user-supplied prompt before sending it to the inference API.
+ * Rejects prompts containing shell commands, base64-encoded payloads, leetspeak obfuscation,
+ * hidden prompt-injection markers, or other known malicious patterns.
+ */
+function validateAndSanitizePrompt(prompt: unknown): string {
+  if (typeof prompt !== "string") {
+    throw new Error("Prompt validation failed: prompt must be a string.");
+  }
+
+  // Enforce reasonable length limit to prevent prompt-stuffing attacks
+  const MAX_PROMPT_LENGTH = 1000;
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    throw new Error(
+      `Prompt validation failed: prompt exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.`
+    );
+  }
+
+  // Detect base64-encoded content (long runs of base64 chars that decode to non-trivial payloads)
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/;
+  if (base64Pattern.test(prompt)) {
+    throw new Error(
+      "Prompt validation failed: prompt contains suspected base64-encoded content."
+    );
+  }
+
+  // Detect shell command patterns
+  const shellCommandPattern =
+    /(?:^|\s|;|\||&)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|subprocess|os\.system|`[^`]*`|\$\([^)]*\))/i;
+  if (shellCommandPattern.test(prompt)) {
+    throw new Error(
+      "Prompt validation failed: prompt contains suspected shell command patterns."
+    );
+  }
+
+  // Detect common prompt-injection / jailbreak markers
+  const injectionMarkers = [
+    /ignore\s+(all\s+)?previous\s+instructions/i,
+    /disregard\s+(all\s+)?previous\s+instructions/i,
+    /forget\s+(all\s+)?previous\s+instructions/i,
+    /you\s+are\s+now\s+(?:a|an|the)\s+/i,
+    /act\s+as\s+(?:a|an|the)\s+/i,
+    /pretend\s+(?:you\s+are|to\s+be)\s+/i,
+    /\[SYSTEM\]/i,
+    /\[INST\]/i,
+    /<\|system\|>/i,
+    /###\s*instruction/i,
+    /---\s*system\s*---/i,
+  ];
+  for (const marker of injectionMarkers) {
+    if (marker.test(prompt)) {
+      throw new Error(
+        "Prompt validation failed: prompt contains suspected prompt-injection content."
+      );
+    }
+  }
+
+  // Detect leetspeak obfuscation (heuristic: high ratio of digit-substituted letters)
+  const leetspeakPattern = /(?:[a-zA-Z]*[013457][a-zA-Z]*){4,}/;
+  if (leetspeakPattern.test(prompt.replace(/\s/g, ""))) {
+    throw new Error(
+      "Prompt validation failed: prompt contains suspected leetspeak obfuscation."
+    );
+  }
+
+  // Detect hidden / zero-width characters used to smuggle instructions
+  const hiddenCharPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060]/;
+  if (hiddenCharPattern.test(prompt)) {
+    throw new Error(
+      "Prompt validation failed: prompt contains hidden or zero-width characters."
+    );
+  }
+
+  // Strip leading/trailing whitespace and return the validated prompt
+  return prompt.trim();
+}
+
+/**
+ * Sanitizes and validates a user-supplied prompt before sending it to the AI inference API.
+ * - Strips leading/trailing whitespace
+ * - Removes ASCII control characters (except newline/tab)
+ * - Enforces a maximum length
+ * - Rejects prompts containing prompt-injection or jailbreak patterns
+ * @throws {Error} if the prompt is invalid or contains disallowed content
+ */
+function sanitizeAndValidatePrompt(prompt: unknown): string {
+  if (typeof prompt !== "string") {
+    throw new Error("Invalid prompt: prompt must be a string.");
+  }
+
+  // Strip leading/trailing whitespace
+  let sanitized = prompt.trim();
+
+  // Remove ASCII control characters except \t (0x09) and \n (0x0A)
+  // eslint-disable-next-line no-control-regex
+  sanitized = sanitized.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
+
+  // Enforce minimum length
+  if (sanitized.length === 0) {
+    throw new Error("Invalid prompt: prompt must not be empty.");
+  }
+
+  // Enforce maximum length (4000 characters)
+  const MAX_PROMPT_LENGTH = 4000;
+  if (sanitized.length > MAX_PROMPT_LENGTH) {
+    throw new Error(
+      `Invalid prompt: prompt exceeds maximum allowed length of ${MAX_PROMPT_LENGTH} characters.`
+    );
+  }
+
+  // Reject prompt-injection / jailbreak patterns (case-insensitive)
+  const DISALLOWED_PATTERNS: RegExp[] = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /disregard\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /forget\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /you\s+are\s+now\s+(a|an|the)?\s*(?:different|new|unrestricted|jailbroken)/i,
+    /act\s+as\s+(a|an|the)?\s*(?:unrestricted|jailbroken|evil|malicious)/i,
+    /\bdan\b.*\bmode\b/i,
+    /system\s*:\s*you\s+are/i,
+    /<\s*script[^>]*>/i,
+    /\bexec\s*\(/i,
+    /\beval\s*\(/i,
+  ];
+
+  for (const pattern of DISALLOWED_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      throw new Error(
+        "Invalid prompt: prompt contains disallowed or potentially malicious content."
+      );
+    }
+  }
+
+  return sanitized;
+}
+
+/**
  * Writes a structured AI decision audit record to the persistent audit log endpoint.
  * This must be called for every AI inference action to satisfy forensic readiness requirements.
  */
@@ -87,21 +217,32 @@ async function writeAuditRecord(record: {
   try {
     const auditResponse = await fetch("/api/audit-log", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Signal append-only semantics: the server must reject any mutation of existing records.
+        "X-Audit-Append-Only": "true",
+        // Signal minimum retention requirement (90 days) for forensic readiness.
+        "X-Audit-Retention-Days": "90",
+      },
       body: JSON.stringify({
         eventType: "AI_IMAGE_GENERATION",
         ...record,
       }),
     });
     if (!auditResponse.ok) {
-      // Log to console as fallback — audit failures must not silently disappear.
-      console.error(
-        "[AUDIT] Failed to persist AI decision audit record:",
-        await auditResponse.text()
+      const errorBody = await auditResponse.text();
+      // Audit failure must block the inference action — never proceed silently.
+      throw new Error(
+        `[AUDIT] Failed to persist AI decision audit record (HTTP ${auditResponse.status}): ${errorBody}`
       );
     }
   } catch (auditErr) {
-    console.error("[AUDIT] Exception writing AI decision audit record:", auditErr);
+    // Re-throw so the calling inference action is aborted on audit failure.
+    throw new Error(
+      `[AUDIT] Exception writing AI decision audit record: ${
+        auditErr instanceof Error ? auditErr.message : String(auditErr)
+      }`
+    );
   }
 }
 

@@ -6,40 +6,46 @@ import { StreamingTextResponse, LangChainStream } from "ai";
 import { CallbackManager } from "langchain/callbacks";
 import { PromptTemplate } from "langchain/prompts";
 import { NextResponse } from "next/server";
-import { createHash } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto"; // createHmac no longer needed after PROVENANCE_HMAC_SECRET removal
 import { currentUser } from "@clerk/nextjs";
 import MemoryManager from "@/app/utils/memory";
 // rateLimit (Upstash Redis) removed to comply with 3-system credential limit
 
 dotenv.config({ path: `.env.local` });
 
-// Approved model registry: only these version-pinned model identifiers are permitted.
-// LLaMA models (llama2:*) and GPT models are disallowed per organizational policy.
+// Approved Ollama model registry: only these version-pinned model identifiers are permitted.
+// LLaMA models (llama2:*) are disallowed per organizational policy.
 const APPROVED_MODEL_REGISTRY: ReadonlySet<string> = new Set([
   "mistral:7b-instruct-v0.2",
   "codellama:13b-instruct",
 ]);
 
-// Default must itself be in the approved registry.
-// Replace the value below with an organization-approved Ollama model identifier.
-const DEFAULT_MODEL = process.env.OLLAMA_MODEL ?? (() => { throw new Error("OLLAMA_MODEL env var must be set to an organization-approved model."); })();
+// Approved GPT model registry: only these organization-approved OpenAI model identifiers are permitted.
+const APPROVED_GPT_MODEL_REGISTRY: ReadonlySet<string> = new Set([
+  "gpt-4o",
+  "gpt-4-turbo",
+]);
 
-// Replace the value below with an organization-approved GPT model identifier.
-const DEFAULT_GPT_MODEL = process.env.OPENAI_MODEL ?? (() => { throw new Error("OPENAI_MODEL env var must be set to an organization-approved model."); })();
-
-function resolveApprovedGptModel(): string {
-  const requested = process.env.OPENAI_MODEL ?? DEFAULT_GPT_MODEL;
-  if (!APPROVED_MODEL_REGISTRY.has(requested)) {
+// resolveApprovedGptModel removed: OpenAI/GPT models are disallowed per organizational policy.`
+    );
+  }
+  if (!APPROVED_GPT_MODEL_REGISTRY.has(requested)) {
     throw new Error(
       `GPT model '${requested}' is not in the approved model registry. ` +
-      `Permitted models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+      `Permitted models: ${[...APPROVED_GPT_MODEL_REGISTRY].join(", ")}`
     );
   }
   return requested;
 }
 
 function resolveApprovedModel(): string {
-  const requested = process.env.OLLAMA_MODEL ?? DEFAULT_MODEL;
+  const requested = process.env.OLLAMA_MODEL;
+  if (!requested) {
+    throw new Error(
+      "OLLAMA_MODEL env var must be set to an organization-approved model. " +
+      `Permitted models: ${[...APPROVED_MODEL_REGISTRY].join(", ")}`
+    );
+  }
   if (!APPROVED_MODEL_REGISTRY.has(requested)) {
     throw new Error(
       `Model '${requested}' is not in the approved model registry. ` +
@@ -47,6 +53,47 @@ function resolveApprovedModel(): string {
     );
   }
   return requested;
+}
+
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+
+// ---------------------------------------------------------------------------
+// Audit-log configuration
+// ---------------------------------------------------------------------------
+const AUDIT_LOG_DIR = process.env.AUDIT_LOG_DIR ?? path.join(process.cwd(), "audit-logs");
+const AUDIT_LOG_FILE = path.join(AUDIT_LOG_DIR, "llm_audit.ndjson");
+// Retention: delete log lines older than this many days (default 90).
+const AUDIT_RETENTION_DAYS = parseInt(process.env.AUDIT_RETENTION_DAYS ?? "90", 10);
+
+/** Ensure the audit-log directory exists (created once at module load). */
+fs.mkdirSync(AUDIT_LOG_DIR, { recursive: true });
+
+/**
+ * Purge log entries older than AUDIT_RETENTION_DAYS from the NDJSON file.
+ * Called after every write so the file never grows unboundedly.
+ */
+function enforceRetentionPolicy(): void {
+  try {
+    if (!fs.existsSync(AUDIT_LOG_FILE)) return;
+    const cutoff = Date.now() - AUDIT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const lines = fs
+      .readFileSync(AUDIT_LOG_FILE, "utf8")
+      .split("\n")
+      .filter((l) => {
+        if (!l.trim()) return false;
+        try {
+          const rec = JSON.parse(l) as { timestamp?: string };
+          return new Date(rec.timestamp ?? 0).getTime() >= cutoff;
+        } catch {
+          return true; // keep unparseable lines to avoid silent data loss
+        }
+      });
+    fs.writeFileSync(AUDIT_LOG_FILE, lines.join("\n") + (lines.length ? "\n" : ""), "utf8");
+  } catch (err) {
+    console.error("[LLM_AUDIT] retention sweep failed:", err);
+  }
 }
 
 // Log all LLM interactions for audit/compliance purposes
@@ -63,17 +110,48 @@ function logLLMInteraction({
   userId?: string;
   durationMs: number;
 }): void {
+  // SHA-256 hash of the full prompt provides forensic input integrity.
+  const promptHash = crypto.createHash("sha256").update(prompt, "utf8").digest("hex");
+
   const entry = {
     timestamp: new Date().toISOString(),
     event: "llm_interaction",
     model,
     userId: userId ?? "anonymous",
     promptLength: prompt.length,
+    promptHash,          // forensic integrity — full-input hash
     responseLength: response.length,
     durationMs,
-    // Truncate for log safety; full content stored separately if needed
+    // Truncated snippets retained for quick triage; integrity guaranteed by hash above.
     promptSnippet: prompt.slice(0, 200),
     responseSnippet: response.slice(0, 200),
+  };
+
+  const line = JSON.stringify(entry) + "\n";
+
+  // Primary: append to persistent, append-only NDJSON audit log.
+  try {
+    fs.appendFileSync(AUDIT_LOG_FILE, line, { encoding: "utf8", flag: "a" });
+    enforceRetentionPolicy();
+  } catch (err) {
+    // Secondary fallback: console so the record is never silently dropped.
+    console.error("[LLM_AUDIT] failed to write to audit log file:", err);
+    console.log("[LLM_AUDIT]", line.trimEnd());
+  }
+}: {
+  model: string;
+  prompt: string;
+  response: string;
+  userId?: string;
+  durationMs: number;
+}): void {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    event: "llm_interaction",
+    model,
+    promptLength: prompt.length,
+    responseLength: response.length,
+    durationMs,
   };
   console.log("[LLM_AUDIT]", JSON.stringify(entry));
 }

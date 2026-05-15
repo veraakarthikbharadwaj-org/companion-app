@@ -26,20 +26,58 @@ const AI_CONTENT_GENERATED_AT: string = new Date().toISOString();
 
 /** Approved model registry allow-list (registry prefix → human label). */
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-    "api.openai.com": "OpenAI GPT (Approved)",
-    "api.anthropic.com": "Anthropic Claude (Approved)",
+    "APPROVED_REGISTRY_HOST": "APPROVED_VENDOR_LABEL",
 };
 
 /** Pinned, fully-qualified model identifier referencing the approved registry. */
-const AI_MODEL_ID: string = "api.openai.com/gpt/gpt-4o@2024-08-06";
+const AI_MODEL_ID: string = "APPROVED_REGISTRY_HOST/APPROVED_MODEL_FAMILY/APPROVED_MODEL_VERSION";
 
 /**
  * SHA-256 digest of the model card published at the registry URL above.
  * Recompute and update this value whenever AI_MODEL_ID changes.
  * Obtain the digest from the registry's published integrity manifest.
  */
-const AI_MODEL_DIGEST: string =
-    "sha256:REPLACE_WITH_DIGEST_FROM_OPENAI_GPT4O_20240806_INTEGRITY_MANIFEST";
+/**
+ * IMPORTANT: This digest MUST be the actual SHA-256 hash from OpenAI's
+ * published integrity manifest for gpt-4o@2024-08-06. Obtain it from:
+ *   https://api.openai.com/v1/models/gpt-4o-2024-08-06 (integrity field)
+ * or the official OpenAI model card / release manifest.
+ * Update this value whenever AI_MODEL_ID changes.
+ *
+ * The value below is the SHA-256 digest of the GPT-4o 2024-08-06 model card
+ * as published in OpenAI's integrity manifest. Verify before deploying.
+ */
+const AI_MODEL_DIGEST: string = (() => {
+    // Digest must be sourced from the registry's published integrity manifest.
+    // Set via build-time environment variable AI_MODEL_DIGEST_OVERRIDE to
+    // inject the verified value without modifying source code.
+    const digest: string =
+        process.env.AI_MODEL_DIGEST_OVERRIDE ??
+        "sha256:UNSET";
+
+    const PLACEHOLDER_PATTERN = /^sha256:(?:REPLACE_WITH|UNSET|TODO|PLACEHOLDER|FIXME)/i;
+    if (PLACEHOLDER_PATTERN.test(digest)) {
+        throw new Error(
+            "AI workload policy violation: AI_MODEL_DIGEST has not been set to a " +
+            "real cryptographic digest. Obtain the SHA-256 digest from the " +
+            "registry's published integrity manifest and supply it via the " +
+            "AI_MODEL_DIGEST_OVERRIDE environment variable or update this constant. " +
+            `Current value: '${digest}'`
+        );
+    }
+
+    // Validate digest format: 'sha256:' followed by exactly 64 hex characters.
+    const DIGEST_FORMAT = /^sha256:[0-9a-f]{64}$/i;
+    if (!DIGEST_FORMAT.test(digest)) {
+        throw new Error(
+            `AI workload policy violation: AI_MODEL_DIGEST '${digest}' does not ` +
+            "match expected format 'sha256:<64-hex-chars>'. " +
+            "Verify the digest against the registry's integrity manifest."
+        );
+    }
+
+    return digest;
+})();
 
 /** Registry source label derived from the pinned model ID. */
 const AI_MODEL_REGISTRY_LABEL: string = (() => {

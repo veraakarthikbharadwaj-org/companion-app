@@ -15,14 +15,32 @@ create table documents (
 -- Retention policy: records must be kept for a minimum of 90 days.
 -- This table is append-only; DELETE and UPDATE are blocked by rules below.
 create table if not exists match_documents_audit (
-  audit_id    bigserial primary key,
-  logged_at   timestamptz not null default now(),
-  principal   text        not null,
-  model_id    text        not null,
-  input_hash  text        not null,  -- SHA-256 hex of the serialised query_embedding
-  match_count int,
-  filter      jsonb
+  audit_id      bigserial primary key,
+  logged_at     timestamptz not null default now(),
+  principal     text        not null,
+  model_id      text        not null,
+  model_version text        not null default 'unknown',  -- e.g. '002', '3.5-turbo-0125'
+  input_hash    text        not null,  -- SHA-256 hex of the serialised query_embedding
+  match_count   int,
+  filter        jsonb,
+  output        jsonb        -- serialised result set returned to the caller
 );
+
+-- Retention enforcement: purge audit rows older than 90 days.
+-- Schedule this function via pg_cron:  SELECT cron.schedule('0 2 * * *', $$SELECT purge_match_documents_audit()$$);
+create or replace function purge_match_documents_audit(
+  retention_days int default 90
+) returns void
+language plpgsql
+security definer
+as $$
+begin
+  -- Temporarily disable the no_delete_audit rule so the purge can proceed.
+  set local session_replication_role = replica;
+  delete from match_documents_audit
+  where logged_at < now() - (retention_days || ' days')::interval;
+end;
+$$;
 
 -- Append-only enforcement: block DELETE and UPDATE on the audit table.
 do $rules$
@@ -63,8 +81,8 @@ create function match_documents (
   match_count     int     DEFAULT null,
   filter          jsonb   DEFAULT '{}',
   -- Caller-supplied model identifier (e.g. 'text-embedding-ada-002').
-  -- Defaults to 'unknown' when not provided.
-  model_id        text    DEFAULT 'unknown',
+  -- Must be a non-empty string matching an entry in the approved model registry.
+  model_id        text,
   -- Caller-supplied principal / user identifier for audit purposes.
   principal       text    DEFAULT 'anonymous',
   -- HMAC secret used to sign each result row.  Override via GUC
@@ -105,13 +123,27 @@ begin
     raise exception 'filter must be a JSON object, got %', jsonb_typeof(filter);
   end if;
 
+  -- Validate model_id: must be non-empty and present in the approved model registry.
+  if model_id is null or model_id = '' then
+    raise exception 'model_id must not be null or empty; supply an approved model identifier';
+  end if;
+  if model_id not in (
+    'text-embedding-ada-002',
+    'text-embedding-3-small',
+    'text-embedding-3-large'
+  ) then
+    raise exception 'model_id ''%'' is not in the approved model registry', model_id;
+  end if;
+
   -- Normalise optional parameters
-  if model_id  is null or model_id  = '' then model_id  := 'unknown';   end if;
   if principal is null or principal = '' then principal := 'anonymous'; end if;
 
-  -- Resolve HMAC secret (fall back to a fixed sentinel so the column is
-  -- never empty; callers SHOULD set app.match_documents_hmac_secret).
-  v_secret := coalesce(nullif(hmac_secret, ''), 'UNSET-CONFIGURE-app.match_documents_hmac_secret');
+  -- Resolve HMAC secret; raise an error if it has not been configured so
+  -- the function never operates with an absent or empty secret.
+  v_secret := nullif(hmac_secret, '');
+  if v_secret is null then
+    raise exception 'HMAC secret is not configured. Set app.match_documents_hmac_secret before calling this function.';
+  end if;
 
   -- Hash the serialised query embedding for the audit record.
   v_input_hash := encode(

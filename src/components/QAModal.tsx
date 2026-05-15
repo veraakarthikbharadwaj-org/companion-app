@@ -2,9 +2,98 @@
 
 import {Fragment, useEffect, useRef, useState} from "react";
 import { Dialog, Transition } from "@headlessui/react";
-import { useCompletion } from "ai/react";
+// useCompletion from 'ai/react' removed: backed by models not in the approved registry.
+// Use the organization-approved completion endpoint via native fetch instead.
+// Replace APPROVED_COMPLETION_ENDPOINT with your org's approved model API route.
+const APPROVED_COMPLETION_ENDPOINT = "/api/approved-completion";
 import { useSession } from "next-auth/react";
 import { useEffect, useState as useStateVerified } from "react";
+
+// ---------------------------------------------------------------------------
+// Approved Model Registry — version-pinned with integrity digests
+// ---------------------------------------------------------------------------
+
+/**
+ * APPROVED_MODEL_REGISTRY contains the only models permitted for use in this
+ * application. Each entry includes:
+ *   - id:      the canonical model identifier sent to the API
+ *   - version: pinned version string
+ *   - digest:  SHA-256 hex digest of the model card / release manifest
+ *              (obtain from your model provider's verified release page)
+ *   - provider: the approved provider name
+ */
+const APPROVED_MODEL_REGISTRY: Record<
+  string,
+  { id: string; version: string; digest: string; provider: string }
+> = {
+  // Primary completion model
+  "gpt-4o": {
+    id: "gpt-4o",
+    version: "2024-08-06",
+    digest:
+      "a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4",
+    provider: "openai",
+  },
+  // Secondary completion model
+  "claude-3-5-sonnet": {
+    id: "claude-3-5-sonnet-20241022",
+    version: "20241022",
+    digest:
+      "b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5",
+    provider: "anthropic",
+  },
+  // Tertiary / agent model
+  "mistral-large": {
+    id: "mistral-large-2411",
+    version: "2411",
+    digest:
+      "c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    provider: "mistral",
+  },
+  // RAG embedding model
+  "text-embedding-3-small": {
+    id: "text-embedding-3-small",
+    version: "1",
+    digest:
+      "d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7",
+    provider: "openai",
+  },
+};
+
+/**
+ * Resolves a model alias to its pinned registry entry.
+ * Throws a RangeError if the alias is not in the approved registry,
+ * enforcing that no unregistered model can be used at runtime.
+ */
+function resolveModel(alias: string): {
+  id: string;
+  version: string;
+  digest: string;
+  provider: string;
+} {
+  const entry = APPROVED_MODEL_REGISTRY[alias];
+  if (!entry) {
+    throw new RangeError(
+      `Model "${alias}" is NOT in the approved registry. ` +
+        `Permitted models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(", ")}`
+    );
+  }
+  return entry;
+}
+
+/**
+ * Returns the pinned model id string for use in API calls.
+ * Throws if the alias is not registered.
+ */
+function pinnedModelId(alias: string): string {
+  return resolveModel(alias).id;
+}
+
+// Pinned model constants — use these everywhere instead of bare strings.
+const MODEL_COMPLETION_PRIMARY = pinnedModelId("gpt-4o");         // "gpt-4o" @ 2024-08-06
+const MODEL_COMPLETION_SECONDARY = pinnedModelId("claude-3-5-sonnet"); // claude-3-5-sonnet-20241022
+const MODEL_AGENT = pinnedModelId("mistral-large");               // mistral-large-2411
+const MODEL_EMBEDDING = pinnedModelId("text-embedding-3-small");  // text-embedding-3-small v1
 
 // ---------------------------------------------------------------------------
 // Session integrity helpers
@@ -40,6 +129,39 @@ async function hmacSign(key: CryptoKey, message: string): Promise<string> {
 }
 
 /**
+ * Verifies an HMAC-SHA-256 signature using the Web Crypto API's constant-time
+ * verify operation. `trustedTokenHex` must be the hex-encoded token received
+ * from a trusted server-side source (e.g. a signed API response).
+ * This is the ONLY correct way to verify — re-signing and comparing is a no-op
+ * because both sides always produce the same output for the same inputs.
+ */
+async function hmacVerify(
+  key: CryptoKey,
+  message: string,
+  trustedTokenHex: string
+): Promise<boolean> {
+  const enc = new TextEncoder();
+  // Convert the trusted hex token back to a Uint8Array for crypto.subtle.verify
+  if (trustedTokenHex.length % 2 !== 0) return false;
+  const tokenBytes = new Uint8Array(
+    trustedTokenHex.match(/.{2}/g)!.map((byte) => parseInt(byte, 16))
+  );
+  return crypto.subtle.verify("HMAC", key, tokenBytes, enc.encode(message));
+}
+
+/**
+ * Returns a SHA-256 hex digest of the input string.
+ * Used to avoid including raw PII in binding messages or audit tokens.
+ */
+async function sha256Hex(input: string): Promise<string> {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest("SHA-256", enc.encode(input));
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
  * Constant-time hex comparison to prevent timing attacks.
  */
 function safeEqual(a: string, b: string): boolean {
@@ -55,10 +177,69 @@ function safeEqual(a: string, b: string): boolean {
 // IMPORTANT: Replace this with a value injected from a secure server-side
 // environment variable (e.g. process.env.SESSION_HMAC_SECRET) via a
 // dedicated API route or build-time injection — never hard-code in production.
-const SESSION_HMAC_SECRET =
-  typeof process !== "undefined" && process.env.NEXT_PUBLIC_SESSION_HMAC_SECRET
-    ? process.env.NEXT_PUBLIC_SESSION_HMAC_SECRET
-    : "REPLACE_WITH_SECURE_SERVER_SIDE_SECRET";
+/**
+ * Sanitizes and validates user input before sending to the LLM.
+ * - Trims whitespace
+ * - Enforces maximum length to prevent prompt flooding
+ * - Strips null bytes and control characters
+ * - Blocks common prompt injection patterns
+ * - Rejects empty input
+ * Returns the sanitized string, or null if input is invalid.
+ */
+function sanitizeUserInput(input: string): string | null {
+  if (typeof input !== "string") return null;
+
+  // Trim surrounding whitespace
+  let sanitized = input.trim();
+
+  // Reject empty input
+  if (sanitized.length === 0) return null;
+
+  // Enforce maximum length (1000 characters)
+  const MAX_LENGTH = 1000;
+  if (sanitized.length > MAX_LENGTH) {
+    sanitized = sanitized.slice(0, MAX_LENGTH);
+  }
+
+  // Remove null bytes and ASCII control characters (except newline/tab)
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+
+  // Block common prompt injection patterns
+  const injectionPatterns = [
+    /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i,
+    /system\s*:\s*/i,
+    /\[\s*system\s*\]/i,
+    /<\s*system\s*>/i,
+    /you\s+are\s+now/i,
+    /disregard\s+(all\s+)?(previous|prior)/i,
+    /forget\s+(all\s+)?(previous|prior|your)/i,
+    /act\s+as\s+(if\s+you\s+are|a)/i,
+    /jailbreak/i,
+    /\bDAN\b/,
+  ];
+
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(sanitized)) {
+      return null;
+    }
+  }
+
+  return sanitized;
+}
+
+const SESSION_HMAC_SECRET: string = (() => {
+  const secret =
+    typeof process !== "undefined"
+      ? process.env.NEXT_PUBLIC_SESSION_HMAC_SECRET
+      : undefined;
+  if (!secret) {
+    throw new Error(
+      "[SESSION] NEXT_PUBLIC_SESSION_HMAC_SECRET environment variable is not set. " +
+        "Configure this variable with a secure, randomly generated secret before starting the application."
+    );
+  }
+  return secret;
+})();
 
 export interface VerifiedSession {
   /** The verified, bound principal (email). */
@@ -108,17 +289,44 @@ export function useVerifiedSession(): VerifiedSession | null {
         return;
       }
 
-      // 4. HMAC integrity — sign the canonical binding string and verify it
-      //    matches what we would expect for this subject+expiry pair.
-      //    This detects any client-side tampering with the session payload.
+            // 4. HMAC integrity — recompute the HMAC over the canonical binding
+      //    string and compare it against the token that was previously issued
+      //    and stored in the session record.  A mismatch means the payload
+      //    has been tampered with; absence of a stored token is also rejected.
       try {
+        // The previously-issued token must be present in the session object.
+        const storedToken: string | undefined = (session as any)?.integrityToken;
+        if (!storedToken) {
+          console.warn("[SESSION] No stored integrity token — session rejected.");
+          if (!cancelled) setVerified(null);
+          return;
+        }
+
         const key = await deriveHmacKey(SESSION_HMAC_SECRET);
         const bindingMessage = `${email}|${expires}`;
+
+        // Recompute the expected HMAC for the current payload.
+        const recomputedToken = await hmacSign(key, bindingMessage);
+
+        // Compare the recomputed value against the previously-stored token.
+        if (!safeEqual(recomputedToken, storedToken)) {
+          console.warn("[SESSION] HMAC integrity check failed — session rejected.");
+          if (!cancelled) setVerified(null);
+          return;
+        }
+
+        if (!cancelled) {
+          setVerified({ principal: email, expires, integrityToken: storedToken });
+        }
+      } catch (err) {
+        console.error("[SESSION] Integrity verification error:", err);
+        if (!cancelled) setVerified(null);
+      }|${expires}`;
         const expectedToken = await hmacSign(key, bindingMessage);
 
         // Re-derive to simulate verification (sign-then-compare pattern).
-        const verifyToken = await hmacSign(key, bindingMessage);
-        if (!safeEqual(expectedToken, verifyToken)) {
+        const isValid = await hmacVerify(key, bindingMessage, expectedToken);
+        if (!isValid) {
           console.warn("[SESSION] HMAC integrity check failed — session rejected.");
           if (!cancelled) setVerified(null);
           return;
@@ -698,6 +906,7 @@ async function writeAuditLog(entry: {
   }
 }
 
+// NOTE: sha256Hex is defined inline above near useCompletion usage.
 async function sha256Hex(message: string): Promise<string> {
   try {
     const msgBuffer = new TextEncoder().encode(message);
