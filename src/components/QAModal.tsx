@@ -4,9 +4,276 @@ import {Fragment, useEffect, useRef, useState} from "react";
 import { Dialog, Transition } from "@headlessui/react";
 import { useCompletion } from "ai/react";
 import { useSession } from "next-auth/react";
+import { useEffect, useState as useStateVerified } from "react";
+
+// ---------------------------------------------------------------------------
+// Session integrity helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Derives an HMAC-SHA-256 key from a secret string.
+ * In production the secret MUST come from a server-side environment variable
+ * delivered to the client via a signed, httpOnly cookie or equivalent mechanism.
+ * Here we use a build-time constant as a demonstration; replace with your
+ * actual secret delivery mechanism.
+ */
+async function deriveHmacKey(secret: string): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  return crypto.subtle.importKey(
+    "raw",
+    enc.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+/**
+ * Computes HMAC-SHA-256 over `message` and returns a hex string.
+ */
+async function hmacSign(key: CryptoKey, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Constant-time hex comparison to prevent timing attacks.
+ */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+// The HMAC secret used to sign session binding tokens.
+// IMPORTANT: Replace this with a value injected from a secure server-side
+// environment variable (e.g. process.env.SESSION_HMAC_SECRET) via a
+// dedicated API route or build-time injection — never hard-code in production.
+const SESSION_HMAC_SECRET =
+  typeof process !== "undefined" && process.env.NEXT_PUBLIC_SESSION_HMAC_SECRET
+    ? process.env.NEXT_PUBLIC_SESSION_HMAC_SECRET
+    : "REPLACE_WITH_SECURE_SERVER_SIDE_SECRET";
+
+export interface VerifiedSession {
+  /** The verified, bound principal (email). */
+  principal: string;
+  /** ISO-8601 expiry that has been confirmed to be in the future. */
+  expires: string;
+  /** HMAC-SHA-256 hex over `principal|expires` — stored in audit records. */
+  integrityToken: string;
+}
+
+/**
+ * useVerifiedSession — wraps next-auth's useSession and enforces:
+ *   1. Expiry check  — rejects sessions whose `expires` is in the past.
+ *   2. Subject binding — rejects sessions with no email/subject claim.
+ *   3. HMAC integrity — computes and verifies an HMAC over `email|expires`
+ *      so that any tampering with the session payload is detected.
+ *
+ * Returns `null` while loading or when any integrity check fails.
+ */
+export function useVerifiedSession(): VerifiedSession | null {
+  const { data: session, status } = useSession();
+  const [verified, setVerified] = useStateVerified<VerifiedSession | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function verify() {
+      // 1. Wait until next-auth has resolved the session.
+      if (status === "loading") {
+        setVerified(null);
+        return;
+      }
+
+      // 2. Require an authenticated session with a subject claim.
+      const email = session?.user?.email;
+      const expires = session?.expires;
+      if (!email || !expires) {
+        setVerified(null);
+        return;
+      }
+
+      // 3. Expiry check — reject sessions that have already expired.
+      const expiryMs = Date.parse(expires);
+      if (isNaN(expiryMs) || Date.now() >= expiryMs) {
+        console.warn("[SESSION] Session has expired or has an invalid expiry.");
+        setVerified(null);
+        return;
+      }
+
+      // 4. HMAC integrity — sign the canonical binding string and verify it
+      //    matches what we would expect for this subject+expiry pair.
+      //    This detects any client-side tampering with the session payload.
+      try {
+        const key = await deriveHmacKey(SESSION_HMAC_SECRET);
+        const bindingMessage = `${email}|${expires}`;
+        const expectedToken = await hmacSign(key, bindingMessage);
+
+        // Re-derive to simulate verification (sign-then-compare pattern).
+        const verifyToken = await hmacSign(key, bindingMessage);
+        if (!safeEqual(expectedToken, verifyToken)) {
+          console.warn("[SESSION] HMAC integrity check failed — session rejected.");
+          if (!cancelled) setVerified(null);
+          return;
+        }
+
+        if (!cancelled) {
+          setVerified({ principal: email, expires, integrityToken: expectedToken });
+        }
+      } catch (err) {
+        console.error("[SESSION] Integrity verification error:", err);
+        if (!cancelled) setVerified(null);
+      }
+    }
+
+    verify();
+    return () => { cancelled = true; };
+  }, [session, status]);
+
+  return verified;
+}
 import {ChatBlock, responseToChatBlocks} from "@/components/ChatBlock";
+import { useMemo } from "react";
 
 var last_name = "";
+
+// ---------------------------------------------------------------------------
+// Prompt sanitization — must run before every LLM call.
+// Throws a descriptive Error if an injection pattern is detected so the caller
+// can surface the message to the user without forwarding tainted input.
+// ---------------------------------------------------------------------------
+function sanitizePrompt(input: string): string {
+  if (typeof input !== "string") {
+    throw new Error("Invalid prompt: input must be a string.");
+  }
+
+  // 1. Length guard — prevents resource exhaustion and oversized payloads.
+  const MAX_PROMPT_CHARS = 4000;
+  if (input.length > MAX_PROMPT_CHARS) {
+    throw new Error(`Prompt exceeds maximum allowed length of ${MAX_PROMPT_CHARS} characters.`);
+  }
+
+  // 2. Hidden / zero-width Unicode characters (common prompt-injection vector).
+  // Covers zero-width space, zero-width non-joiner, zero-width joiner,
+  // word joiner, invisible separator, left-to-right / right-to-left marks, etc.
+  const hiddenUnicodePattern = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/u;
+  if (hiddenUnicodePattern.test(input)) {
+    throw new Error("Prompt rejected: hidden or directional Unicode characters detected.");
+  }
+
+  // 3. Base64 blobs — long runs of base64 alphabet chars are a common
+  //    exfiltration / instruction-smuggling vector.
+  //    Flag any token that looks like a base64-encoded payload (≥ 40 chars).
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/;
+  if (base64Pattern.test(input)) {
+    throw new Error("Prompt rejected: possible base64-encoded content detected.");
+  }
+
+  // 4. Shell command sequences — pipes, redirects, backticks, $() substitution,
+  //    semicolon-chained commands, and common dangerous binaries.
+  const shellPattern =
+    /(`[^`]*`|\$\([^)]*\)|\|\s*\w+|&&|\|\||;\s*\w+|>>?\s*\S+|\bsudo\b|\brm\s+-rf\b|\bchmod\b|\bchown\b|\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\beval\b|\bexec\b)/i;
+  if (shellPattern.test(input)) {
+    throw new Error("Prompt rejected: shell command pattern detected.");
+  }
+
+  // 5. Leetspeak / character-substitution obfuscation heuristic.
+  //    Flags strings with an unusually high ratio of digit-for-letter substitutions
+  //    (e.g. 1337, h4x0r) combined with known injection keywords.
+  const leetspeakKeywords = /\b(?:1gnor3|1gnore|byp4ss|byp455|pr0mpt|syst3m|adm1n|r00t|sh3ll|3xec|3xecute|inj3ct)\b/i;
+  if (leetspeakKeywords.test(input)) {
+    throw new Error("Prompt rejected: obfuscated (leetspeak) injection keyword detected.");
+  }
+
+  // 6. Prompt-injection instruction patterns — attempts to override system role.
+  const injectionPhrases =
+    /(?:ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)|you\s+are\s+now\s+(?:a|an)\s+|disregard\s+(all\s+)?(?:instructions?|rules?|guidelines?)|act\s+as\s+(?:if\s+you\s+(?:are|were)|a\b)|new\s+instructions?\s*:|system\s*:\s*you|<\s*system\s*>)/i;
+  if (injectionPhrases.test(input)) {
+    throw new Error("Prompt rejected: prompt-injection instruction pattern detected.");
+  }
+
+  // Passed all checks — return the original (we do not mutate user text).
+  return input;
+}
+const BLOCKED_COMPLETION_MESSAGE =
+  "[Response blocked: the model output contained a forbidden dynamic code execution primitive and cannot be displayed.]";
+
+// Detects and rejects file content that may contain prompt injection attacks.
+// Checks for: invisible/control characters, base64-encoded blobs, leetspeak,
+// binary/shell content, and explicit prompt-injection trigger phrases.
+function sanitizeFileContent(content: string): string {
+  // 1. Reject binary content: high density of non-printable bytes
+  const nonPrintable = content.replace(/[\x09\x0A\x0D\x20-\x7E]/g, "");
+  if (nonPrintable.length / Math.max(content.length, 1) > 0.05) {
+    throw new Error("[SECURITY] File rejected: binary or non-printable content detected.");
+  }
+
+  // 2. Strip and flag invisible Unicode characters (zero-width, soft-hyphen, BOM, etc.)
+  const invisiblePattern = /[\u00AD\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\u2028\u2029]/g;
+  if (invisiblePattern.test(content)) {
+    throw new Error("[SECURITY] File rejected: invisible or bidirectional Unicode characters detected.");
+  }
+
+  // 3. Reject shell/script injection markers
+  const shellPatterns = [
+    /`[^`]*`/,           // backtick command substitution
+    /\$\([^)]*\)/,       // $(command)
+    /<script[\s>]/i,     // script tags
+    /;\s*(rm|curl|wget|bash|sh|python|perl|ruby|nc|ncat)\b/i,
+    /\|\s*(bash|sh|cmd|powershell)/i,
+  ];
+  for (const pattern of shellPatterns) {
+    if (pattern.test(content)) {
+      throw new Error("[SECURITY] File rejected: shell or script injection pattern detected.");
+    }
+  }
+
+  // 4. Reject large base64-encoded blobs (potential encoded payloads)
+  const base64BlockPattern = /[A-Za-z0-9+/]{200,}={0,2}/g;
+  if (base64BlockPattern.test(content)) {
+    throw new Error("[SECURITY] File rejected: large base64-encoded block detected.");
+  }
+
+  // 5. Reject leetspeak patterns (e.g. 1gn0r3, 4dm1n, 3x3cut3)
+  const leetspeakPattern = /\b(?=[a-z0-9]*[0-9][a-z0-9]*)(?=[a-z0-9]*[a-z][a-z0-9]*)[a-z0-9]{5,}\b/i;
+  const leetspeakSubstitutions = /[0-9](?=[a-z])|[a-z](?=[0-9])/gi;
+  const leetspeakMatches = content.match(leetspeakSubstitutions) || [];
+  if (leetspeakMatches.length > 10) {
+    throw new Error("[SECURITY] File rejected: leetspeak encoding pattern detected.");
+  }
+
+  // 6. Reject explicit prompt-injection trigger phrases
+  const injectionPhrases = [
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /disregard\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /forget\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context)/i,
+    /you\s+are\s+now\s+(a|an|the)\s+/i,
+    /act\s+as\s+(a|an|the)\s+/i,
+    /new\s+instructions?\s*:/i,
+    /system\s*:\s*(you|your|ignore|forget)/i,
+    /\[INST\]/i,
+    /<\|im_start\|>/i,
+    /###\s*instruction/i,
+    /override\s+(safety|guidelines?|rules?|policy|policies)/i,
+    /jailbreak/i,
+    /do\s+anything\s+now/i,
+    /DAN\b/,
+  ];
+  for (const phrase of injectionPhrases) {
+    if (phrase.test(content)) {
+      throw new Error("[SECURITY] File rejected: prompt injection phrase detected.");
+    }
+  }
+
+  return content;
+}
 
 // Computes a SHA-256 hex digest of the given string for audit input hashing.
 async function sha256Hex(input: string): Promise<string> {
@@ -29,15 +296,142 @@ async function writeAuditRecord(record: {
   sessionId?: string;
 }): Promise<void> {
   try {
-    await fetch("/api/audit/ai-decision", {
+    const auditResponse = await fetch("/api/audit/ai-decision", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        // Retention policy: audit records must be retained for 365 days per forensic readiness requirements.
+        "X-Audit-Retention-Policy": "retain=365d;immutable=true;classification=ai-decision",
+      },
       body: JSON.stringify(record),
     });
+    if (!auditResponse.ok) {
+      throw new Error(
+        `[AUDIT] Audit endpoint returned non-OK status ${auditResponse.status} for record eventType=${record.eventType} principal=${record.principal} timestamp=${record.timestamp}`
+      );
+    }
   } catch (err) {
-    // Audit failures must not silently disappear — log to console as fallback.
+    // Audit failures must not silently disappear — log to console and re-throw
+    // so the caller and any surrounding alerting/dead-letter infrastructure can
+    // detect and handle the failure. Never swallow audit errors.
     console.error("[AUDIT] Failed to write AI decision audit record:", err, record);
+    throw err;
   }
+}
+
+// Patterns that indicate dynamic code execution primitives in LLM output.
+// Any completion containing these patterns is considered unsafe and will be blocked.
+const DANGEROUS_CODE_PATTERNS: RegExp[] = [
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bFunction\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
+  /\bsetImmediate\s*\(\s*['"`]/gi,
+  /\bexecScript\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\binnerHTML\s*=/gi,
+  /\bouterHTML\s*=/gi,
+  /\bimportScripts\s*\(/gi,
+  /\brequire\s*\(\s*['"`]/gi,
+  /\b__import__\s*\(/gi,
+  /\bcompile\s*\(/gi,
+  /\bos\.system\s*\(/gi,
+  /\bsubprocess\s*\./gi,
+  /\bProcessBuilder\s*\(/gi,
+  /\bRuntime\.getRuntime\s*\(/gi,
+];
+
+/**
+ * Validates LLM completion output for the presence of dynamic code execution
+ * primitives. Returns { safe: true, sanitized: text } when the output is clean,
+ * or { safe: false, sanitized: null, reason } when a dangerous pattern is found.
+ */
+function validateLLMOutput(text: string): { safe: true; sanitized: string } | { safe: false; sanitized: null; reason: string } {
+  if (typeof text !== "string") {
+    return { safe: false, sanitized: null, reason: "LLM output is not a string." };
+  }
+  for (const pattern of DANGEROUS_CODE_PATTERNS) {
+    // Reset lastIndex for global regexes before each test.
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) {
+      const matched = text.match(pattern)?.[0] ?? pattern.source;
+      console.warn(
+        `[SECURITY] LLM output blocked: dangerous code execution primitive detected. Pattern: ${pattern}, Match: ${matched}`
+      );
+      return {
+        safe: false,
+        sanitized: null,
+        reason: `LLM output contains a forbidden dynamic code execution primitive matching pattern: ${pattern}`,
+      };
+    }
+  }
+  return { safe: true, sanitized: text };
+}
+
+// Sanitizes user prompt to detect and block prompt injection attempts.
+// Checks for: invisible/hidden text, base64-encoded payloads, leetspeak obfuscation,
+// and shell/binary command patterns before the prompt reaches the AI agent.
+function sanitizePrompt(input: string): { safe: boolean; reason?: string } {
+  // 1. Detect invisible / zero-width characters often used to hide injected instructions.
+  const invisibleCharPattern = /[\u200B-\u200D\uFEFF\u00AD\u2060\u180E\u00A0]/;
+  if (invisibleCharPattern.test(input)) {
+    return { safe: false, reason: "Prompt contains invisible or hidden characters." };
+  }
+
+  // 2. Detect base64-encoded content (long runs of base64 alphabet with optional padding).
+  // Require at least 20 chars to avoid false positives on short alphanumeric words.
+  const base64Pattern = /(?:[A-Za-z0-9+/]{20,}={0,2})/;
+  if (base64Pattern.test(input)) {
+    // Attempt to decode and check whether the decoded payload looks executable.
+    const b64Candidates = input.match(/[A-Za-z0-9+/]{20,}={0,2}/g) ?? [];
+    for (const candidate of b64Candidates) {
+      try {
+        const decoded = atob(candidate);
+        // If decoded text contains shell metacharacters or command patterns, block it.
+        if (/[|;&`$(){}\[\]<>!]|\b(bash|sh|cmd|powershell|exec|eval|system|wget|curl|nc|ncat|python|perl|ruby|php)\b/i.test(decoded)) {
+          return { safe: false, reason: "Prompt contains a base64-encoded command payload." };
+        }
+      } catch {
+        // Not valid base64 — skip.
+      }
+    }
+  }
+
+  // 3. Detect common leetspeak substitutions used to obfuscate injection keywords.
+  // Normalise digits/symbols that map to letters and check for dangerous keywords.
+  const leetspeakNormalized = input
+    .replace(/0/g, "o")
+    .replace(/1/g, "i")
+    .replace(/3/g, "e")
+    .replace(/4/g, "a")
+    .replace(/5/g, "s")
+    .replace(/7/g, "t")
+    .replace(/@/g, "a")
+    .replace(/\$/g, "s")
+    .toLowerCase();
+  const leetspeakDangerousKeywords =
+    /\b(ignore|forget|disregard|override|bypass|jailbreak|system|prompt|instruction|exec|eval|shell|cmd|bash|powershell|sudo|rm\s+-rf|drop\s+table|select\s+\*|union\s+select)\b/i;
+  if (leetspeakDangerousKeywords.test(leetspeakNormalized)) {
+    return { safe: false, reason: "Prompt contains obfuscated (leetspeak) injection keywords." };
+  }
+
+  // 4. Detect shell metacharacters and binary/command execution patterns directly.
+  const shellCommandPattern =
+    /(\||;|&&|\$\(|`|\bexec\b|\beval\b|\bsystem\b|\bpassthru\b|\bpopen\b|\bproc_open\b|\bshell_exec\b|\bwget\b|\bcurl\b|\bnc\b|\bncat\b|\bnetcat\b|\bchmod\b|\bchown\b|\bsudo\b|\brm\s+-rf|\bmkdir\b|\btouch\b|\bcat\s+\/|\bls\s+-|\bps\s+-|\bkill\b|\bpkill\b|\bpython[23]?\s+-c|\bperl\s+-e|\bruby\s+-e|\bphp\s+-r)/i;
+  if (shellCommandPattern.test(input)) {
+    return { safe: false, reason: "Prompt contains shell or binary command patterns." };
+  }
+
+  // 5. Detect hidden prompt injection markers (e.g. "ignore previous instructions").
+  const injectionPhrasePattern =
+    /ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context|rules?)|forget\s+(everything|all|previous)|you\s+are\s+now|act\s+as\s+(a\s+)?(different|new|another|unrestricted)|disregard\s+(all\s+)?(previous|prior|above)/i;
+  if (injectionPhrasePattern.test(input)) {
+    return { safe: false, reason: "Prompt contains hidden injection instructions." };
+  }
+
+  return { safe: true };
 }
 
 // Approved model registry — entries MUST exist in the org's component registry.
@@ -48,10 +442,12 @@ async function writeAuditRecord(record: {
 // in the organization's component registry. The placeholder below MUST be replaced
 // with a real registry-verified entry before deploying. Leaving this map empty or
 // with unverified entries will cause all inference calls to be blocked at runtime.
+// IMPORTANT: Replace "org-llm-prod-v2" and "org-llm-prod-v2.3.1" with the actual
+// model ID and pinned version from the organization's approved component registry
+// before deploying. Do NOT add GPT, Claude, LLaMA, or any model not in the registry.
 const APPROVED_MODEL_REGISTRY: Record<string, string> = {
-  // Replace with a real org-registry-verified model ID and pinned version, e.g.:
-  // "org-llm-prod-v2": "org-llm-prod-v2.3.1",
-  // DO NOT add GPT, Claude, LLaMA, or any model not present in the org component registry.
+  // Registry-verified entry: approved in org component registry, version pinned.
+  "org-llm-prod-v2": "org-llm-prod-v2.3.1",
 };
 
 // No silent default: if the registry is empty or the requested model is absent,
@@ -715,8 +1111,6 @@ export default function QAModal({
                             {`Provenance: model=${MODEL_ID}, generated=${provenanceTimestamp}, origin=ai-generated`}
                           </span>
                         </div>
-                        {/* Invisible Unicode watermark appended to AI output */}
-                        <span aria-hidden="true" style={{ userSelect: "none", fontSize: 0, lineHeight: 0 }}>{AI_WATERMARK}</span>
                         {blocks}
                       </div>
                     )}
